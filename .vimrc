@@ -20,6 +20,7 @@ Bundle 'gmarik/vundle'
 Bundle 'scrooloose/nerdtree'
 Bundle 'majutsushi/tagbar'
 Bundle 'Valloric/YouCompleteMe'
+Bundle 'kien/ctrlp.vim'
 "Bundle 'nosami/Omnisharp'
 "Bundle 'ervandew/supertab'
 " The sparkup vim script is in a subdirectory of this repo called vim.
@@ -29,7 +30,6 @@ Bundle 'Valloric/YouCompleteMe'
 " Bundle 'L9'
 " Bundle 'FuzzyFinder'
 " scripts not on GitHub
-Bundle 'git://git.wincent.com/command-t.git'
 " git repos on your local machine (i.e. when working on your own plugin)
 " Bundle 'file:///home/gmarik/path/to/plugin'
 " ...

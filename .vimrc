@@ -21,6 +21,7 @@ Bundle 'scrooloose/nerdtree'
 Bundle 'majutsushi/tagbar'
 Bundle 'Valloric/YouCompleteMe'
 Bundle 'kien/ctrlp.vim'
+Bundle 'Lokaltog/vim-easymotion'
 "Bundle 'nosami/Omnisharp'
 "Bundle 'ervandew/supertab'
 " The sparkup vim script is in a subdirectory of this repo called vim.
@@ -56,4 +57,6 @@ set tabstop=4
 set hlsearch
 nmap <F8> :TagbarToggle<CR>
 nmap <F2> :NERDTreeToggle<CR>
+let mapleader = ','
 let g:EclimCompletionMethod = 'omnifunc'
+map <Leader> <Plug>(easymotion-prefix)

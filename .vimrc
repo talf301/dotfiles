@@ -18,10 +18,16 @@ Bundle 'gmarik/vundle'
 " Bundle 'Lokaltog/vim-easymotion'
 " Bundle 'tpope/vim-rails.git'
 Bundle 'scrooloose/nerdtree'
+Bundle 'scrooloose/nerdcommenter'
 Bundle 'majutsushi/tagbar'
 Bundle 'Valloric/YouCompleteMe'
 Bundle 'kien/ctrlp.vim'
 Bundle 'Lokaltog/vim-easymotion'
+Bundle 'scrooloose/syntastic'
+Bundle 'jdonaldson/vaxe'
+Bundle 'bling/vim-airline'
+Bundle 'xolox/vim-misc'
+"Bundle 'xolox/vim-session'
 "Bundle 'nosami/Omnisharp'
 "Bundle 'ervandew/supertab'
 " The sparkup vim script is in a subdirectory of this repo called vim.
@@ -51,12 +57,15 @@ filetype plugin indent on     " required
 
 syntax on
 set number
-colorscheme elflord
+colorscheme molokai
 set shiftwidth=4
 set tabstop=4
 set hlsearch
+set autowrite
 nmap <F8> :TagbarToggle<CR>
 nmap <F2> :NERDTreeToggle<CR>
 let mapleader = ','
 let g:EclimCompletionMethod = 'omnifunc'
+let g:ycm_global_extra_conf = '~/.vim/bundle/YouCompleteMe/third_party/ycmd/cpp/ycm/.ycm_extra_conf'
 map <Leader> <Plug>(easymotion-prefix)
+set t_Co=256

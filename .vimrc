@@ -24,9 +24,13 @@ Bundle 'Valloric/YouCompleteMe'
 Bundle 'kien/ctrlp.vim'
 Bundle 'Lokaltog/vim-easymotion'
 Bundle 'scrooloose/syntastic'
-Bundle 'jdonaldson/vaxe'
+"Bundle 'jdonaldson/vaxe'
 Bundle 'bling/vim-airline'
 Bundle 'xolox/vim-misc'
+Bundle 'lervag/vim-latex'
+"Bundle 'klen/python-mode'
+"Bundle 'sjl/gundo.vim'
+"Bundle 'tpope/vim-fugitive'
 "Bundle 'xolox/vim-session'
 "Bundle 'nosami/Omnisharp'
 "Bundle 'ervandew/supertab'
@@ -54,7 +58,8 @@ filetype plugin indent on     " required
 " see :h vundle for more details or wiki for FAQ
 " NOTE: comments after Bundle commands are not allowed.
 " Put your stuff after this line
-
+set grepprg=grep\ -nH\ $*
+let g:tex_flavor='latex'
 syntax on
 set number
 colorscheme molokai
@@ -69,3 +74,37 @@ let g:EclimCompletionMethod = 'omnifunc'
 let g:ycm_global_extra_conf = '~/.vim/bundle/YouCompleteMe/third_party/ycmd/cpp/ycm/.ycm_extra_conf'
 map <Leader> <Plug>(easymotion-prefix)
 set t_Co=256
+
+nnoremap <F3> :GundoToggle<CR>
+
+" Airline 
+set laststatus=2
+let g:airline_section_z = '%{strftime("%c")}'
+
+"" Python stuff
+
+ ""Documentation
+ "let g:pymode_doc = 1
+ "let g:pymode_doc_key = 'K'
+
+ ""Linting
+ "let g:pymode_lint = 1
+ "let g:pymode_lint_checker = "pyflakes,pep8"
+ "" Auto check on save
+ "let g:pymode_lint_write = 1
+
+ "" Support virtualenv
+ "let g:pymode_virtualenv = 1
+
+ "" Enable breakpoints plugin
+ "let g:pymode_breakpoint = 1
+ "let g:pymode_breakpoint_bind = '<leader>b'
+
+ "" syntax highlighting
+ "let g:pymode_syntax = 1
+ "let g:pymode_syntax_all = 1
+ "let g:pymode_syntax_indent_errors = g:pymode_syntax_all
+ "let g:pymode_syntax_space_errors = g:pymode_syntax_all
+
+ "" Don't autofold code
+ "let g:pymode_folding = 1 

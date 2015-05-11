@@ -1,0 +1,10 @@
+startup_message off
+autodetach on
+altscreen on
+caption always "%{= db}%{+b w}%n %t %h %=%l %H %c"
+hardstatus alwayslastline "%-Lw%{= KW}%50>%n%f* %t%{-}%+Lw%<"
+
+activity "Activity in %t(%n)"
+
+shelltitle "shell"
+shell -$SHELL

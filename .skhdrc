@@ -109,7 +109,7 @@
 ############################################################
 
 # launch terminal instance
-cmd + alt + ctrl - return : open -n -a iTerm
+cmd + alt + ctrl - return : open -n -a Alacritty
 
 # launch browser instance
 cmd + alt + ctrl + shift - return : open -n -a Google\ Chrome
@@ -126,13 +126,16 @@ shift + cmd + alt + ctrl - j : yabai -m window --warp south
 shift + cmd + alt + ctrl - k : yabai -m window --warp north
 shift + cmd + alt + ctrl - l : yabai -m window --warp east
 
-# Send window to a display and follow
-ctrl + cmd - 1  : yabai -m window --display 1; yabai -m display --focus 1
-ctrl + cmd - 2  : yabai -m window --display 2; yabai -m display --focus 2
-ctrl + cmd - 3  : yabai -m window --display 3; yabai -m display --focus 3
+# # Send window to a display and follow
+# ctrl + cmd - 1  : yabai -m window --display 1; yabai -m display --focus 1
+# ctrl + cmd - 2  : yabai -m window --display 2; yabai -m display --focus 2
+# ctrl + cmd - 3  : yabai -m window --display 3; yabai -m display --focus 3
 
 # cycle focused display
 cmd + alt + ctrl - a : yabai -m display --focus recent
+cmd + alt + ctrl + shift - x : yabai -m display --focus 1
+cmd + alt + ctrl + shift - c : yabai -m display --focus 2
+cmd + alt + ctrl + shift - v : yabai -m display --focus 3
 
 # toggle window fullscreen zoom
 cmd + alt + ctrl - f : yabai -m window --toggle zoom-fullscreen
@@ -147,19 +150,19 @@ cmd + alt + ctrl - y : yabai -m space --mirror y-axis
 cmd + alt + ctrl - x : yabai -m space --mirror x-axis
 
 # Switch to desktop
-cmd + alt + ctrl - b : yabai -m space --focus recent
-cmd + alt + ctrl - z : yabai -m space --focus prev
-cmd + alt + ctrl - c : yabai -m space -- focus next
-cmd + alt + ctrl - 1 : yabai -m space --focus 1
-cmd + alt + ctrl - 2 : yabai -m space --focus 2
-cmd + alt + ctrl - 3 : yabai -m space --focus 3
-cmd + alt + ctrl - 4 : yabai -m space --focus 4
-cmd + alt + ctrl - 5 : yabai -m space --focus 5
-cmd + alt + ctrl - 6 : yabai -m space --focus 6
-cmd + alt + ctrl - 7 : yabai -m space --focus 7
-cmd + alt + ctrl - 8 : yabai -m space --focus 8
-cmd + alt + ctrl - 9 : yabai -m space --focus 9
-cmd + alt + ctrl - 0 : yabai -m space --focus 10
+# cmd + alt + ctrl - b : yabai -m space --focus recent
+# cmd + alt + ctrl - z : yabai -m space --focus prev
+# cmd + alt + ctrl - c : yabai -m space -- focus next
+# cmd + alt + ctrl - 1 : yabai -m space --focus 1
+# cmd + alt + ctrl - 2 : yabai -m space --focus 2
+# cmd + alt + ctrl - 3 : yabai -m space --focus 3
+# cmd + alt + ctrl - 4 : yabai -m space --focus 4
+# cmd + alt + ctrl - 5 : yabai -m space --focus 5
+# cmd + alt + ctrl - 6 : yabai -m space --focus 6
+# cmd + alt + ctrl - 7 : yabai -m space --focus 7
+# cmd + alt + ctrl - 8 : yabai -m space --focus 8
+# cmd + alt + ctrl - 9 : yabai -m space --focus 9
+# cmd + alt + ctrl - 0 : yabai -m space --focus 10
 
 # send to desktop 
 shift + cmd + alt + ctrl - b : yabai -m window --space recent

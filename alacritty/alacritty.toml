@@ -1,0 +1,42 @@
+[font]
+normal = { family = "JetBrainsMono Nerd Font", style = "Regular" }
+bold = { family = "JetBrainsMono Nerd Font", style = "Bold" }
+italic = { family = "JetBrainsMono Nerd Font", style = "Italic" }
+bold_italic = { family = "JetBrainsMono Nerd Font", style = "Bold Italic" }
+size = 18.0
+
+# Catppuccin Frappe
+[colors.primary]
+background = "#303446"
+foreground = "#c6d0f5"
+
+[colors.cursor]
+text = "#303446"
+cursor = "#f2d5cf"
+
+[colors.normal]
+black   = "#51576d"
+red     = "#e78284"
+green   = "#a6d189"
+yellow  = "#e5c890"
+blue    = "#8caaee"
+magenta = "#f4b8e4"
+cyan    = "#81c8be"
+white   = "#b5bfe2"
+
+[colors.bright]
+black   = "#626880"
+red     = "#e78284"
+green   = "#a6d189"
+yellow  = "#e5c890"
+blue    = "#8caaee"
+magenta = "#f4b8e4"
+cyan    = "#81c8be"
+white   = "#a5adce"
+
+[window]
+decorations = "buttonless"
+option_as_alt = "Both"
+
+[env]
+TERM = "xterm-256color"

@@ -20,8 +20,8 @@ update_space_icons() {
 }
 
 # Update all workspaces to ensure clean state
-for monitor in $(aerospace list-monitors --format "%{monitor-appkit-nsscreen-screens-id}"); do
-    for sid in $(aerospace list-workspaces --monitor "$monitor"); do
+for monitor_id in $(aerospace list-monitors --format "%{monitor-id}"); do
+    for sid in $(aerospace list-workspaces --monitor "$monitor_id"); do
         update_space_icons "$sid"
     done
 done

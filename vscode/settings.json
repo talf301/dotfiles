@@ -54,7 +54,7 @@
     "julia.symbolCacheDownload": true,
     "editor.fontSize": 18,
     "editor.fontFamily": "CaskaydiaCove Nerd Font",
-    "workbench.colorTheme": "Catppuccin Frappé",
+    "workbench.colorTheme": "Catppuccin Macchiato",
     "editor.fontLigatures": true,
     "julia.lint.run": true,
     "diffEditor.ignoreTrimWhitespace": false,

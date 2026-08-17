@@ -127,8 +127,31 @@ Beads: ${id}"
   sleep 3
 }
 
-_done() {  # $1 = id — post-PR-merge tidy: close bead + remove worktree + delete local branch
+_done() {  # $1 = id — post-merge tidy. A pr:<slug> bead cleans the WHOLE group (every member's iar
+           # worktree/branch + the pr/<slug> branch and its integration worktree); else the one bead.
   local id="$1"; [ -z "$id" ] && return
+  local slug
+  slug="$(br list --id "$id" --json 2>/dev/null | jq -r '.issues[0].labels // [] | map(select(startswith("pr:"))) | .[0] // empty' | sed 's/^pr://')"
+  if [ -n "$slug" ]; then
+    # --all so already-closed members (they close on integrate) are still found.
+    local members m count
+    members="$(br list --all --json 2>/dev/null | jq -r --arg L "pr:$slug" '.issues[] | select((.labels//[])|index($L)) | .id')"
+    count="$(printf '%s\n' "$members" | grep -c .)"
+    printf '\nDone with PR-group %s (%s beads)? → close all + remove their worktrees/branches + delete pr/%s and its worktree  [y/N] ' "$slug" "$count" "$slug"; read -r yn
+    case "$yn" in [yY]*) : ;; *) echo "cancelled"; sleep 1; return ;; esac
+    for m in $members; do
+      br close "$m" --reason "PR-group $slug merged via swarm" >/dev/null 2>&1
+      local mwt="$REPO/.claude/worktrees/iar-$m"
+      [ -d "$mwt" ] && git -C "$REPO" worktree remove --force "$mwt" >/dev/null 2>&1
+      git -C "$REPO" branch -D "u/tfriedman/iar-$m" >/dev/null 2>&1
+    done
+    local pwt="$REPO/.claude/worktrees/pr-$slug"
+    [ -d "$pwt" ] && git -C "$REPO" worktree remove --force "$pwt" >/dev/null 2>&1
+    git -C "$REPO" branch -D "pr/$slug" >/dev/null 2>&1
+    rmdir "$LOG_DIR/pr-$slug.lock" 2>/dev/null   # stale integrate lock, if any
+    echo "✓ PR-group $slug: $count beads closed, worktrees + member branches removed, pr/$slug deleted"; sleep 2
+    return
+  fi
   local branch="u/tfriedman/iar-$id" wt="$REPO/.claude/worktrees/iar-$id"
   printf '\nDone with %s? → close bead + remove worktree + delete %s  [y/N] ' "$id" "$branch"; read -r yn
   case "$yn" in [yY]*) : ;; *) echo "cancelled"; sleep 1; return ;; esac

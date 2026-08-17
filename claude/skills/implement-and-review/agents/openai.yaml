@@ -1,0 +1,4 @@
+interface:
+  display_name: "Implement and Review"
+  short_description: "Run tasks with independent cross-model review"
+  default_prompt: "Use $implement-and-review to run these tasks with independent implementation and review."

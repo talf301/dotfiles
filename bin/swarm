@@ -1,0 +1,245 @@
+#!/usr/bin/env bash
+# swarm — one live, interactive surface for the IAR swarm.
+#
+# Bare `swarm` opens an fzf TUI that AUTO-REFRESHES every few seconds and lets you
+# act on beads with single keys — it is the dashboard and the control panel in one.
+# No hand-typed `br update --remove-label ...` / `gh pr create ...`; the keys do it.
+#
+#   swarm                     live TUI (dashboard + actions)
+#   swarm status              one-shot text snapshot (swarm-status.sh)
+#   swarm on [once]           start the supervisor poller (loop, or a single tick)
+#   swarm add "<title>"       create a ready bead, print its id
+#   swarm answer <id> "<m>"   record a decision + resume (drops needs-human)
+#   swarm chat <id>           open a live Fable session on a hard/structural bead in a NEW tab
+#   swarm pr <id>             push the approved branch + open a DRAFT PR (base: main)
+#   swarm done <id>           post-PR-merge tidy: close bead + rm worktree + delete branch
+#   swarm close <id>          close a bead
+#   swarm resume <id>         drop needs-human, hand back to the swarm
+#
+# TUI keys:  enter=detail  a=answer  f=fable-chat  p=open-PR  d=done  c=close  r=resume
+#            s=poller-on/off  /=filter-mode (esc exits)  q=quit
+#
+# Requires: br, jq, fzf, git.  bash 3.2-safe (stock macOS).
+set -uo pipefail
+export BEADS_DIR="${BEADS_DIR:-/Users/tal/.local/share/beads/precog/.beads}"
+REPO="${REPO:-/Users/tal/Documents/precog}"
+REFRESH="${SWARM_REFRESH:-2}"       # TUI auto-refresh seconds
+LOG_DIR="${LOG_DIR:-/tmp/swarm-logs}"
+SELF="$(command -v swarm || echo "$HOME/.local/bin/swarm")"
+
+# colors (ANSI-C \033 so no raw ESC bytes live in the source)
+NC=$'\033[0m'; RED=$'\033[1;31m'; GRN=$'\033[1;32m'; CYAN=$'\033[36m'; DIM=$'\033[2m'
+
+# ---- shared list, one row per bead, priority-ordered (first tag wins on dedup) ----
+# needs-you (⚠) > approved (✅) > PR open (🔀) > swarm phase (▶ live / ◌ idle) > non-swarm in_progress (·)
+_list() {
+  local nhj ipj
+  nhj="$(br list -l needs-human --status open --status in_progress --json 2>/dev/null)"
+  ipj="$(br list --status in_progress --json 2>/dev/null)"
+  {
+    # structural escalation → Fable
+    echo "$nhj" | jq -r --arg red "$RED" --arg nc "$NC" \
+      '.issues[]? | select((.labels//[])|index("needs-fable")) | [.id, ($red+"⚠  needs-you  🧠 f→Fable"+$nc), .title] | @tsv'
+    # plain escalation
+    echo "$nhj" | jq -r --arg red "$RED" --arg nc "$NC" \
+      '.issues[]? | [.id, ($red+"⚠  needs-you"+$nc), .title] | @tsv'
+    # review passed
+    echo "$ipj" | jq -r --arg grn "$GRN" --arg nc "$NC" \
+      '.issues[]? | select((.labels//[])|index("iar:approved")) | [.id, ($grn+"✅ approved (p:PR)"+$nc), .title] | @tsv'
+    # PR opened
+    echo "$ipj" | jq -r --arg cy "$CYAN" --arg nc "$NC" \
+      '.issues[]? | select((.labels//[])|index("pr-open")) | [.id, ($cy+"🔀 PR open"+$nc), .title] | @tsv'
+    # swarm-claimed work: phase from label + whether an agent process is live for it
+    echo "$ipj" | jq -r '.issues[]? | select((.assignee//"")|startswith("swarm-")) | [.id, (((.labels//[])|join(","))|if .=="" then "none" else . end), .title] | @tsv' \
+    | while IFS=$'\t' read -r id labels title; do
+        local tag
+        if pgrep -f "iar-worker:$id" >/dev/null 2>&1; then
+          case "$labels" in
+            *iar:awaiting-review*)   tag="${GRN}▶ reviewing${NC}" ;;
+            *iar:changes-requested*) tag="${GRN}▶ fixing${NC}" ;;
+            *)                       tag="${GRN}▶ implementing${NC}" ;;
+          esac
+        else
+          case "$labels" in
+            *iar:awaiting-review*)   tag="${DIM}◌ idle → review${NC}" ;;
+            *iar:changes-requested*) tag="${DIM}◌ idle → fix${NC}" ;;
+            *)                       tag="${DIM}◌ idle → implement${NC}" ;;
+          esac
+        fi
+        printf '%s\t%s\t%s\n' "$id" "$tag" "$title"
+      done
+    # in_progress but NOT swarm-owned (your own manual beads) — dimmed so they aren't mistaken for swarm work
+    echo "$ipj" | jq -r --arg dim "$DIM" --arg nc "$NC" \
+      '.issues[]? | select((.assignee//"")|startswith("swarm-")|not) | [.id, ($dim+"·  in_progress (not swarm)"+$nc), .title] | @tsv'
+  } | awk -F'\t' '!seen[$1]++'   # first occurrence wins → highest-priority tag per bead
+}
+
+_preview() {  # $1 = bead id — canonical bead view (br show already includes the comment thread)
+  local id="$1"
+  [ -z "$id" ] && { echo "(all quiet — no beads in flight)"; return; }
+  br show "$id" 2>/dev/null
+}
+
+_detail() {  # enter → full detail in a pager
+  local id="$1"; [ -z "$id" ] && return
+  { br show "$id" 2>/dev/null; echo; echo "──────── comments ────────"; br comments "$id" 2>/dev/null; } | ${PAGER:-less -R}
+}
+
+_answer() {  # $1 = id (interactive: prompt for the decision, then resume)
+  local id="$1"; [ -z "$id" ] && return
+  printf '\nDecision / instructions for %s (blank = just resume): ' "$id"
+  IFS= read -r msg
+  [ -n "$msg" ] && br update "$id" --notes "$msg" >/dev/null 2>&1
+  br update "$id" --remove-label needs-human >/dev/null 2>&1
+  echo "→ resumed $id (supervisor picks it back up)"; sleep 1
+}
+
+_resume() { local id="$1"; [ -z "$id" ] && return; br update "$id" --remove-label needs-human >/dev/null 2>&1; echo "→ resumed $id"; sleep 1; }
+_close()  { local id="$1"; [ -z "$id" ] && return; printf '\nClose %s? [y/N] ' "$id"; read -r yn; case "$yn" in [yY]*) br close "$id" --reason "closed via swarm" >/dev/null 2>&1 && echo "→ closed $id";; *) echo "cancelled";; esac; sleep 1; }
+
+_pr() {  # $1 = id — push the approved branch and open a DRAFT PR (never a local merge into main)
+  local id="$1"; [ -z "$id" ] && return
+  local branch="u/tfriedman/iar-$id"
+  if ! git -C "$REPO" rev-parse --verify "$branch" >/dev/null 2>&1; then echo "no branch $branch"; sleep 2; return; fi
+  local title; title="$(br list --id "$id" --json 2>/dev/null | jq -r ".issues[0].title // \"iar-$id\"")"
+  printf '\nOpen a DRAFT PR for %s\n  branch: %s → main\n  title:  %s\nProceed? [y/N] ' "$id" "$branch" "$title"; read -r yn
+  case "$yn" in [yY]*) : ;; *) echo "cancelled"; sleep 1; return ;; esac
+  echo "→ pushing $branch …"
+  local push_out push_rc
+  push_out="$(git -C "$REPO" push -u origin "$branch" 2>&1)"; push_rc=$?
+  echo "$push_out" | tail -2
+  [ "$push_rc" -ne 0 ] && { echo "✗ push failed"; sleep 3; return; }
+  local body url
+  body="Implements ${title}. Opened as a draft by the IAR swarm after cross-model review; see bead ${id} for acceptance criteria and the review thread.
+
+Beads: ${id}"
+  url="$(cd "$REPO" && gh pr create --draft --base main --head "$branch" --title "$title" --body "$body" 2>&1 | tail -1)"
+  case "$url" in
+    https://*) br comments add "$id" -m "Draft PR opened: $url" >/dev/null 2>&1
+               br update "$id" --add-label pr-open --remove-label iar:approved >/dev/null 2>&1
+               echo "✓ draft PR: $url" ;;
+    *)         echo "✗ gh pr create: $url" ;;
+  esac
+  sleep 3
+}
+
+_done() {  # $1 = id — post-PR-merge tidy: close bead + remove worktree + delete local branch
+  local id="$1"; [ -z "$id" ] && return
+  local branch="u/tfriedman/iar-$id" wt="$REPO/.claude/worktrees/iar-$id"
+  printf '\nDone with %s? → close bead + remove worktree + delete %s  [y/N] ' "$id" "$branch"; read -r yn
+  case "$yn" in [yY]*) : ;; *) echo "cancelled"; sleep 1; return ;; esac
+  br close "$id" --reason "done via swarm (PR merged / resolved)" >/dev/null 2>&1
+  [ -d "$wt" ] && git -C "$REPO" worktree remove --force "$wt" >/dev/null 2>&1
+  git -C "$REPO" branch -D "$branch" >/dev/null 2>&1
+  echo "✓ $id: bead closed, worktree removed, branch deleted"; sleep 2
+}
+
+_chat() {  # $1 = id — open a live Fable session on a hard/structural bead in a NEW tab (TUI keeps running)
+  local id="$1"; [ -z "$id" ] && return
+  local wt="$REPO/.claude/worktrees/iar-$id"
+  [ -d "$wt" ] || { echo "no worktree for $id yet — nothing for Fable to look at" >&2; return 1; }
+  local base; base="$(cat "$LOG_DIR/base-$id" 2>/dev/null || git -C "$REPO" rev-parse HEAD)"
+  local ctx="/tmp/iar-chat-$id.md"
+  # All the detailed instructions live in the context file — keeps the launcher's claude prompt quote-simple.
+  {
+    echo "# Blocked IAR bead $id — Fable, a fresh set of eyes"
+    echo
+    echo "Opus implemented and Sol reviewed this, but it's blocked / needs a structural rethink."
+    echo "You are in its worktree ($wt). Talk it through with me first; edit here only if we agree;"
+    echo "run tests with: iar-run-tests.sh $wt <pytest-args>"
+    echo
+    echo "## When we've resolved it"
+    echo "- Hand back to the swarm:  br update $id --notes \"<decision>\"  then  br update $id --remove-label needs-human"
+    echo "- Or if we fixed it here:  commit, then  br update $id --add-label iar:awaiting-review --remove-label needs-human"
+    echo
+    echo "## The bead"
+    br show "$id" 2>/dev/null
+    echo
+    echo "## Diff so far ($base..HEAD)"
+    echo '```diff'
+    git -C "$wt" --no-pager diff "$base"..HEAD 2>/dev/null
+    echo '```'
+  } > "$ctx"
+  local prompt="You are Fable, a fresh third set of eyes on blocked IAR bead $id. Read $ctx — it has the bead, the escalation question (the latest comment), the diff so far, and how to hand back when we're done. Start by reading it and giving me your read of the problem."
+  if command -v herdr >/dev/null 2>&1; then
+    # herdr-native: open a new tab in the worktree, then start Fable (claude) in its pane.
+    local pane
+    pane="$(herdr tab create --cwd "$wt" --label "fable-$id" --focus 2>/dev/null | jq -r '.result.root_pane.pane_id // empty')"
+    [ -n "$pane" ] && herdr agent start "fable-$id" --kind claude --pane "$pane" -- \
+      --model claude-fable-5 --add-dir "$wt" "$prompt" >/dev/null 2>&1 &
+  else
+    # fallback (no herdr): a launcher script opened in a new Terminal window.
+    local launch="/tmp/iar-chat-$id.command"
+    { echo '#!/usr/bin/env bash'; echo "cd \"$wt\" || exit 1"; echo "exec claude --model claude-fable-5 --add-dir \"$wt\" \"$prompt\""; } > "$launch"
+    chmod +x "$launch"
+    open "$launch" >/dev/null 2>&1 || osascript -e "tell application \"Terminal\" to do script \"bash '$launch'\"" >/dev/null 2>&1
+  fi
+}
+
+_toggle() {  # start/stop the supervisor poller, detached so the TUI keeps running
+  if pgrep -f "swarm-supervisor.sh" >/dev/null 2>&1; then
+    pkill -f "swarm-supervisor.sh" >/dev/null 2>&1
+    for _ in 1 2 3 4 5; do pgrep -f "swarm-supervisor.sh" >/dev/null 2>&1 || break; sleep 0.2; done
+  else
+    mkdir -p "$LOG_DIR"
+    nohup swarm-supervisor.sh >>"$LOG_DIR/poller.log" 2>&1 &
+  fi
+}
+
+_hdr() {  # live header: is the poller actually running?
+  local keys='enter:detail  a:answer  f:fable  p:PR  d:done  c:close  r:resume  s:poller  /:filter  q:quit'
+  if pgrep -f "swarm-supervisor.sh" >/dev/null 2>&1; then
+    printf '● poller ON  (s: stop)   |   %s\n' "$keys"
+  else
+    printf '○ poller OFF (s: start)   |   %s\n' "$keys"
+  fi
+}
+
+_tui() {
+  command -v fzf >/dev/null || { echo "fzf not installed (brew install fzf)"; exit 1; }
+  # filter mode: '/' unbinds the action letters so you can type to filter; esc rebinds them.
+  local ACT='a,c,d,f,p,q,r,s'
+  : | fzf --ansi --delimiter='\t' --with-nth=2,3 \
+    --header-first --reverse --no-sort --prompt='swarm> ' \
+    --preview="$SELF __preview {1}" --preview-window='down,50%,wrap,border-top' \
+    --bind="start:reload($SELF __list)+transform-header($SELF __hdr)" \
+    --bind="load:reload(sleep $REFRESH && $SELF __list)+transform-header($SELF __hdr)" \
+    --bind="ctrl-r:reload($SELF __list)" \
+    --bind="/:unbind($ACT)+change-prompt(filter [esc→actions]> )" \
+    --bind="esc:clear-query+rebind($ACT)+change-prompt(swarm> )" \
+    --bind="enter:execute($SELF __detail {1})" \
+    --bind="a:execute($SELF __answer {1})+reload($SELF __list)" \
+    --bind="f:execute-silent($SELF __chat {1})" \
+    --bind="p:execute($SELF __pr {1})+reload($SELF __list)" \
+    --bind="d:execute($SELF __done {1})+reload($SELF __list)" \
+    --bind="c:execute($SELF __close {1})+reload($SELF __list)" \
+    --bind="r:execute($SELF __resume {1})+reload($SELF __list)" \
+    --bind="s:execute-silent($SELF __toggle)+transform-header($SELF __hdr)" \
+    --bind="q:abort" >/dev/null || true
+}
+
+case "${1:-tui}" in
+  tui|"")   _tui ;;
+  status)   exec swarm-status.sh ;;
+  on)       shift; exec swarm-supervisor.sh "$@" ;;
+  add)      shift; br create "$1" ${2:+--acceptance-criteria "$2"} -p "${3:-2}" --json 2>/dev/null | jq -r '.id // .issue.id' ;;
+  answer)   shift; id="$1"; shift || true; [ $# -gt 0 ] && br update "$id" --notes "$*" >/dev/null 2>&1; br update "$id" --remove-label needs-human >/dev/null 2>&1; echo "resumed $id" ;;
+  chat)     shift; _chat "$1" ;;
+  pr)       shift; _pr "$1" ;;
+  done)     shift; _done "$1" ;;
+  close)    shift; br close "$1" --reason "closed via swarm" >/dev/null 2>&1 && echo "closed $1" ;;
+  resume)   shift; br update "$1" --remove-label needs-human >/dev/null 2>&1 && echo "resumed $1" ;;
+  # ---- internal (fzf binds) ----
+  __hdr)     _hdr ;;
+  __list)    _list ;;
+  __preview) shift; _preview "${1:-}" ;;
+  __detail)  shift; _detail "${1:-}" ;;
+  __answer)  shift; _answer "${1:-}" ;;
+  __chat)    shift; _chat "${1:-}" ;;
+  __pr)      shift; _pr "${1:-}" ;;
+  __done)    shift; _done "${1:-}" ;;
+  __close)   shift; _close "${1:-}" ;;
+  __resume)  shift; _resume "${1:-}" ;;
+  __toggle)  _toggle ;;
+  *) echo "usage: swarm [status|on|add|answer|chat|pr|done|close|resume]  (bare = live TUI)"; exit 1 ;;
+esac

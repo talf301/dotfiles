@@ -33,6 +33,7 @@ set -euo pipefail
 
 export BEADS_DIR="${BEADS_DIR:-/Users/tal/.local/share/beads/precog/.beads}"
 REPO="${REPO:-/Users/tal/Documents/precog}"
+MAIN="${MAIN:-main}"                        # trunk that PR branches (and standalone beads) branch off of
 MAX_INFLIGHT="${MAX_INFLIGHT:-3}"          # cap concurrently-owned beads
 POLL_SECS="${POLL_SECS:-60}"
 LOG_DIR="${LOG_DIR:-/tmp/swarm-logs}"
@@ -51,6 +52,26 @@ maxed()    { [ "$(val "$1")" -ge "$2" ]; }   # attempts: escalate once N failed 
 inflight()   { br list --assignee "$ACTOR" --status in_progress --json 2>/dev/null | jq '.issues | length'; }
 proc_alive() { pgrep -f "iar-worker:$1" >/dev/null 2>&1; }   # any phase process for this bead
 
+# ---- PR-group helpers: a bead labelled pr:<slug> bases off the PR branch, not main ---------------
+# A PR-group is the integration unit — one or more beads that ship as one PR — carried as a `pr:<slug>`
+# label (orthogonal to epics, which are parent-child organization and do NOT drive integration).
+# prgroup_of: the pr:<slug> a bead belongs to, or '' (a bead with no pr: label is its own 1-bead PR,
+# branched off main, terminal for a human PR — i.e. exactly the old behavior).
+prgroup_of() { br list --id "$1" --json 2>/dev/null | jq -r '.issues[0].labels // [] | map(select(startswith("pr:"))) | .[0] // empty' | sed 's/^pr://'; }
+# prgroup_base: the sha a bead should be cut from — PR branch HEAD if it has a group (creating the
+# branch off $MAIN on the first member), else main HEAD (standalone: unchanged).
+prgroup_base() {
+  local slug="$1" pb
+  [ -z "$slug" ] && { git -C "$REPO" rev-parse HEAD; return 0; }
+  pb="pr/$slug"
+  if git -C "$REPO" show-ref --verify -q "refs/heads/$pb"; then
+    git -C "$REPO" rev-parse "$pb"
+  else
+    [ "$DRY_RUN" = 1 ] || git -C "$REPO" branch "$pb" "$MAIN" >/dev/null 2>&1
+    git -C "$REPO" rev-parse "$pb" 2>/dev/null || git -C "$REPO" rev-parse "$MAIN"
+  fi
+}
+
 # Current phase = derived purely from the bead's labels (single source of truth).
 phase_of() {
   local L; L=$(br list --id "$1" --json 2>/dev/null | jq -r '.issues[0].labels // [] | join(" ")')
@@ -67,13 +88,14 @@ phase_of() {
 load_worktree() {
   local id="$1" branch="u/tfriedman/iar-$1" basef="$LOG_DIR/base-$1"
   WT="$REPO/.claude/worktrees/iar-$1"
+  PRG=$(prgroup_of "$id")                       # '' for a standalone bead; global for callers
   if [ -d "$WT" ]; then
     BASE=$(val "$basef")
-    [ "$BASE" = 0 ] && BASE=$(git -C "$REPO" rev-parse HEAD)
+    [ "$BASE" = 0 ] && BASE=$(prgroup_base "$PRG")
     return 0   # explicit: a bare `return` here would propagate the `&&` test's exit 1 and set -e would kill the caller
   fi
-  BASE=$(git -C "$REPO" rev-parse HEAD)
-  [ "$DRY_RUN" = 1 ] && return 0
+  BASE=$(prgroup_base "$PRG")                    # PR-group members cut from the PR branch HEAD (sees merged siblings); standalone from main
+  [ "$DRY_RUN" = 1 ] && { echo "  DRY: $id base=${PRG:+pr/$PRG @ }$BASE"; return 0; }
   git -C "$REPO" worktree add -b "$branch" "$WT" "$BASE" >/dev/null 2>&1 \
     || git -C "$REPO" worktree add "$WT" "$branch" >/dev/null 2>&1   # branch may already exist
   echo "$BASE" > "$basef"
@@ -128,6 +150,32 @@ spawn_reviewer() {  # $1 bead
   ' _ "$id" "$WT" "$BASE" "$ACTOR" "$LOG_DIR/review-$id.log" "$critf" >"$LOG_DIR/revwrap-$id.log" 2>&1 &
 }
 
+# INTEGRATE: an approved PR-group bead's done-condition is its code merged into the PR branch (the
+# cheap, local equivalent of "the PR merged" — which is already what closing a bead requires).
+# Merge happens in a dedicated PR worktree so the user's main checkout/HEAD is never touched.
+# Order is load-bearing: merge succeeds -> THEN close (close is what unblocks dependents, and a
+# dependent must never be cut from a PR branch missing this bead). Conflict -> do NOT close.
+# ponytail: one mkdir-lock per PR-group serializes concurrent integrates; a real queue only if a
+# group ever gets wide enough to actually contend.
+integrate_bead() {  # $1 bead  $2 pr-slug
+  local id="$1" slug="$2" pb="pr/$2" bb="u/tfriedman/iar-$1"
+  local pwt="$REPO/.claude/worktrees/pr-$2" lock="$LOG_DIR/pr-$2.lock"
+  local tries=0
+  while ! mkdir "$lock" 2>/dev/null; do tries=$((tries+1)); [ "$tries" -gt 120 ] && { echo "[$(date +%T)] $id integrate: lock busy, retry next tick"; return 0; }; sleep 1; done
+  [ -d "$pwt" ] || git -C "$REPO" worktree add "$pwt" "$pb" >/dev/null 2>&1
+  git -C "$pwt" checkout "$pb" >/dev/null 2>&1
+  if git -C "$pwt" merge --no-ff -m "integrate $id into $pb" "$bb" >/dev/null 2>&1; then
+    br close "$id" --reason "integrated into $pb" --actor "$ACTOR" >/dev/null 2>&1
+    echo "[$(date +%T)] $id integrated into $pb and closed"
+  else
+    git -C "$pwt" merge --abort >/dev/null 2>&1
+    br comments add "$id" --actor "$ACTOR" -m "MERGE CONFLICT integrating $bb into $pb — a sibling bead in this PR-group likely edited the same files without a blocks edge. Resolve in $pwt, then close; or add the missing blocks edge and re-run. Bead left approved (not closed) so dependents stay blocked." >/dev/null 2>&1 || true
+    br update "$id" --add-label needs-human --actor "$ACTOR" >/dev/null 2>&1 || true
+    echo "[$(date +%T)] $id MERGE CONFLICT into $pb -> needs-human"
+  fi
+  rmdir "$lock" 2>/dev/null || true
+}
+
 # Advance ONE owned bead by at most one phase step. Never acts while a worker for it is alive.
 advance() {  # $1 bead
   local id="$1" cur; cur=$(phase_of "$id")
@@ -142,7 +190,11 @@ advance() {  # $1 bead
   fi
 
   case "$cur" in
-    human|approved) return 0 ;;                    # hold / done
+    human) return 0 ;;                             # hold
+    approved)                                      # done-for-review: integrate into the PR branch, then close
+      local slug; slug=$(prgroup_of "$id")
+      [ -z "$slug" ] && return 0                    # no pr: label -> its own 1-bead PR; terminal, human opens it (unchanged)
+      integrate_bead "$id" "$slug" ;;
     review)
       maxed "$af" "$PHASE_CAP" && { escalate_stuck "$id" review; return 0; }
       inc "$af"; echo "[$(date +%T)] $id -> reviewer"; spawn_reviewer "$id" ;;

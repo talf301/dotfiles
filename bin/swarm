@@ -97,9 +97,13 @@ _answer() {  # $1 = id (interactive: prompt for the decision, then resume)
 _resume() { local id="$1"; [ -z "$id" ] && return; br update "$id" --remove-label needs-human >/dev/null 2>&1; echo "→ resumed $id"; sleep 1; }
 _close()  { local id="$1"; [ -z "$id" ] && return; printf '\nClose %s? [y/N] ' "$id"; read -r yn; case "$yn" in [yY]*) br close "$id" --reason "closed via swarm" >/dev/null 2>&1 && echo "→ closed $id";; *) echo "cancelled";; esac; sleep 1; }
 
-_pr() {  # $1 = id — push the approved branch and open a DRAFT PR (never a local merge into main)
+_pr() {  # $1 = id — push the branch and open a DRAFT PR (never a local merge into main)
   local id="$1"; [ -z "$id" ] && return
-  local branch="u/tfriedman/iar-$id"
+  # PR-group aware: a bead labelled pr:<slug> ships as part of the shared pr/<slug> branch (all the
+  # group's beads, in dep order). No pr: label -> the per-bead branch (its own 1-bead PR, unchanged).
+  local branch slug
+  slug="$(br list --id "$id" --json 2>/dev/null | jq -r '.issues[0].labels // [] | map(select(startswith("pr:"))) | .[0] // empty' | sed 's/^pr://')"
+  if [ -n "$slug" ] && git -C "$REPO" rev-parse --verify "pr/$slug" >/dev/null 2>&1; then branch="pr/$slug"; else branch="u/tfriedman/iar-$id"; fi
   if ! git -C "$REPO" rev-parse --verify "$branch" >/dev/null 2>&1; then echo "no branch $branch"; sleep 2; return; fi
   local title; title="$(br list --id "$id" --json 2>/dev/null | jq -r ".issues[0].title // \"iar-$id\"")"
   printf '\nOpen a DRAFT PR for %s\n  branch: %s → main\n  title:  %s\nProceed? [y/N] ' "$id" "$branch" "$title"; read -r yn

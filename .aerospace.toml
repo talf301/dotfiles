@@ -4,8 +4,8 @@
 # But the feature is very helpful.
 # Normalizations eliminate all sorts of weird tree configurations that don't make sense.
 # Give normalizations a chance and enable them back.
-enable-normalization-flatten-containers = false
-enable-normalization-opposite-orientation-for-nested-containers = false
+enable-normalization-flatten-containers = true
+enable-normalization-opposite-orientation-for-nested-containers = true
 
 # Mouse follows focus when focused monitor changes
 on-focused-monitor-changed = ['move-mouse monitor-lazy-center']
@@ -36,7 +36,7 @@ exec-on-workspace-change = ['/bin/bash', '-c',
 
 [mode.main.binding]
     # See: https://nikitabobko.github.io/AeroSpace/goodies#open-a-new-window-with-applescript
-    alt-cmd-ctrl-enter = 'exec-and-forget open -n -a Alacritty'
+    alt-cmd-ctrl-enter = 'exec-and-forget open -n -a Wezterm'
 
     # i3 wraps focus by default
     alt-cmd-ctrl-h =         'focus --boundaries-action wrap-around-the-workspace left'
@@ -51,12 +51,12 @@ exec-on-workspace-change = ['/bin/bash', '-c',
 
     # Consider using 'join-with' command as a 'split' replacement if you want to enable
     # normalizations
-    alt-cmd-ctrl-b = 'split horizontal'
-    alt-cmd-ctrl-v = 'split vertical'
+    # alt-cmd-ctrl-b = 'split horizontal'
+    # alt-cmd-ctrl-v = 'split vertical'
 
     alt-cmd-ctrl-f = 'fullscreen'
 
-    alt-s = 'layout v_accordion' # 'layout stacking' in i3
+    alt-s = 'layout v_accordion' # 'layout stacking' in i3s
     alt-w = 'layout h_accordion' # 'layout tabbed' in i3
     alt-e = 'layout tiles horizontal vertical' # 'layout toggle split' in i3
 

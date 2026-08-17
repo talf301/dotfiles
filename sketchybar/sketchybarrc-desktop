@@ -1,10 +1,21 @@
 #!/usr/bin/env zsh
 
 FONT_FACE="JetBrainsMono Nerd Font"
-PLUGIN_DIR="$HOME/.config/sketchybar/plugins-desktop"
 PLUGIN_SHARED_DIR="$HOME/.config/sketchybar/plugins"
 
-SPOTIFY_EVENT="com.spotify.client.PlaybackStateChanged"
+if [[ -n "$SKETCHYBAR_LAPTOP" ]]; then
+    BAR_DISPLAY="main"
+    WORKSPACE_LABEL_PADDING=12
+    WORKSPACE_ICON_PADDING=10
+    WORKSPACE_LABEL_FONT_SIZE=16
+    MAX_WORKSPACE_APPS=2
+else
+    BAR_DISPLAY="all"
+    WORKSPACE_LABEL_PADDING=20
+    WORKSPACE_ICON_PADDING=10
+    WORKSPACE_LABEL_FONT_SIZE=16
+    MAX_WORKSPACE_APPS=999
+fi
 
 sketchybar --bar \
     height=32 \
@@ -14,7 +25,7 @@ sketchybar --bar \
     padding_left=0 \
     padding_right=0 \
     notch_width=188 \
-    display=all \
+    display="$BAR_DISPLAY" \
 
 sketchybar --default \
     background.height=32 \
@@ -28,62 +39,89 @@ sketchybar --default \
     label.padding_left=0 \
     label.padding_right=5
 
-sketchybar --add item current_space left \
-    --set current_space \
-    display=1 \
+sketchybar --add item claude_budget right \
+    --set claude_budget \
+    icon=:claude: \
+    icon.font="sketchybar-app-font:Regular:18.0" \
     background.color=0xfff5a97f \
-    label.drawing=off \
-    script="$PLUGIN_SHARED_DIR/current_space.sh" \
-    --subscribe current_space space_change mouse.clicked
+    update_freq=300 \
+    script="$PLUGIN_SHARED_DIR/ai_budget.sh claude"
 
-sketchybar --add item front_app left \
-    --set front_app \
-    background.color=0xffa6da95 \
-    background.padding_left=0 \
-    background.padding_right=0 \
-    icon.y_offset=1 \
-    label.drawing=no \
-    script="$PLUGIN_SHARED_DIR/front_app.sh" \
-    --add item front_app.separator left \
-    --set front_app.separator \
-    background.color=0x00000000 \
-    icon= \
-    icon.color=0xffa6da95 \
-    icon.font="$FONT_FACE:Bold:23.0" \
-    icon.padding_left=0 \
-    icon.padding_right=0 \
-    icon.y_offset=1 \
-    label.drawing=no #\
-    # --add item front_app.name left \
-    # --set front_app.name \
-    # background.color=0x00000000 \
-    # icon.drawing=off \
-    # label.font="$FONT_FACE:Bold:16.0" \
-    # label.color=0xffcad3f5 \
-    # label.padding_left=5
+sketchybar --add item codex_budget right \
+    --set codex_budget \
+    icon=:codex: \
+    icon.font="sketchybar-app-font:Regular:18.0" \
+    background.color=0xfff5bde6 \
+    update_freq=300 \
+    script="$PLUGIN_SHARED_DIR/ai_budget.sh codex"
 
-sketchybar --add bracket front_app_bracket \
-    front_app \
-    front_app.separator \
-    front_app.name \
-    --subscribe front_app front_app_switched
+sketchybar --add item overseer_mail right \
+    --set overseer_mail \
+    icon= \
+    icon.font="JetBrainsMono Nerd Font:Regular:15.0" \
+    icon.color=0xfff38ba8 \
+    drawing=off \
+    update_freq=30 \
+    script="$PLUGIN_SHARED_DIR/overseerMail.sh"
+
 
 sketchybar --add item clock right \
     --set clock \
     icon=󰃰 \
-    background.color=0xffed8796 \
+    background.color=0xffc6a0f6 \
     update_freq=10 \
     script="$PLUGIN_SHARED_DIR/clock.sh"
 
-sketchybar --add event spotify_change $SPOTIFY_EVENT \
-    --add item spotify right \
-    --set spotify \
-    icon= \
-    icon.y_offset=1 \
-    label.drawing=off \
-    label.padding_left=3 \
-    script="$PLUGIN_DIR/spotify.sh" \
-    --subscribe spotify spotify_change mouse.clicked
+sketchybar --add item battery right \
+    --set battery \
+    background.color=0xff8aadf4 \
+    update_freq=60 \
+    script="$PLUGIN_SHARED_DIR/battery.sh" \
+    --subscribe battery power_source_change system_woke
+
+sketchybar --add item volume right \
+    --set volume \
+    background.color=0xff8bd5ca \
+    script="$PLUGIN_SHARED_DIR/volume.sh" \
+    --subscribe volume volume_change mouse.scrolled
+
+sketchybar --add item wifi right \
+    --set wifi \
+    background.color=0xffa6da95 \
+    update_freq=15 \
+    script="$PLUGIN_SHARED_DIR/wifi.sh" \
+    --subscribe wifi wifi_change
+
+sketchybar --add item calendar right \
+    --set calendar \
+    background.color=0xffed8796 \
+    update_freq=60 \
+    script="SKETCHYBAR_LAPTOP=${SKETCHYBAR_LAPTOP:-0} $PLUGIN_SHARED_DIR/calendar.sh" \
+    --subscribe calendar mouse.clicked
+
+sketchybar --add item display_watcher left \
+    --set display_watcher \
+    drawing=off \
+    script="$PLUGIN_SHARED_DIR/display_change.sh ${SKETCHYBAR_LAPTOP:-0}" \
+    --subscribe display_watcher display_change
+
+if [[ -z "$SKETCHYBAR_LAPTOP" ]]; then
+    sketchybar --add item ytmusic right \
+        --set ytmusic \
+        background.color=0xfff5a97f \
+        icon.y_offset=1 \
+        update_freq=5 \
+        script="$PLUGIN_SHARED_DIR/ytmusic.sh" \
+        --subscribe ytmusic mouse.clicked
+fi
+
+if [[ -z "$SKETCHYBAR_LAPTOP" ]]; then
+    # Right-side items render in reverse of this internal order.
+    sketchybar --reorder clock battery volume wifi codex_budget claude_budget ytmusic
+else
+    sketchybar --reorder clock battery volume wifi codex_budget claude_budget
+fi
+
 
 sketchybar --add event aerospace_workspace_change
 
@@ -120,12 +158,13 @@ while IFS='|' read -r monitor_id nsscreen_id; do
       background.height=25 \
       icon="$sid" \
       icon.color=0xffcad3f5 \
-      icon.padding_left=10 \
+      icon.padding_left=$WORKSPACE_ICON_PADDING \
+      icon.padding_right=5 \
       icon.shadow.distance=4 \
       icon.shadow.color=0xA0000000 \
       label.color=0xffcad3f5 \
-      label.font="sketchybar-app-font:Regular:16.0" \
-      label.padding_right=20 \
+      label.font="sketchybar-app-font:Regular:${WORKSPACE_LABEL_FONT_SIZE}.0" \
+      label.padding_right=$WORKSPACE_LABEL_PADDING \
       label.padding_left=0 \
       label.y_offset=-1 \
       label.shadow.drawing=off \
@@ -143,11 +182,24 @@ for monitor_id in $(aerospace list-monitors --format "%{monitor-id}"); do
 
     sketchybar --set space.$sid drawing=on
 
-    icon_strip=" "
+    icon_strip=""
     if [ "${apps}" != "" ]; then
+      typeset -A seen_workspace_icons=()
+      app_count=0
       while read -r app; do
-        icon_strip+=" $($PLUGIN_SHARED_DIR/icon_map_fn.sh "$app")"
+        app_icon="$($HOME/.config/sketchybar/helpers/icon_map.sh "$app")"
+        if [[ -n "${seen_workspace_icons[$app_icon]}" ]]; then
+          continue
+        fi
+        seen_workspace_icons[$app_icon]=1
+        if (( app_count < MAX_WORKSPACE_APPS )); then
+          icon_strip+="$app_icon"
+        fi
+        (( app_count++ ))
       done <<<"${apps}"
+      if (( app_count > MAX_WORKSPACE_APPS )); then
+        icon_strip+="…"
+      fi
     else
       icon_strip=""
     fi

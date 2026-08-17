@@ -34,6 +34,31 @@ sketchybar --default \
     label.padding_left=0 \
     label.padding_right=5
 
+sketchybar --add item claude_budget left \
+    --set claude_budget \
+    icon=:claude: \
+    icon.font="sketchybar-app-font:Regular:18.0" \
+    background.color=0xfff5a97f \
+    update_freq=300 \
+    script="$PLUGIN_SHARED_DIR/ai_budget.sh claude"
+
+sketchybar --add item codex_budget left \
+    --set codex_budget \
+    icon=:codex: \
+    icon.font="sketchybar-app-font:Regular:18.0" \
+    background.color=0xff8aadf4 \
+    update_freq=300 \
+    script="$PLUGIN_SHARED_DIR/ai_budget.sh codex"
+
+sketchybar --add item overseer_mail left \
+    --set overseer_mail \
+    icon= \
+    icon.font="$FONT_FACE:Regular:15.0" \
+    icon.color=0xfff38ba8 \
+    drawing=off \
+    update_freq=30 \
+    script="$PLUGIN_SHARED_DIR/overseerMail.sh"
+
 sketchybar --add event spotify_change $SPOTIFY_EVENT \
     --add item spotify e \
     --set spotify \

@@ -17,7 +17,7 @@
 #   swarm resume <id>         drop needs-human, hand back to the swarm
 #
 # TUI keys:  enter=detail  a=answer  f=fable-chat  p=open-PR  d=done  c=close  r=resume
-#            s=poller-on/off  /=filter-mode (esc exits)  q=quit
+#            s=poller-on/off  /=filter-mode (type freely; esc returns to actions)  q=quit
 #
 # Requires: br, jq, fzf, git.  bash 3.2-safe (stock macOS).
 set -uo pipefail
@@ -187,13 +187,32 @@ _chat() {  # $1 = id — open a live Fable session on a hard/structural bead in 
     git -C "$wt" --no-pager diff "$base"..HEAD 2>/dev/null
     echo '```'
   } > "$ctx"
-  local prompt="You are Fable, a fresh third set of eyes on blocked IAR bead $id. Read $ctx — it has the bead, the escalation question (the latest comment), the diff so far, and how to hand back when we're done. Start by reading it and giving me your read of the problem."
+  local prompt="You are Fable, a fresh third set of eyes on blocked IAR bead $id. Read $ctx — it has the bead, the escalation question (the latest comment), the diff so far, and how to hand back when we're done. Start now: read it, investigate, and present your read of the problem — what's blocking it and whether it's actually solvable — before waiting for me."
   if command -v herdr >/dev/null 2>&1; then
     # herdr-native: open a new tab in the worktree, then start Fable (claude) in its pane.
+    # herdr agent names are 1-32 chars of [a-z0-9_-]; bead ids run longer and can contain '.',
+    # so 'fable-<id>' is rejected (invalid_agent_name) and the agent silently never starts. Sanitize
+    # and keep the distinctive tail so sub-beads (…-04w.3 vs …-04w.5) stay distinct.
+    local sid; sid="$(printf '%s' "$id" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9_-' '-')"
+    local aname="fable-${sid: -26}"
     local pane
     pane="$(herdr tab create --cwd "$wt" --label "fable-$id" --focus 2>/dev/null | jq -r '.result.root_pane.pane_id // empty')"
-    [ -n "$pane" ] && herdr agent start "fable-$id" --kind claude --pane "$pane" -- \
-      --model claude-fable-5 --add-dir "$wt" "$prompt" >/dev/null 2>&1 &
+    # herdr returns the pane_id before its shell reaches an interactive prompt; agent start against a
+    # not-yet-ready pane fails with agent_pane_busy and the agent never launches (tab opens, nothing runs).
+    # Backgrounded already, so retry cheaply until the shell is available.
+    # A positional prompt to `claude` is NOT auto-submitted (it launches to an empty input line), so
+    # kick Fable off by typing the prompt into its pane and pressing Enter once the agent is ready.
+    [ -n "$pane" ] && (
+      for _ in $(seq 8); do
+        out="$(herdr agent start "$aname" --kind claude --pane "$pane" -- \
+                 --model claude-fable-5 --add-dir "$wt" 2>&1)"
+        case "$out" in
+          *agent_started*) sleep 1; herdr pane send-text "$pane" "$prompt" && herdr pane send-keys "$pane" Enter; break;;
+          *agent_pane_busy*) sleep 1;;
+          *) break;;
+        esac
+      done
+    ) >/dev/null 2>&1 &
   else
     # fallback (no herdr): a launcher script opened in a new Terminal window.
     local launch="/tmp/iar-chat-$id.command"
@@ -214,7 +233,7 @@ _toggle() {  # start/stop the supervisor poller, detached so the TUI keeps runni
 }
 
 _hdr() {  # live header: is the poller actually running?
-  local keys='enter:detail  a:answer  f:fable  p:PR  d:done  c:close  r:resume  s:poller  /:filter  q:quit'
+  local keys='enter:detail  a:answer  f:fable  p:PR  d:done  c:close  r:resume  s:poller  q:quit  |  press / to type-filter (esc back)'
   if pgrep -f "swarm-supervisor.sh" >/dev/null 2>&1; then
     printf '● poller ON  (s: stop)   |   %s\n' "$keys"
   else
@@ -230,7 +249,7 @@ _tui() {
     --header-first --reverse --no-sort --prompt='swarm> ' \
     --preview="$SELF __preview {1}" --preview-window='down,50%,wrap,border-top' \
     --bind="start:reload($SELF __list)+transform-header($SELF __hdr)" \
-    --bind="load:reload(sleep $REFRESH && $SELF __list)+transform-header($SELF __hdr)" \
+    --bind="load:reload-sync(sleep $REFRESH; $SELF __list)+transform-header($SELF __hdr)" \
     --bind="ctrl-r:reload($SELF __list)" \
     --bind="/:unbind($ACT)+change-prompt(filter [esc→actions]> )" \
     --bind="esc:clear-query+rebind($ACT)+change-prompt(swarm> )" \

@@ -7,7 +7,7 @@
 # wait on an async reviewer). Instead the supervisor drives phases off Beads LABELS it can read:
 #
 #   (claimed, no iar: label)   -> spawn IMPLEMENTER  -> agent sets  iar:awaiting-review
-#   iar:awaiting-review        -> spawn REVIEWER     -> wrapper sets iar:approved | iar:changes-requested
+#   iar:awaiting-review        -> spawn REVIEWER     -> wrapper sets iar:approved | iar:changes-requested | needs-human
 #   iar:changes-requested      -> spawn FIXER        -> agent sets  iar:awaiting-review
 #   iar:approved               -> DONE (human merges; no auto-merge in v1)
 #   needs-human                -> HOLD (the escalation gate)
@@ -135,14 +135,17 @@ spawn_reviewer() {  # $1 bead
   nohup bash -c '
     id="$1"; wt="$2"; base="$3"; actor="$4"; rlog="$5"; critf="$6"
     cd "$wt" || exit 1
-    codex exec -m gpt-5.6-sol -s read-only "You are the independent REVIEWER for bead $id (iar-worker:$id). Do NOT run br and do NOT search CASS (the read-only sandbox blocks their locks). Do NOT modify anything. Read the acceptance criteria with: cat $critf . Review ONLY the fixed range $base..HEAD: run git diff $base HEAD and read the changed files. You cannot run pytest under read-only; use non-writing checks (python3 -c import, ast.parse) and the implementer stated results. Judge against the criteria and repo standards (correctness, security, tests, maintainability, scope creep). List findings (file:line, impact, concrete fix), then print exactly one final line: VERDICT: APPROVED  or  VERDICT: CHANGES REQUESTED." < /dev/null > "$rlog" 2>&1 || true
-    # Take the LAST verdict line: codex echoes the prompt (which names both verdicts), so the
+    codex exec -m gpt-5.6-sol -s read-only "You are the independent REVIEWER for bead $id (iar-worker:$id). Do NOT run br and do NOT search CASS (the read-only sandbox blocks their locks). Do NOT modify anything. Read the acceptance criteria with: cat $critf . Review ONLY the fixed range $base..HEAD: run git diff $base HEAD and read the changed files. You cannot run pytest under read-only; use non-writing checks (python3 -c import, ast.parse) and the implementer stated results. Judge against the criteria and repo standards (correctness, security, tests, maintainability, scope creep). List findings (file:line, impact, concrete fix), then print exactly one final line, choosing ONE of three verdicts: VERDICT: APPROVED  or  VERDICT: CHANGES REQUESTED  or  VERDICT: NEEDS HUMAN . Use NEEDS HUMAN when the remaining gap CANNOT be closed by an automated headless implementer for a valid structural reason — it requires credentials, VPN, real hardware, a cluster/live run, or a human decision the sandbox cannot provide — so more fix cycles would only re-hit the same dead end; in that case make your findings state exactly what human action is required. Prefer NEEDS HUMAN over CHANGES REQUESTED whenever the fix is a human-only action rather than a code change the implementer could make." < /dev/null > "$rlog" 2>&1 || true
+    # Take the LAST verdict line: codex echoes the prompt (which names every verdict), so the
     # real answer is always the final match. stdin closed above or codex hangs reading it.
-    v=$(grep -oE "VERDICT: (APPROVED|CHANGES REQUESTED)" "$rlog" | tail -1)
+    v=$(grep -oE "VERDICT: (APPROVED|CHANGES REQUESTED|NEEDS HUMAN)" "$rlog" | tail -1)
     if [ "$v" = "VERDICT: APPROVED" ]; then
       br update "$id" --add-label iar:approved --remove-label iar:awaiting-review --actor "$actor" >/dev/null 2>&1 || true
     elif [ "$v" = "VERDICT: CHANGES REQUESTED" ]; then
       br update "$id" --add-label iar:changes-requested --remove-label iar:awaiting-review --actor "$actor" >/dev/null 2>&1 || true
+    elif [ "$v" = "VERDICT: NEEDS HUMAN" ]; then
+      # reviewer judged the block human-only: escalate straight to the hold state, skip the fix loop.
+      br update "$id" --add-label needs-human --remove-label iar:awaiting-review --actor "$actor" >/dev/null 2>&1 || true
     fi
     # Record the verdict on the bead (durable human/fixer-readable provenance; replaces the old mail).
     [ -n "$v" ] && br comments add "$id" --actor "reviewer:sol" -m "$v (reviewer:sol) — full findings in $rlog" >/dev/null 2>&1 || true

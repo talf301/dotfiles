@@ -37,7 +37,7 @@ MAIN="${MAIN:-main}"                        # trunk that PR branches (and standa
 MAX_INFLIGHT="${MAX_INFLIGHT:-3}"          # cap concurrently-owned beads
 POLL_SECS="${POLL_SECS:-60}"
 LOG_DIR="${LOG_DIR:-/tmp/swarm-logs}"
-ACTOR="${ACTOR:-swarm-$(hostname -s)}"     # claim identity — STABLE per host (no $$), so a restarted poller reclaims its own in-flight beads instead of orphaning them. Single poller per host (the `swarm` toggle enforces one); set ACTOR explicitly to run more.
+ACTOR="${ACTOR:-swarm-precog}"             # claim identity — pinned, NOT hostname-derived: EC2 private IPs (hence `hostname -s`) roll on stop/start, which would mint a new actor and orphan in-flight claims. A fixed name means a restarted poller reclaims its own beads. One poller per DB (the `swarm` toggle enforces one); set ACTOR explicitly to run more.
 PHASE_CAP="${PHASE_CAP:-2}"                # max spawn attempts in one phase before needs-human
 FIX_CAP="${FIX_CAP:-2}"                    # max review->changes cycles before needs-human
 DRY_RUN="${DRY_RUN:-0}"
@@ -218,7 +218,7 @@ tick() {
 
   # 2. Claim new ready work up to the cap, then let advance() kick off its implement phase.
   br scheduler --format json 2>/dev/null \
-    | jq -r '.recommendations[] | select(.evidence.stale_claim.classification=="unassigned") | .issue.id' \
+    | jq -r '.recommendations[] | select(.evidence.stale_claim.classification=="unassigned") | select(.issue.issue_type=="task") | .issue.id' \
   | while IFS= read -r id; do
       [ -z "$id" ] && continue
       if [ "$(inflight)" -ge "$MAX_INFLIGHT" ]; then echo "[$(date +%T)] at capacity ($MAX_INFLIGHT), holding"; break; fi

@@ -32,5 +32,15 @@ done < <(find "$WORKTREE" -maxdepth 4 -type d -name src -not -path '*/.venv/*' -
 
 [ -n "$py_path" ] || { echo "iar-run-tests.sh: no */src dirs found under $WORKTREE" >&2; exit 1; }
 
+# Generated protobuf modules (*_pb2.py) live in bazel-bin virtual-imports dirs, not under src — so
+# they otherwise resolve to the MAIN checkout's bazel-bin via the venv's .pth entries. When the
+# worktree's protos differ from the main checkout's (e.g. an unmerged enum addition), that stale
+# pb2 makes every proto-codec import crash. If the worktree has its own bazel-built protos (e.g.
+# `bazel build //fleet/common:py-proto-library`), put them FIRST so the worktree's proto sources
+# win. PYTHONPATH precedes site-packages .pth entries, so this shadows cleanly.
+while IFS= read -r vimp; do
+  py_path="$vimp:$py_path"
+done < <(find -L "$WORKTREE/bazel-bin" -type d -path '*/_virtual_imports/*' -not -path '*/external/*' 2>/dev/null)
+
 cd "$WORKTREE"
 exec env PYTHONPATH="$py_path" "$PYTHON" -m pytest "$@" < /dev/null

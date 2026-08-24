@@ -38,9 +38,22 @@ MAX_INFLIGHT="${MAX_INFLIGHT:-3}"          # cap concurrently-owned beads
 POLL_SECS="${POLL_SECS:-60}"
 LOG_DIR="${LOG_DIR:-/tmp/swarm-logs}"
 ACTOR="${ACTOR:-swarm-precog}"             # claim identity — pinned, NOT hostname-derived: EC2 private IPs (hence `hostname -s`) roll on stop/start, which would mint a new actor and orphan in-flight claims. A fixed name means a restarted poller reclaims its own beads. One poller per DB (the `swarm` toggle enforces one); set ACTOR explicitly to run more.
+PR_BRANCH_PREFIX="${PR_BRANCH_PREFIX:-u/tfriedman/pr}"  # PR-group integration branches; u/<user>/ prefix per repo convention so they never collide with anyone else's branches
 PHASE_CAP="${PHASE_CAP:-2}"                # max spawn attempts in one phase before needs-human
 FIX_CAP="${FIX_CAP:-2}"                    # max review->changes cycles before needs-human
 DRY_RUN="${DRY_RUN:-0}"
+
+# Single-instance guard: two pollers race the same beads and double-spawn workers (fixer A and
+# fixer B both writing one worktree). `swarm on` and the TUI toggle check this too, but a bare
+# `nohup swarm-supervisor.sh &` bypasses both — enforce it here. DRY_RUN passes through: a dry
+# tick mutates nothing and is the self-check path.
+if [ "$DRY_RUN" != 1 ]; then
+  _others="$(pgrep -f 'swarm-supervisor\.sh' | grep -vw "$$" || true)"
+  if [ -n "$_others" ]; then
+    echo "swarm-supervisor: another poller is already running (pid $(printf '%s\n' $_others | head -1)); refusing to start a second one" >&2
+    exit 1
+  fi
+fi
 mkdir -p "$LOG_DIR"
 
 # ---- tiny state helpers (throwaway counters under $LOG_DIR, keyed by bead) -------------------
@@ -51,10 +64,19 @@ maxed()    { [ "$(val "$1")" -ge "$2" ]; }   # attempts: escalate once N failed 
 
 inflight()   { br list --assignee "$ACTOR" --status in_progress --json 2>/dev/null | jq '.issues | length'; }
 proc_alive() { pgrep -f "iar-worker:$1" >/dev/null 2>&1; }   # any phase process for this bead
+# no_swarm: a bead the swarm must never implement — either explicitly labelled `no-swarm` (by
+# spec-to-beads) or any wayfinder:<phase> map bead (design/grilling/research/prototype decisions
+# owned by the human; an unassigned wayfinder bead was claimed the moment its blocker closed —
+# assignment must not be the only guard on a map).
+# Read LIVE from `br list --id` (not `br scheduler`'s snapshot, whose labels can lag a just-applied
+# label) so it's authoritative at both claim time and advance time — labelling an in-flight bead
+# `no-swarm` cleanly ejects it from the pipeline.
+no_swarm()   { br list --id "$1" --json 2>/dev/null | jq -e '.issues[0].labels // [] | any(.[]; . == "no-swarm" or startswith("wayfinder:"))' >/dev/null 2>&1; }
 
 # ---- PR-group helpers: a bead labelled pr:<slug> bases off the PR branch, not main ---------------
 # A PR-group is the integration unit — one or more beads that ship as one PR — carried as a `pr:<slug>`
 # label (orthogonal to epics, which are parent-child organization and do NOT drive integration).
+# The integration branch is $PR_BRANCH_PREFIX/<slug> (i.e. u/tfriedman/pr/<slug>).
 # prgroup_of: the pr:<slug> a bead belongs to, or '' (a bead with no pr: label is its own 1-bead PR,
 # branched off main, terminal for a human PR — i.e. exactly the old behavior).
 prgroup_of() { br list --id "$1" --json 2>/dev/null | jq -r '.issues[0].labels // [] | map(select(startswith("pr:"))) | .[0] // empty' | sed 's/^pr://'; }
@@ -63,7 +85,7 @@ prgroup_of() { br list --id "$1" --json 2>/dev/null | jq -r '.issues[0].labels /
 prgroup_base() {
   local slug="$1" pb
   [ -z "$slug" ] && { git -C "$REPO" rev-parse HEAD; return 0; }
-  pb="pr/$slug"
+  pb="$PR_BRANCH_PREFIX/$slug"
   if git -C "$REPO" show-ref --verify -q "refs/heads/$pb"; then
     git -C "$REPO" rev-parse "$pb"
   else
@@ -95,7 +117,7 @@ load_worktree() {
     return 0   # explicit: a bare `return` here would propagate the `&&` test's exit 1 and set -e would kill the caller
   fi
   BASE=$(prgroup_base "$PRG")                    # PR-group members cut from the PR branch HEAD (sees merged siblings); standalone from main
-  [ "$DRY_RUN" = 1 ] && { echo "  DRY: $id base=${PRG:+pr/$PRG @ }$BASE"; return 0; }
+  [ "$DRY_RUN" = 1 ] && { echo "  DRY: $id base=${PRG:+$PR_BRANCH_PREFIX/$PRG @ }$BASE"; return 0; }
   git -C "$REPO" worktree add -b "$branch" "$WT" "$BASE" >/dev/null 2>&1 \
     || git -C "$REPO" worktree add "$WT" "$branch" >/dev/null 2>&1   # branch may already exist
   echo "$BASE" > "$basef"
@@ -161,7 +183,7 @@ spawn_reviewer() {  # $1 bead
 # ponytail: one mkdir-lock per PR-group serializes concurrent integrates; a real queue only if a
 # group ever gets wide enough to actually contend.
 integrate_bead() {  # $1 bead  $2 pr-slug
-  local id="$1" slug="$2" pb="pr/$2" bb="u/tfriedman/iar-$1"
+  local id="$1" slug="$2" pb="$PR_BRANCH_PREFIX/$2" bb="u/tfriedman/iar-$1"
   local pwt="$REPO/.claude/worktrees/pr-$2" lock="$LOG_DIR/pr-$2.lock"
   local tries=0
   while ! mkdir "$lock" 2>/dev/null; do tries=$((tries+1)); [ "$tries" -gt 120 ] && { echo "[$(date +%T)] $id integrate: lock busy, retry next tick"; return 0; }; sleep 1; done
@@ -214,13 +236,21 @@ advance() {  # $1 bead
 tick() {
   # 1. Advance every bead this supervisor already owns.
   br list --assignee "$ACTOR" --status in_progress --json 2>/dev/null | jq -r '.issues[].id' \
-  | while IFS= read -r id; do [ -n "$id" ] && advance "$id"; done
+  | while IFS= read -r id; do
+      [ -z "$id" ] && continue
+      if no_swarm "$id"; then echo "[$(date +%T)] skip owned $id (no-swarm/wayfinder) — release with: br update $id --assignee \"\" -s open"; continue; fi
+      advance "$id"
+    done
 
   # 2. Claim new ready work up to the cap, then let advance() kick off its implement phase.
   br scheduler --format json 2>/dev/null \
-    | jq -r '.recommendations[] | select(.evidence.stale_claim.classification=="unassigned") | select(.issue.issue_type=="task") | .issue.id' \
+    | jq -r '.recommendations[] | select(.evidence.stale_claim.classification=="unassigned") | select(.issue.issue_type=="task") | select((.issue.labels // []) | any(.[]; . == "no-swarm" or startswith("wayfinder:")) | not) | .issue.id' \
   | while IFS= read -r id; do
       [ -z "$id" ] && continue
+      # Authoritative no-swarm gate: the jq filter above reads `br scheduler`'s coordination snapshot,
+      # whose labels can lag a just-applied `--add-label no-swarm`. Re-check LIVE so a design/non-code
+      # bead is never claimed on stale snapshot data.
+      if no_swarm "$id"; then echo "[$(date +%T)] skip $id (no-swarm/wayfinder)"; continue; fi
       if [ "$(inflight)" -ge "$MAX_INFLIGHT" ]; then echo "[$(date +%T)] at capacity ($MAX_INFLIGHT), holding"; break; fi
       if [ "$DRY_RUN" = 1 ]; then echo "  DRY: would claim $id -> implement"; continue; fi
       if br update "$id" --claim --actor "$ACTOR" >/dev/null 2>&1 \

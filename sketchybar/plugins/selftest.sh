@@ -42,19 +42,23 @@ for spec in 0:F0581 20:F057F 50:F0580 90:F057E; do
     check "volume ${spec%%:*}% icon" "$(glyph ${spec#*:})"
 done
 
-# --- calendar: countdown formatting, then the guards ---
+# --- calendar: countdown formatting from an absolute event time, then the guards ---
 CACHE="$HOME/.cache/sketchybar/nextevent"
 SAVE=$(<$CACHE 2>/dev/null)
-cal() { print -n "$1" > $CACHE; : > $SB_LOG; NAME=calendar zsh -f ./calendar.sh }
-for spec in "Standup|300::Standup · 5m" "Long|7800::Long · 2h10m" "Soon|30::Soon · now" "Started|-240::Started · now"; do
+NOW=10000
+cal() { print -n "$1" > $CACHE; : > $SB_LOG; NOW=$NOW NAME=calendar zsh -f ./calendar.sh }
+for spec in "Standup|10300::Standup · 5m" "Long|17800::Long · 2h10m" "Soon|10030::Soon · now" "Started|9760::Started · now"; do
     cal "${spec%%::*}"; check "calendar ${spec%%::*}" "${spec#*::}"
 done
-for bad in "Old|-301" "garbage" ""; do
+print -n "After Sleep|14200" > $CACHE
+: > $SB_LOG; NOW=13600 NAME=calendar zsh -f ./calendar.sh
+check "calendar countdown advances while helper does not run" "After Sleep · 10m"
+for bad in "Old|9699" "garbage" ""; do
     cal "$bad"; check "calendar hides '$bad'" "drawing=off"
 done
-cal "$(printf 'A%.0s' {1..40})|300"; check "calendar truncates long title" "…"
-: > $SB_LOG; print -n "Standup|300|https://meet.example.com/standup" > $CACHE
-NAME=calendar SENDER=mouse.clicked zsh -f ./calendar.sh
+cal "$(printf 'A%.0s' {1..40})|10300"; check "calendar truncates long title" "…"
+: > $SB_LOG; print -n "Standup|10300|https://meet.example.com/standup" > $CACHE
+NOW=$NOW NAME=calendar SENDER=mouse.clicked zsh -f ./calendar.sh
 check "calendar opens meeting URL" "https://meet.example.com/standup"
 print -n "$SAVE" > $CACHE
 

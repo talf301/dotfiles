@@ -1,7 +1,7 @@
 import EventKit
 import Foundation
 
-// Writes "<title>|<seconds until start>|<meeting URL>" for the next event within 12h to the cache
+// Writes "<title>|<Unix start time>|<meeting URL>" for the next event within 12h to the cache
 // file (empty when there is none). EventKit expands recurring events; Calendar.app's
 // AppleScript interface does not, which is why this is a compiled helper.
 
@@ -49,7 +49,7 @@ if !cals.isEmpty {
         let detectedURL = try? NSDataDetector(types: NSTextCheckingResult.CheckingType.link.rawValue)
             .firstMatch(in: text, range: range)?.url
         let url = (e.url ?? detectedURL)?.absoluteString ?? ""
-        result = "\(title)|\(Int(e.startDate.timeIntervalSince(now)))|\(url)"
+        result = "\(title)|\(Int(e.startDate.timeIntervalSince1970))|\(url)"
     }
 }
 write(result)

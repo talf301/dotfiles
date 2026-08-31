@@ -12,8 +12,9 @@ printf '#!/bin/sh\nprintf "%%s\\n" "$FAKE_IPCONFIG"\n'                    > $STU
 printf '#!/bin/sh\nprintf "%%s\\n" "$FAKE_IFCONFIG"\n'                    > $STUB/ifconfig
 printf '#!/bin/sh\nprintf "%%s" "$FAKE_SONG"\n'                             > $STUB/curl
 printf '#!/bin/sh\nprintf "%%s\n" "$FAKE_DISPLAY_COUNT"\n'                > $STUB/aerospace
+printf '#!/bin/sh\nprintf "%%s\n" "$*" >> "$SB_LOG"\n'                  > $STUB/launchctl
 printf '#!/bin/sh\nprintf "%%s\n" "$*" >> "$SB_LOG"\n'                  > $STUB/open
-chmod +x $STUB/sketchybar $STUB/pmset $STUB/osascript $STUB/ipconfig $STUB/ifconfig $STUB/curl $STUB/aerospace $STUB/open
+chmod +x $STUB/sketchybar $STUB/pmset $STUB/osascript $STUB/ipconfig $STUB/ifconfig $STUB/curl $STUB/aerospace $STUB/launchctl $STUB/open
 export PATH="$STUB:$PATH"
 
 typeset -i fail=0
@@ -50,6 +51,7 @@ cal() { print -n "$1" > $CACHE; : > $SB_LOG; NOW=$NOW NAME=calendar zsh -f ./cal
 for spec in "Standup|10300::Standup · 5m" "Long|17800::Long · 2h10m" "Soon|10030::Soon · now" "Started|9760::Started · now"; do
     cal "${spec%%::*}"; check "calendar ${spec%%::*}" "${spec#*::}"
 done
+check "calendar refreshes the EventKit cache" "kickstart gui/$(id -u)/local.sketchybar.nextevent"
 print -n "After Sleep|14200" > $CACHE
 : > $SB_LOG; NOW=13600 NAME=calendar zsh -f ./calendar.sh
 check "calendar countdown advances while helper does not run" "After Sleep · 10m"

@@ -4,6 +4,10 @@
 # never blocks on Calendar and never needs Calendar permission itself.
 CACHE="$HOME/.cache/sketchybar/nextevent"
 
+# StartInterval jobs can remain pending after the launchd GUI domain becomes inactive.
+# Request a refresh from the bar as well; this run updates the cache for the next tick.
+launchctl kickstart "gui/$(id -u)/local.sketchybar.nextevent" >/dev/null 2>&1
+
 OUT=$(<"$CACHE" 2>/dev/null)
 if [[ -z $OUT ]]; then
     sketchybar --set $NAME drawing=off

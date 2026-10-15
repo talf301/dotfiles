@@ -63,7 +63,7 @@ over_cap() { [ "$(val "$1")" -gt "$2" ]; }   # fix-cycles: allow N cycles, escal
 maxed()    { [ "$(val "$1")" -ge "$2" ]; }   # attempts: escalate once N failed tries reached
 
 inflight()   { br list --assignee "$ACTOR" --status in_progress --json 2>/dev/null | jq '.issues | length'; }
-proc_alive() { pgrep -f "iar-worker:$1" >/dev/null 2>&1; }   # any phase process for this bead
+proc_alive() { pgrep -f "iar-worker:$1|iar-review\.sh $1 " >/dev/null 2>&1; }   # any phase process for this bead
 # no_swarm: a bead the swarm must never implement — either explicitly labelled `no-swarm` (by
 # spec-to-beads) or any wayfinder:<phase> map bead (design/grilling/research/prototype decisions
 # owned by the human; an unassigned wayfinder bead was claimed the moment its blocker closed —
@@ -140,39 +140,19 @@ spawn_impl() {  # $1 bead  $2 role(implement|fix)
   if [ "$DRY_RUN" = 1 ]; then echo "  DRY: would spawn ${role} for $id in $WT"; return; fi
   local extra=""
   [ "$role" = fix ] && extra="You are FIXING a prior review. First read the reviewer's findings in $LOG_DIR/review-$id.log (and 'br comments $id' for the recorded verdict), then address only actionable findings. "
-  ( cd "$WT" && claude -p "You are the IMPLEMENTER for bead $id (iar-worker:$id). ${extra}Work ONLY inside this worktree ($WT); never edit anything outside it. Read the bead ('br show $id'), its acceptance criteria, repo instructions, and relevant CASS. Implement the smallest complete solution. Run tests only with: iar-run-tests.sh $WT <pytest-args> (never bazel, never bare pytest). Commit all task changes to the current branch. Then record a review-request note on the bead: WRITE a file /tmp/iar-review-$id.txt containing base SHA $BASE, the head SHA, the acceptance criteria, a concise change summary, the exact checks you ran and their results, and any known risks; then run: br comments add $id --actor $ACTOR -f /tmp/iar-review-$id.txt . (Write the file with your editor — do NOT pack this prose into a shell -m argument, quoting will bite you.) Finally run EXACTLY: br update $id --add-label iar:awaiting-review --remove-label iar:changes-requested --actor $ACTOR . Do not set other labels; do not close the bead; then stop. If you are blocked or need a human decision, record it on the bead: WRITE a file /tmp/iar-esc-$id.txt whose first line is 'ESCALATION — <your exact question and what input you need>', then a line 'To decide+resume: br update $id --notes \"<decision>\" then br update $id --remove-label needs-human', then a line 'To resolve directly: br close $id'; then run: br comments add $id --actor $ACTOR -f /tmp/iar-esc-$id.txt . (Write the file with your editor — do NOT pack prose into -m.) Then run: br update $id --add-label needs-human --actor $ACTOR (leave it in_progress — do NOT release the claim). If the block is STRUCTURAL or needs a rethink rather than a quick factual decision, ALSO run: br update $id --add-label needs-fable --actor $ACTOR (this flags it so the human can open a fresh Fable session on it). Then stop." \
+  ( cd "$WT" && claude -p "You are the IMPLEMENTER for bead $id (iar-worker:$id). ${extra}Work ONLY inside this worktree ($WT); never edit anything outside it. Read the bead ('br show $id'), its acceptance criteria, repo instructions, and relevant CASS. Implement the smallest complete solution. Run tests only with: iar-run-tests.sh $WT <pytest-args> (never bazel, never bare pytest). Commit all task changes to the current branch. Then record a review-request note on the bead: WRITE a file /tmp/iar-review-$id.txt containing base SHA $BASE, the head SHA, the acceptance criteria, a concise change summary, the exact checks you ran and their results, and any known risks; then run: br comments add $id --actor $ACTOR -f /tmp/iar-review-$id.txt . (Write the file with your editor — do NOT pack this prose into a shell -m argument, quoting will bite you.) Finally run EXACTLY: br update $id --add-label iar:awaiting-review --remove-label iar:changes-requested --actor $ACTOR . Do not set other labels; do not close the bead; then stop. If you are blocked or need a human decision, record it on the bead: WRITE a file /tmp/iar-esc-$id.txt whose first line is 'ESCALATION — <your exact question and what input you need>', then a line 'To decide+resume: br update $id --notes \"<decision>\" then br update $id --remove-label needs-human', then a line 'To resolve directly: br close $id'; then run: br comments add $id --actor $ACTOR -f /tmp/iar-esc-$id.txt . (Write the file with your editor — do NOT pack prose into -m.) Then run: br update $id --add-label needs-human --actor $ACTOR (leave it in_progress — do NOT release the claim). If the block is STRUCTURAL or needs a rethink rather than a quick factual decision, ALSO run: br update $id --add-label needs-fable --actor $ACTOR (this flags it so the human can open a fresh Fable session on it). Then stop.
+
+$(cat "$HOME/dotfiles/iar/scope-self-review.md")" \
       --permission-mode bypassPermissions --add-dir "$WT" >"$LOG_DIR/impl-$id.log" 2>&1 ) &
 }
 
-# REVIEWER: read-only codex/Sol. The read-only sandbox blocks the file locks br + CASS need, so the
-# reviewer must NOT touch them — the supervisor (full access) captures the acceptance criteria and
-# injects them; the reviewer judges the git diff + files only. codex echoes the prompt (names both
-# verdicts) so we stamp the LAST verdict line; stdin is closed or codex hangs reading it; nohup
-# detaches the wrapper so a tick exiting can't orphan it; the marker keeps it matchable until the
-# label is stamped; the label write runs in the wrapper (outside the sandbox), so it can mutate beads.
+# REVIEWER: iar-review.sh (shared with the solo /next-bead flow) runs read-only codex and stamps the
+# verdict label + comment outside the sandbox. nohup detaches it so a tick exiting can't orphan it;
+# proc_alive matches its command line until the label is stamped.
 spawn_reviewer() {  # $1 bead
   local id="$1"; load_worktree "$id"
   if [ "$DRY_RUN" = 1 ]; then echo "  DRY: would spawn reviewer for $id ($BASE..HEAD in $WT)"; return; fi
-  local critf="$LOG_DIR/crit-$id.txt"; br show "$id" 2>/dev/null | tr -d '\r' > "$critf"
-  nohup bash -c '
-    id="$1"; wt="$2"; base="$3"; actor="$4"; rlog="$5"; critf="$6"
-    cd "$wt" || exit 1
-    codex exec -m gpt-5.6-sol -s read-only "You are the independent REVIEWER for bead $id (iar-worker:$id). Do NOT run br and do NOT search CASS (the read-only sandbox blocks their locks). Do NOT modify anything. Read the acceptance criteria with: cat $critf . Review ONLY the fixed range $base..HEAD: run git diff $base HEAD and read the changed files. You cannot run pytest under read-only; use non-writing checks (python3 -c import, ast.parse) and the implementer stated results. Judge against the criteria and repo standards (correctness, security, tests, maintainability, scope creep). List findings (file:line, impact, concrete fix), then print exactly one final line, choosing ONE of three verdicts: VERDICT: APPROVED  or  VERDICT: CHANGES REQUESTED  or  VERDICT: NEEDS HUMAN . Use NEEDS HUMAN when the remaining gap CANNOT be closed by an automated headless implementer for a valid structural reason — it requires credentials, VPN, real hardware, a cluster/live run, or a human decision the sandbox cannot provide — so more fix cycles would only re-hit the same dead end; in that case make your findings state exactly what human action is required. Prefer NEEDS HUMAN over CHANGES REQUESTED whenever the fix is a human-only action rather than a code change the implementer could make." < /dev/null > "$rlog" 2>&1 || true
-    # Take the LAST verdict line: codex echoes the prompt (which names every verdict), so the
-    # real answer is always the final match. stdin closed above or codex hangs reading it.
-    v=$(grep -oE "VERDICT: (APPROVED|CHANGES REQUESTED|NEEDS HUMAN)" "$rlog" | tail -1)
-    if [ "$v" = "VERDICT: APPROVED" ]; then
-      br update "$id" --add-label iar:approved --remove-label iar:awaiting-review --actor "$actor" >/dev/null 2>&1 || true
-    elif [ "$v" = "VERDICT: CHANGES REQUESTED" ]; then
-      br update "$id" --add-label iar:changes-requested --remove-label iar:awaiting-review --actor "$actor" >/dev/null 2>&1 || true
-    elif [ "$v" = "VERDICT: NEEDS HUMAN" ]; then
-      # reviewer judged the block human-only: escalate straight to the hold state, skip the fix loop.
-      br update "$id" --add-label needs-human --remove-label iar:awaiting-review --actor "$actor" >/dev/null 2>&1 || true
-    fi
-    # Record the verdict on the bead (durable human/fixer-readable provenance; replaces the old mail).
-    [ -n "$v" ] && br comments add "$id" --actor "reviewer:sol" -m "$v (reviewer:sol) — full findings in $rlog" >/dev/null 2>&1 || true
-    : # iar-worker:'"$id"' — marker: keep wrapper matchable until label stamped
-  ' _ "$id" "$WT" "$BASE" "$ACTOR" "$LOG_DIR/review-$id.log" "$critf" >"$LOG_DIR/revwrap-$id.log" 2>&1 &
+  ACTOR="$ACTOR" LOG_DIR="$LOG_DIR" nohup iar-review.sh "$id" "$WT" "$BASE" >"$LOG_DIR/revwrap-$id.log" 2>&1 &
 }
 
 # INTEGRATE: an approved PR-group bead's done-condition is its code merged into the PR branch (the

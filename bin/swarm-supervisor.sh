@@ -35,12 +35,13 @@ export BEADS_DIR="${BEADS_DIR:-/Users/tal/.local/share/beads/precog/.beads}"
 REPO="${REPO:-/Users/tal/Documents/precog}"
 MAIN="${MAIN:-main}"                        # trunk that PR branches (and standalone beads) branch off of
 MAX_INFLIGHT="${MAX_INFLIGHT:-3}"          # cap concurrently-owned beads
-POLL_SECS="${POLL_SECS:-60}"
+POLL_SECS="${POLL_SECS:-15}"               # each phase change waits up to one poll; a tick is only a few br calls
 LOG_DIR="${LOG_DIR:-/tmp/swarm-logs}"
 ACTOR="${ACTOR:-swarm-precog}"             # claim identity — pinned, NOT hostname-derived: EC2 private IPs (hence `hostname -s`) roll on stop/start, which would mint a new actor and orphan in-flight claims. A fixed name means a restarted poller reclaims its own beads. One poller per DB (the `swarm` toggle enforces one); set ACTOR explicitly to run more.
 PR_BRANCH_PREFIX="${PR_BRANCH_PREFIX:-u/tfriedman/pr}"  # PR-group integration branches; u/<user>/ prefix per repo convention so they never collide with anyone else's branches
 PHASE_CAP="${PHASE_CAP:-2}"                # max spawn attempts in one phase before needs-human
 FIX_CAP="${FIX_CAP:-2}"                    # max review->changes cycles before needs-human
+PHASE_TIMEOUT="${PHASE_TIMEOUT:-5400}"     # seconds a phase process may run before it is killed; the retry then counts against PHASE_CAP
 DRY_RUN="${DRY_RUN:-0}"
 
 # Single-instance guard: two pollers race the same beads and double-spawn workers (fixer A and
@@ -138,6 +139,7 @@ escalate_stuck() {  # $1 bead  $2 why
 spawn_impl() {  # $1 bead  $2 role(implement|fix)
   local id="$1" role="${2:-implement}"; load_worktree "$id"
   if [ "$DRY_RUN" = 1 ]; then echo "  DRY: would spawn ${role} for $id in $WT"; return; fi
+  date +%s > "$LOG_DIR/started-$id"
   local extra=""
   [ "$role" = fix ] && extra="You are FIXING a prior review. First read the reviewer's findings in $LOG_DIR/review-$id.log (and 'br comments $id' for the recorded verdict), then address only actionable findings. "
   ( cd "$WT" && claude -p "You are the IMPLEMENTER for bead $id (iar-worker:$id). ${extra}Work ONLY inside this worktree ($WT); never edit anything outside it. Read the bead ('br show $id'), its acceptance criteria, repo instructions, and relevant CASS. Implement the smallest complete solution. Run tests only with: iar-run-tests.sh $WT <pytest-args> (never bazel, never bare pytest). Commit all task changes to the current branch. Then record a review-request note on the bead: WRITE a file /tmp/iar-review-$id.txt containing base SHA $BASE, the head SHA, the acceptance criteria, a concise change summary, the exact checks you ran and their results, and any known risks; then run: br comments add $id --actor $ACTOR -f /tmp/iar-review-$id.txt . (Write the file with your editor — do NOT pack this prose into a shell -m argument, quoting will bite you.) Finally run EXACTLY: br update $id --add-label iar:awaiting-review --remove-label iar:changes-requested --actor $ACTOR . Do not set other labels; do not close the bead; then stop. If you are blocked or need a human decision, record it on the bead: WRITE a file /tmp/iar-esc-$id.txt whose first line is 'ESCALATION — <your exact question and what input you need>', then a line 'To decide+resume: br update $id --notes \"<decision>\" then br update $id --remove-label needs-human', then a line 'To resolve directly: br close $id'; then run: br comments add $id --actor $ACTOR -f /tmp/iar-esc-$id.txt . (Write the file with your editor — do NOT pack prose into -m.) Then run: br update $id --add-label needs-human --actor $ACTOR (leave it in_progress — do NOT release the claim). If the block is STRUCTURAL or needs a rethink rather than a quick factual decision, ALSO run: br update $id --add-label needs-fable --actor $ACTOR (this flags it so the human can open a fresh Fable session on it). Then stop.
@@ -152,6 +154,7 @@ $(cat "$HOME/dotfiles/iar/scope-self-review.md")" \
 spawn_reviewer() {  # $1 bead
   local id="$1"; load_worktree "$id"
   if [ "$DRY_RUN" = 1 ]; then echo "  DRY: would spawn reviewer for $id ($BASE..HEAD in $WT)"; return; fi
+  date +%s > "$LOG_DIR/started-$id"
   ACTOR="$ACTOR" LOG_DIR="$LOG_DIR" nohup iar-review.sh "$id" "$WT" "$BASE" >"$LOG_DIR/revwrap-$id.log" 2>&1 &
 }
 
@@ -184,7 +187,17 @@ integrate_bead() {  # $1 bead  $2 pr-slug
 # Advance ONE owned bead by at most one phase step. Never acts while a worker for it is alive.
 advance() {  # $1 bead
   local id="$1" cur; cur=$(phase_of "$id")
-  proc_alive "$id" && { [ "$DRY_RUN" = 1 ] && echo "  $id: phase=$cur (worker running)"; return 0; }
+  if proc_alive "$id"; then
+    [ "$DRY_RUN" = 1 ] && echo "  $id: phase=$cur (worker running)"
+    # A finished `claude -p` can fail to exit and hold the bead forever. Kill it once over the
+    # limit; the next tick respawns the same phase, so PHASE_CAP still bounds retries.
+    local sf="$LOG_DIR/started-$id"
+    if [ "$DRY_RUN" != 1 ] && [ -f "$sf" ] && [ $(( $(date +%s) - $(val "$sf") )) -gt "$PHASE_TIMEOUT" ]; then
+      echo "[$(date +%T)] $id $cur worker over ${PHASE_TIMEOUT}s -> killed"
+      pkill -f "iar-worker:$id|iar-review\.sh $id " || true
+    fi
+    return 0
+  fi
 
   if [ "$DRY_RUN" = 1 ]; then echo "  $id: phase=$cur -> would spawn/advance"; return 0; fi
 

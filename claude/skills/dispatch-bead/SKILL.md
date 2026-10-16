@@ -1,6 +1,6 @@
 ---
 name: dispatch-bead
-description: Check a ready Bead against the background readiness gate, then start it as a named background Claude session (`claude --bg --name <bead-id>`) in a leased treehouse slot that implements, self-reviews, runs the narrowed codex review, and waits for Tal in agent view. Use when the user says "dispatch", "run this bead in the background", "start overnight beads", or asks to hand beads off without watching them.
+description: Check a ready Bead against the background readiness gate, then start it as a named background Claude session (`claude --bg --name "<bead-id>: <short description>"`) in a leased treehouse slot that implements, self-reviews, runs the narrowed codex review, and waits for Tal in agent view. Use when the user says "dispatch", "run this bead in the background", "start overnight beads", or asks to hand beads off without watching them.
 ---
 
 # Dispatch Bead (background session)
@@ -19,7 +19,7 @@ Constants: `BEADS_DIR=/Users/tal/.local/share/beads/precog/.beads` on every `br`
 Read `br show <id>` and its parent spec. A bead passes only if all are true:
 
 1. **Done-when command.** A command proves the criteria (usually the bead's tests via `iar-run-tests.sh`). If the bead names none, propose one from the criteria.
-2. **Files listed, no overlap.** The bead lists the files it changes, and no running background bead lists the same files. Running background beads: `claude agents --json`, entries with `kind=="background"` whose `state` is not `done` and whose `name` is a bead id.
+2. **Files listed, no overlap.** The bead lists the files it changes, and no running background bead lists the same files. Running background beads: `claude agents --json`, entries with `kind=="background"` whose `state` is not `done` and whose `name` starts with a bead id.
 3. **No open decision.** No product default or design choice the bead and spec leave open.
 4. **Local only.** No Flyte or cluster run, VPN, AWS or paid run.
 5. **One session in size.** A few hours of focused work, not a multi-day change.
@@ -45,7 +45,7 @@ Write `$LOG_DIR/dispatch-<id>.md` with the Write tool. Fill in every `<…>`:
 ```markdown
 # Bead <id>: <title>
 
-You are a background session working alone on one bead. Tal sees you in agent view as `<id>`. Work only in this slot: <slot>.
+You are a background session working alone on one bead. Tal sees you in agent view as `<session name>`. Work only in this slot: <slot>.
 
 Bead: run `BEADS_DIR=/Users/tal/.local/share/beads/precog/.beads br show <id>` and read its parent spec (`br show <parent>`). Base SHA: <base-sha>. Branch: u/tfriedman/iar-<id> (<create it at the base SHA | resume the existing origin branch>). Done when: `<done-when command>` passes and every acceptance criterion holds.
 
@@ -65,15 +65,17 @@ When Tal replies: for a code review, follow step 5b of `~/dotfiles/claude/skills
 <full text of ~/dotfiles/iar/escalation-rules.md>
 ```
 
+Session name: `<id>: <short description>`, where the description is 2–4 plain words that say what the bead changes (for example `precog-z8j5: S3 fallback warnings`). Use the words a human would search for, not the full bead title.
+
 Then start the session from the slot so it works there and agent view creates no extra worktree:
 
 ```bash
-cd <slot> && claude --bg --name <id> "Read and follow /tmp/swarm-logs/dispatch-<id>.md"
+cd <slot> && claude --bg --name "<session name>" "Read and follow /tmp/swarm-logs/dispatch-<id>.md"
 ```
 
 ## 5. Report
 
-Give Tal one line per bead: id, session short id, slot. Remind him once: `claude agents` lists them, Space peeks, typing replies, `claude attach <id>` takes over.
+Give Tal one line per bead: session name, session short id, slot. Remind him once: `claude agents` lists them, Space peeks, typing replies, `claude attach <short id>` takes over.
 
 ## Notes
 

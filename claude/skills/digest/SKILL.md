@@ -15,7 +15,7 @@ Read-only except for relaying Tal's own answers. Never stop, delete or redirect 
 
 ## 2. Show
 
-One line per item, newest first inside each section. Leave out empty sections. Each line: session name, then the title when it differs from the name, then what it last said (at most 100 characters), then its age (from `last_active`).
+Leave out the session running this digest. One line per item, newest first inside each section. Leave out empty sections. Each line: session name, then the title when it differs from the name, then what it last said (at most 100 characters), then its age (from `last_active`).
 
 1. **Needs you.** Background sessions in state `blocked`, and any session whose `last_message` starts with `QUESTION:`. Show the question.
 2. **Ready for review.** Background sessions in state `done` whose bead is still in progress, or whose `last_message` starts with `READY:`.

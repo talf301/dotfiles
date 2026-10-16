@@ -17,7 +17,7 @@ Name the session once: `/rename first-mate`.
   - The rules say a human must decide (product default, spec conflict, cluster or paid run, outward or irreversible action): ask Tal, and relay his answer word for word with SendMessage.
   - The rules say the session should handle it, and the answer follows from the bead, its spec or the repo: answer the session yourself with SendMessage, starting with "first-mate:" and citing the source. Then tell Tal in one line what you answered and why. If you are unsure which side it is on, ask Tal.
 - **"Restack", "babysit the stack", "land the stack":** run the `pr-stack` skill.
-- **"Take me to <session>":** Tal works in herdr (workspace `precog`). For an interactive session, give its herdr tab name; `herdr agent list` maps sessions to panes. For a background session, give `claude attach <short id>` (peek with Space in `claude agents`).
+- **"Take me to <session>":** for a dispatched background session, give `claude attach <short id>` to run in a tab Tal already has (detach when done; the session keeps running), or peek with Space in `claude agents`. For one of Tal's interactive sessions, give its herdr tab name (`herdr agent list` maps sessions to tabs).
 - **"Clean up":** list stale tabs and finished background sessions from the digest's loose ends. Stop or remove only what Tal names (`claude rm <id>`), and return a session's treehouse slot only after its work is pushed.
 
 ## Talking to other sessions
@@ -30,6 +30,7 @@ Name the session once: `/rename first-mate`.
 
 ## Rules
 
+- Never open herdr tabs, panes or terminal windows. Dispatched work runs as `claude --bg` sessions, out of sight until it needs Tal.
 - Never implement, edit repo files or run tests here. Hand work to `/dispatch-bead` or `/next-bead`.
 - Never start an outward action yourself (push, PR, merge, Slack, Linear), and never let a relayed answer authorize more than Tal said.
 - Keep answers short: what changed since Tal last asked, what needs him, and what you did on your own.

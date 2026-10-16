@@ -23,7 +23,7 @@ Agent view marks every ended turn `blocked`, even when the session only answered
 1. **Needs you.** Interactive sessions with status `waiting` (a question or permission prompt is on screen), sessions whose `last_message` starts with `QUESTION:`, or whose last message (read in full from the transcript) asks Tal to decide something. Show the question.
 2. **Ready for review.** Sessions whose `last_message` starts with `READY:`, and dispatched sessions (named `<bead-id>: …`, background or herdr tab) that ended their turn without a question while their bead is still in progress.
 3. **Open Plannotator sessions.** Each is a review or document waiting on Tal. Show the target (file name or "review" plus its worktree), the owning session, age and URL, newest first. Sessions older than 2 days whose owner session is gone go under loose ends, with `plannotator sessions --clean` or closing the tab as the suggestion.
-4. **Working.** Background sessions in state `working`, and interactive tabs with status `busy`. Mark a session `stalled` (busy or working, but no new message for 15+ minutes) with its quiet time, and suggest peeking at it; a hung process is a likely cause.
+4. **Working.** Background sessions in state `working`, and interactive tabs with status `busy`.
 5. **Open tabs.** Idle interactive tabs active in the last 3 days.
 6. **Loose ends.** Show each with a suggested action, but do not take it:
    - idle tabs inactive for more than 3 days: suggest closing them;

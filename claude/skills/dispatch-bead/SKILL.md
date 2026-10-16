@@ -25,6 +25,7 @@ Read `br show <id>` and its parent spec. A bead passes only if all are true:
 5. **One session in size.** A few hours of focused work, not a multi-day change.
 6. **Clear base.** The base from step 3 contains the files the bead changes and the beads it depends on (`git ls-tree -r --name-only <base>`). A bead without a `pr:` label whose code lives only on a PR-group branch fails; ask Tal for the base or a `pr:` label.
 7. **Nobody else on it.** No live session works on the same files: check `treehouse status` lease holders and `claude agents --json` names for sibling beads of the same parent.
+8. **Swarm-eligible.** The bead has no `no-swarm` or `wayfinder:*` label. These labels mark design, research and prototype work that belongs to Tal or `/next-bead`. A bead Tal names explicitly still fails this check: show the label and dispatch only if he confirms.
 
 WIP limit: at most 3 running background beads, counting the new ones.
 
@@ -56,7 +57,7 @@ Steps:
 4. Review: `ACTOR=tal-bg iar-review.sh <id> <slot> <base-sha>` (exit 0 approved, 1 changes requested, 2 needs human, 3 no verdict). Read `/tmp/swarm-logs/review-<id>.log`. Fix the actionable findings and review again, at most 2 fix rounds. On exit 2 or after 2 rounds, ask Tal.
 5. Push the branch: `git push -u origin u/tfriedman/iar-<id>`.
 6. Add a bead comment from a file (`br comments add <id> --actor tal-bg -f <file>`): what changed, the checks you ran with results, the review verdict, open risks.
-7. End with a short summary for Tal: what changed, checks, verdict, anything you decided under the rules below. Then wait. Do not integrate, open a PR or return the slot.
+7. End with a short summary for Tal. Its first line is exactly one of `READY: <one-line result>` (finished, nothing needed from Tal) or `QUESTION: <the one question>` (a decision only Tal can make). Then: what changed, checks, verdict, anything you decided under the rules below. Then wait. Do not integrate, open a PR or return the slot.
 
 When Tal replies: for a code review, follow step 5b of `~/dotfiles/claude/skills/next-bead/SKILL.md`. To integrate and finish, follow its steps 6 and 7 (merge into the PR-group branch or offer a draft PR, close the bead, return the treehouse slot).
 
@@ -70,7 +71,7 @@ Session name: `<id>: <short description>`, where the description is 2–4 plain 
 Then start the session from the slot so it works there and agent view creates no extra worktree:
 
 ```bash
-cd <slot> && claude --bg --name "<session name>" "Read and follow /tmp/swarm-logs/dispatch-<id>.md"
+cd <slot> && claude --bg --settings ~/dotfiles/iar/dispatch-settings.json --name "<session name>" "Read and follow /tmp/swarm-logs/dispatch-<id>.md"
 ```
 
 ## 5. Report

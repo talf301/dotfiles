@@ -17,4 +17,4 @@ Handle these yourself, and record what you did in your final summary:
 - A process hung or a tool failed for infra reasons. Retry once. Ask only if it fails a second time.
 - A disputed assumption can be measured. Measure it, then act on the result.
 
-Every question to Tal contains: one question, the evidence, 2–3 options, your recommendation, and what you will do after each answer.
+Every question to Tal starts with a line `QUESTION: <the one question>` and contains: the evidence, 2–3 options, your recommendation, and what you will do after each answer.

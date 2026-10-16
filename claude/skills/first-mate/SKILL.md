@@ -17,7 +17,7 @@ Name the session once: `/rename first-mate`.
   - The rules say a human must decide (product default, spec conflict, cluster or paid run, outward or irreversible action): ask Tal, and relay his answer word for word with SendMessage.
   - The rules say the session should handle it, and the answer follows from the bead, its spec or the repo: answer the session yourself with SendMessage, starting with "first-mate:" and citing the source. Then tell Tal in one line what you answered and why. If you are unsure which side it is on, ask Tal.
 - **"Restack", "babysit the stack", "land the stack":** run the `pr-stack` skill.
-- **"Take me to <session>":** give the exact command: `claude attach <short id>` for a background session (peek with Space in `claude agents`), or the tab name for an interactive one.
+- **"Take me to <session>":** Tal works in herdr (workspace `precog`). For an interactive session, give its herdr tab name; `herdr agent list` maps sessions to panes. For a background session, give `claude attach <short id>` (peek with Space in `claude agents`).
 - **"Clean up":** list stale tabs and finished background sessions from the digest's loose ends. Stop or remove only what Tal names (`claude rm <id>`), and return a session's treehouse slot only after its work is pushed.
 
 ## Talking to other sessions

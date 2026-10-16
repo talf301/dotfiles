@@ -17,4 +17,6 @@ Handle these yourself, and record what you did in your final summary:
 - A process hung or a tool failed for infra reasons. Retry once. Ask only if it fails a second time.
 - A disputed assumption can be measured. Measure it, then act on the result.
 
+Ask early. Raise any decision you can foresee before you build on it, not after the work depends on a guess. Never proceed on an assumed answer: until Tal replies, wait, or work only on parts that do not depend on the answer. A missing or timed-out answer is never a yes.
+
 Every question to Tal starts with a line `QUESTION: <the one question>` and contains: the evidence, 2–3 options, your recommendation, and what you will do after each answer.

@@ -50,6 +50,8 @@ You are a background session working alone on one bead. Tal sees you in agent vi
 
 Bead: run `BEADS_DIR=/Users/tal/.local/share/beads/precog/.beads br show <id>` and read its parent spec (`br show <parent>`). Base SHA: <base-sha>. Branch: u/tfriedman/iar-<id> (<create it at the base SHA | resume the existing origin branch>). Done when: `<done-when command>` passes and every acceptance criterion holds.
 
+Push only your own branch. Never rebase onto another branch, retarget a PR or force-push a shared branch: the shape of a PR stack belongs to Tal (`pr-stack` skill).
+
 Steps:
 1. Create or check out the branch. Read the bead, the parent spec, and the repo instructions.
 2. Implement the smallest complete change. Run tests only with `iar-run-tests.sh <slot> <pytest-args>`. Commit with single-line messages and no co-author.

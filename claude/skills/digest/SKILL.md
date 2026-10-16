@@ -17,8 +17,10 @@ Read-only except for relaying Tal's own answers. Never stop, delete or redirect 
 
 Leave out the session running this digest. One line per item, newest first inside each section. Leave out empty sections. Each line: session name, then the title when it differs from the name, then what it last said (at most 100 characters), then its age (from `last_active`).
 
-1. **Needs you.** Background sessions in state `blocked`, and any session whose `last_message` starts with `QUESTION:`. Show the question.
-2. **Ready for review.** Background sessions in state `done` whose bead is still in progress, or whose `last_message` starts with `READY:`.
+Agent view marks every ended turn `blocked`, even when the session only answered something, so do not take `blocked` as a question. The session's own first line decides: `QUESTION:` means it needs Tal, `READY:` means ready for review. Without either line, read the last message: it needs Tal only if it ends by asking him to decide something.
+
+1. **Needs you.** Sessions whose `last_message` starts with `QUESTION:`, or whose last message (read in full from the transcript) asks Tal to decide something. Show the question.
+2. **Ready for review.** Sessions whose `last_message` starts with `READY:`, and dispatched sessions that ended their turn without a question while their bead is still in progress.
 3. **Working.** Background sessions in state `working`, and interactive tabs with status `busy`.
 4. **Open tabs.** Idle interactive tabs active in the last 3 days.
 5. **Loose ends.** Show each with a suggested action, but do not take it:

@@ -1,6 +1,6 @@
 ---
 name: dispatch-bead
-description: Check a ready Bead against the background readiness gate, then start it as a named background Claude session (`claude --bg --name "<bead-id>: <short description>"`) in a leased treehouse slot that implements, self-reviews, runs the narrowed codex review, and waits for Tal in agent view. Use when the user says "dispatch", "run this bead in the background", "start overnight beads", or asks to hand beads off without watching them.
+description: Check a ready Bead against the background readiness gate, then start it as a named background Claude session (`claude --bg --name "<bead-id>: <short description>"`) in a leased treehouse slot that implements, self-reviews, runs the narrowed codex review, and posts a guided review (or its question) to Tal's Plannotator Inbox, then waits for his reply. Use when the user says "dispatch", "run this bead in the background", "start overnight beads", or asks to hand beads off without watching them.
 ---
 
 # Dispatch Bead (background session)
@@ -59,9 +59,16 @@ Steps:
 4. Review: `ACTOR=tal-bg iar-review.sh <id> <slot> <base-sha>` (exit 0 approved, 1 changes requested, 2 needs human, 3 no verdict). Read `/tmp/swarm-logs/review-<id>.log`. Fix the actionable findings and review again, at most 2 fix rounds. On exit 2 or after 2 rounds, ask Tal.
 5. Push the branch: `git push -u origin u/tfriedman/iar-<id>`.
 6. Add a bead comment from a file (`br comments add <id> --actor tal-bg -f <file>`): what changed, the checks you ran with results, the review verdict, open risks.
-7. End with a short summary for Tal. Its first line is exactly one of `READY: <one-line result>` (finished, nothing needed from Tal) or `QUESTION: <the one question>` (a decision only Tal can make). Then: what changed, checks, verdict, anything you decided under the rules below. Then wait. Do not integrate, open a PR or return the slot.
+7. Post to Tal's Plannotator Inbox with your `plannotator_inbox` tool:
+   - **Finished:** call `get_guide_brief`, then `submit_guide` with a guided review of `<base-sha>..HEAD`, subject `<session name>: ready for review`. Put open risks and anything you decided under the rules below in the guide's intent. End the body with one `:::question`: integrate into the PR group now, or the fix you would make first, with your recommendation.
+   - **Blocked on a decision only Tal can make** (at any step): `send_message` with one `:::question` block that has a `Stopped:` line, the evidence, 2–3 options and your recommendation. Then wait for the answer.
+   - If the tool is missing or fails, say so in your summary and use the summary as the question.
+8. End with a short summary. Its first line is exactly `READY: <one-line result>` or `QUESTION: <the one question>`. Then add the Inbox thread link, what changed, the checks and the verdict. Then wait. Do not integrate, open a PR or return the slot.
 
-When Tal replies: for a code review, follow step 5b of `~/dotfiles/claude/skills/next-bead/SKILL.md`. To integrate and finish, follow its steps 6 and 7 (merge into the PR-group branch or offer a draft PR, close the bead, return the treehouse slot).
+When Tal replies (from the Inbox, the reply arrives in this session by itself):
+- **"Integrate", or a yes to integrating:** follow steps 6 and 7 of `~/dotfiles/claude/skills/next-bead/SKILL.md` (merge into the PR-group branch or offer a draft PR, close the bead, return the treehouse slot). Then post one line in the same thread (`send_message` with `reply_to`) saying what landed, and resolve the thread (`resolve_message`).
+- **Comments or "fix first":** fix, rerun the checks and the review, push, then post an updated guide in the same thread (`submit_guide` with `reply_to`).
+- **A live code review in Plannotator:** follow step 5b of `/next-bead`.
 
 <full text of ~/dotfiles/iar/scope-self-review.md>
 

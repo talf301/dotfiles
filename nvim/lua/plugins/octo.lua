@@ -6,6 +6,25 @@ return {
     picker = "snacks",
     -- bare Octo command opens picker of commands
     enable_builtin = true,
+    -- Ergonomic one-hand navigation inside a review (deep-merged over octo's
+    -- defaults, so only these actions move; everything else keeps its keys).
+    -- C-j/C-k walk unviewed files, C-n/C-p step through discussion.
+    -- File nav stays on ]q/[q brackets; only the unviewed/thread/comment
+    -- motions relocate off the bracket keys.
+    mappings = {
+      review_diff = {
+        select_next_unviewed_entry = { lhs = "<C-j>", desc = "next unviewed file" },
+        select_prev_unviewed_entry = { lhs = "<C-k>", desc = "prev unviewed file" },
+        next_thread = { lhs = "<C-n>", desc = "next thread" },
+        prev_thread = { lhs = "<C-p>", desc = "prev thread" },
+      },
+      review_thread = {
+        select_next_unviewed_entry = { lhs = "<C-j>", desc = "next unviewed file" },
+        select_prev_unviewed_entry = { lhs = "<C-k>", desc = "prev unviewed file" },
+        next_comment = { lhs = "<C-n>", desc = "next comment" },
+        prev_comment = { lhs = "<C-p>", desc = "prev comment" },
+      },
+    },
   },
   keys = {
     {
@@ -27,6 +46,21 @@ return {
       "<leader>on",
       "<CMD>Octo notification list<CR>",
       desc = "List GitHub Notifications",
+    },
+    {
+      "<leader>or",
+      "<CMD>Octo search is:pr is:open review-requested:@me<CR>",
+      desc = "PRs awaiting my review",
+    },
+    {
+      "<leader>oa",
+      "<CMD>Octo search is:pr is:open author:@me<CR>",
+      desc = "My open PRs",
+    },
+    {
+      "<leader>om",
+      "<CMD>Octo search is:pr is:open involves:@me<CR>",
+      desc = "PRs involving me",
     },
     {
       "<leader>os",

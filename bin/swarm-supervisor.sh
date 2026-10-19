@@ -34,7 +34,7 @@ set -euo pipefail
 export BEADS_DIR="${BEADS_DIR:-/Users/tal/.local/share/beads/precog/.beads}"
 REPO="${REPO:-/Users/tal/Documents/precog}"
 MAIN="${MAIN:-main}"                        # trunk that PR branches (and standalone beads) branch off of
-MAX_INFLIGHT="${MAX_INFLIGHT:-3}"          # cap concurrently-owned beads
+MAX_INFLIGHT="${MAX_INFLIGHT:-5}"          # cap concurrently-owned beads
 POLL_SECS="${POLL_SECS:-15}"               # each phase change waits up to one poll; a tick is only a few br calls
 LOG_DIR="${LOG_DIR:-/tmp/swarm-logs}"
 ACTOR="${ACTOR:-swarm-precog}"             # claim identity — pinned, NOT hostname-derived: EC2 private IPs (hence `hostname -s`) roll on stop/start, which would mint a new actor and orphan in-flight claims. A fixed name means a restarted poller reclaims its own beads. One poller per DB (the `swarm` toggle enforces one); set ACTOR explicitly to run more.

@@ -10,12 +10,17 @@
 #   - stdin is closed (< /dev/null) or codex hangs reading it
 #   - codex echoes the prompt, which names every verdict — parse the LAST match
 #   - label + comment writes happen here, outside the sandbox
+#   - the sandbox cannot run or even import code (no writable tmp), so WE run the test command
+#     first, outside the sandbox, and hand the reviewer its exit code and full output. An
+#     APPROVED verdict becomes CHANGES REQUESTED when the tests fail, and NEEDS HUMAN when no
+#     test command was given: a code review alone is never a plain approval.
 #
-# Usage: iar-review.sh <bead-id> <worktree> <base-sha>
+# Usage: iar-review.sh <bead-id> <worktree> <base-sha> [test-command...]
+#        e.g. iar-review.sh <id> <slot> <base> iar-run-tests.sh <slot> <pytest-args>
 # Exit:  0 = APPROVED   1 = CHANGES REQUESTED   2 = NEEDS HUMAN   3 = no verdict
 set -euo pipefail
 
-id="${1:?bead id}"; wt="${2:?worktree}"; base="${3:?base sha}"
+id="${1:?bead id}"; wt="${2:?worktree}"; base="${3:?base sha}"; shift 3
 export BEADS_DIR="${BEADS_DIR:-/Users/tal/.local/share/beads/precog/.beads}"
 LOG_DIR="${LOG_DIR:-/tmp/swarm-logs}"
 ACTOR="${ACTOR:-tal-solo}"
@@ -26,12 +31,29 @@ rlog="$LOG_DIR/review-$id.log"
 parent=$(br show "$id" --json 2>/dev/null | jq -r '.[0].parent // empty' || true)
 { br show "$id"; if [ -n "$parent" ]; then echo; echo "=== PARENT SPECIFICATION ($parent) ==="; br show "$parent"; fi; } 2>/dev/null | tr -d '\r' > "$critf"
 
+tlog="$LOG_DIR/tests-$id.log"
 cd "$wt"
-codex exec -m gpt-5.6-sol -s read-only "You are the independent REVIEWER for bead $id (iar-worker:$id). Do NOT run br and do NOT search CASS (the read-only sandbox blocks their locks). Do NOT modify anything. Read the acceptance criteria and the parent specification with: cat $critf . Review ONLY the fixed range $base..HEAD: run git diff $base HEAD and read the changed files. You cannot run pytest under read-only; use non-writing checks (python3 -c import, ast.parse) and the implementer stated results. Judge against the criteria and repo standards (correctness, security, tests, maintainability, scope creep). List findings (file:line, impact, concrete fix), then print exactly one final line, choosing ONE of three verdicts: VERDICT: APPROVED  or  VERDICT: CHANGES REQUESTED  or  VERDICT: NEEDS HUMAN . Use NEEDS HUMAN when the remaining gap CANNOT be closed by an automated headless implementer for a valid structural reason — it requires credentials, VPN, real hardware, a cluster/live run, or a human decision the sandbox cannot provide — so more fix cycles would only re-hit the same dead end; in that case make your findings state exactly what human action is required. Prefer NEEDS HUMAN over CHANGES REQUESTED whenever the fix is a human-only action rather than a code change the implementer could make.
+if [ $# -gt 0 ]; then
+  trc=0; "$@" < /dev/null > "$tlog" 2>&1 || trc=$?
+  tests="$(printf '%q ' "$@")(exit $trc)"
+  tnote="The test command ran OUTSIDE the sandbox before this review: $(printf '%q ' "$@") . It exited $trc. Read its full output with: cat $tlog . Base your test findings on that output. Do not try to run tests or imports yourself."
+else
+  trc=""; tests="none"
+  echo "no test command given; no tests ran" > "$tlog"
+  tnote="NO TESTS RAN for this review and you cannot run or import code in this sandbox. Say so in your findings."
+fi
 
-$(cat "$HOME/dotfiles/iar/reviewer-scope.md")" < /dev/null > "$rlog" 2>&1 || true
+{ echo "=== TESTS: $tests ==="; cat "$tlog"; echo "=== END TESTS ==="; } > "$rlog"
+codex exec -m gpt-5.6-sol -s read-only "You are the independent REVIEWER for bead $id (iar-worker:$id). Do NOT run br and do NOT search CASS (the read-only sandbox blocks their locks). Do NOT modify anything. Read the acceptance criteria and the parent specification with: cat $critf . Review ONLY the fixed range $base..HEAD: run git diff $base HEAD and read the changed files. $tnote Judge against the criteria and repo standards (correctness, security, tests, maintainability, scope creep). List findings (file:line, impact, concrete fix), then print exactly one final line, choosing ONE of three verdicts: VERDICT: APPROVED  or  VERDICT: CHANGES REQUESTED  or  VERDICT: NEEDS HUMAN . Use NEEDS HUMAN when the remaining gap CANNOT be closed by an automated headless implementer for a valid structural reason — it requires credentials, VPN, real hardware, a cluster/live run, or a human decision the sandbox cannot provide — so more fix cycles would only re-hit the same dead end; in that case make your findings state exactly what human action is required. Prefer NEEDS HUMAN over CHANGES REQUESTED whenever the fix is a human-only action rather than a code change the implementer could make.
+
+$(cat "$HOME/dotfiles/iar/reviewer-scope.md")" < /dev/null >> "$rlog" 2>&1 || true
 
 v=$(grep -oE "VERDICT: (APPROVED|CHANGES REQUESTED|NEEDS HUMAN)" "$rlog" | tail -1 || true)
+note=""
+if [ "$v" = "VERDICT: APPROVED" ] && [ "$trc" != 0 ]; then
+  if [ -z "$trc" ]; then v="VERDICT: NEEDS HUMAN"; note=" — code review approved, but NO TESTS RAN"
+  else v="VERDICT: CHANGES REQUESTED"; note=" — code review approved, but the tests FAILED (exit $trc)"; fi
+fi
 case "$v" in
   "VERDICT: APPROVED")
     br update "$id" --add-label iar:approved --remove-label iar:awaiting-review --actor "$ACTOR" >/dev/null 2>&1 || true; rc=0 ;;
@@ -42,6 +64,6 @@ case "$v" in
   *)
     echo "iar-review: no VERDICT line found — see $rlog" >&2; exit 3 ;;
 esac
-[ -n "$v" ] && br comments add "$id" --actor "reviewer:sol" -m "$v (reviewer:sol) — full findings in $rlog" >/dev/null 2>&1 || true
-echo "$v — full findings in $rlog"
+[ -n "$v" ] && br comments add "$id" --actor "reviewer:sol" -m "$v (reviewer:sol)$note. Tests executed: $tests. Full findings in $rlog" >/dev/null 2>&1 || true
+echo "$v$note. Tests executed: $tests. Full findings in $rlog"
 exit "$rc"

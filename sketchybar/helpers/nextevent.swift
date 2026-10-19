@@ -38,9 +38,19 @@ if !cals.isEmpty {
     let pred = store.predicateForEvents(withStart: now.addingTimeInterval(-5 * 60),
                                         end: now.addingTimeInterval(12 * 3600),
                                         calendars: cals)
+    // Among events at the same start time, prefer accepted over maybe over not yet answered.
+    // Events without a current-user attendee (own events) rank as accepted.
+    func rank(_ e: EKEvent) -> Int {
+        switch e.attendees?.first(where: { $0.isCurrentUser })?.participantStatus {
+        case .declined?: return 3
+        case .pending?: return 2
+        case .tentative?: return 1
+        default: return 0
+        }
+    }
     let next = store.events(matching: pred)
-        .filter { !$0.isAllDay && $0.startDate >= now.addingTimeInterval(-5 * 60) && $0.status != .canceled }
-        .min { $0.startDate < $1.startDate }
+        .filter { !$0.isAllDay && $0.startDate >= now.addingTimeInterval(-5 * 60) && $0.status != .canceled && rank($0) < 3 }
+        .min { ($0.startDate, rank($0)) < ($1.startDate, rank($1)) }
 
     if let e = next {
         let title = (e.title ?? "Event").replacingOccurrences(of: "|", with: "-")

@@ -55,15 +55,16 @@ sketchybar --add item codex_budget right \
     update_freq=300 \
     script="$PLUGIN_SHARED_DIR/ai_budget.sh codex"
 
-sketchybar --add item overseer_mail right \
-    --set overseer_mail \
-    icon= \
-    icon.font="JetBrainsMono Nerd Font:Regular:15.0" \
-    icon.color=0xfff38ba8 \
+sketchybar --add event agents_changed \
+    --add item agents_waiting right \
+    --set agents_waiting \
+    icon=:claude: \
+    icon.font="sketchybar-app-font:Regular:16.0" \
     drawing=off \
-    update_freq=30 \
-    script="$PLUGIN_SHARED_DIR/overseerMail.sh"
-
+    update_freq=60 \
+    script="$PLUGIN_SHARED_DIR/agentsWaiting.sh" \
+    click_script="/Applications/WezTerm.app/Contents/MacOS/wezterm start -- $HOME/.local/bin/claude agents" \
+    --subscribe agents_waiting agents_changed
 
 sketchybar --add item clock right \
     --set clock \

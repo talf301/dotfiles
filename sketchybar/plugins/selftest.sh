@@ -11,10 +11,11 @@ printf '#!/bin/sh\ncase "$*" in *muted*) echo false;; *) echo "${FAKE_VOL:-50}";
 printf '#!/bin/sh\nprintf "%%s\\n" "$FAKE_IPCONFIG"\n'                    > $STUB/ipconfig
 printf '#!/bin/sh\nprintf "%%s\\n" "$FAKE_IFCONFIG"\n'                    > $STUB/ifconfig
 printf '#!/bin/sh\nprintf "%%s" "$FAKE_SONG"\n'                             > $STUB/curl
+printf '#!/bin/sh\nprintf "%%s" "$FAKE_QUOTA_JSON"\n'                       > $STUB/quota-axi
 printf '#!/bin/sh\nprintf "%%s\n" "$FAKE_DISPLAY_COUNT"\n'                > $STUB/aerospace
 printf '#!/bin/sh\nprintf "%%s\n" "$*" >> "$SB_LOG"\n'                  > $STUB/launchctl
 printf '#!/bin/sh\nprintf "%%s\n" "$*" >> "$SB_LOG"\n'                  > $STUB/open
-chmod +x $STUB/sketchybar $STUB/pmset $STUB/osascript $STUB/ipconfig $STUB/ifconfig $STUB/curl $STUB/aerospace $STUB/launchctl $STUB/open
+chmod +x $STUB/sketchybar $STUB/pmset $STUB/osascript $STUB/ipconfig $STUB/ifconfig $STUB/curl $STUB/quota-axi $STUB/aerospace $STUB/launchctl $STUB/open
 export PATH="$STUB:$PATH"
 
 typeset -i fail=0
@@ -23,6 +24,16 @@ check() {  # check <desc> <expected substring>
     else print "  FAIL $1 -- wanted '$2' got '$(<$SB_LOG)'"; fail=1; fi
 }
 glyph() { printf "\\U$1" }
+
+# --- AI budgets: weekly usage, never stale cache ---
+: > $SB_LOG
+FAKE_QUOTA_JSON='{"providers":[{"state":{"stale":false},"windows":[{"kind":"weekly","percentUsed":42}]}]}' \
+    NAME=codex_budget QUOTA_AXI_BIN="$STUB/quota-axi" zsh -f ./ai_budget.sh codex
+check "AI budget shows weekly usage" "label=42%"
+: > $SB_LOG
+FAKE_QUOTA_JSON='{"providers":[{"state":{"stale":true},"windows":[{"kind":"weekly","percentUsed":42}]}]}' \
+    NAME=codex_budget QUOTA_AXI_BIN="$STUB/quota-axi" zsh -f ./ai_budget.sh codex
+check "AI budget rejects stale cache" "label=?%"
 
 # --- battery: icon bucket per percentage ---
 for spec in 100:F0079 95:F0082 85:F0081 75:F0080 65:F007F 55:F007E 42:F007D 35:F007C 25:F007B 15:F007A 5:F0083; do

@@ -12,7 +12,7 @@ Read-only except for relaying Tal's own answers. Never stop, delete or redirect 
 - Sessions: `~/dotfiles/iar/agents-digest.sh` prints one JSON object per session: `kind` (background or interactive), `name`, `state` (background: working, blocked, done) or `status` (interactive: busy, idle), `cwd`, `title`, `last_prompt`, `last_message` (first line of the last assistant message), `last_active`, `pr`, `bead`, `bead_in_progress`.
 - Slots: `cd /Users/tal/Documents/precog && treehouse status` (leased slots and their holders).
 - Dispatched beads: `BEADS_DIR=/Users/tal/.local/share/beads/precog/.beads br list --status in_progress --assignee tal-bg --json`.
-- Inbox: `~/dotfiles/iar/inbox-threads.sh` prints one JSON object per unresolved Plannotator Inbox thread: `subject`, `url`, `guide` (a guided review), `open_questions` (unanswered question prompts), `last_from` (agent or person), `last_text`, `last_at`, `waiting_on` (tal or session), `session` (the session that started it), `session_alive`, and `resume` (the command that brings a stopped session back, else null).
+- Inbox: `plannotator_inbox` with `action: "read_thread"`, `asked_by: "anyone"`, `project_path: "/Users/tal/Documents/precog"` lists the unresolved threads: `subject`, `author.session` (the session that started it), `questions` (`open`, `stopped`, `prompt`), `guide`, `last_author`, `last_at` and `waiting_on_person`. Thread link: `<Inbox url>#thread=<thread_id>`, with the url from `plannotator inbox --background`. Match `author.session` to `sessionId` in `~/dotfiles/iar/agents-digest.sh --all`. The session is stopped when it has no entry or its `pid` is null; its resume command is `cd <cwd> && claude --bg --resume <sessionId>`. If the tool is missing or fails, say so on the count line: never report an empty Inbox you could not read.
 - Plannotator: `~/dotfiles/iar/plannotator-open.sh` prints one JSON object per open Plannotator session: `mode` (annotate or review), `url`, `started`, `target` (what it opened), `cwd`, and `session` (the Claude session that opened it, or null).
 
 ## 2. Show
@@ -23,14 +23,14 @@ Agent view marks every ended turn `blocked`, even when the session only answered
 
 An Inbox thread and its session are one item: show the session's line once, with the thread link added.
 
-1. **Needs you.** Interactive sessions with status `waiting` (a question or permission prompt is on screen), sessions whose `last_message` starts with `QUESTION:`, or whose last message (read in full from the transcript) asks Tal to decide something, and Inbox threads with `open_questions`. Show the question.
-2. **Ready for review.** Sessions whose `last_message` starts with `READY:`, dispatched sessions (named `<bead-id>: …`, background or herdr tab) that ended their turn without a question while their bead is still in progress, and Inbox guided reviews (`guide`) that wait on Tal.
-   **Inbox to read.** Other Inbox threads that wait on Tal with no open question, such as a session's report of what landed. Show `last_text` and suggest Tal reads and resolves the thread.
+1. **Needs you.** Interactive sessions with status `waiting` (a question or permission prompt is on screen), sessions whose `last_message` starts with `QUESTION:`, or whose last message (read in full from the transcript) asks Tal to decide something, and Inbox threads with `questions.open` above 0. Show the question.
+2. **Ready for review.** Sessions whose `last_message` starts with `READY:`, dispatched sessions (named `<bead-id>: …`, background or herdr tab) that ended their turn without a question while their bead is still in progress, and Inbox guided reviews (`guide`) with `waiting_on_person`.
+   **Inbox to read.** Other Inbox threads with `waiting_on_person` and no open question, such as a session's report of what landed. Read the last message with `read_thread` and its `thread_id`, show its first line, and suggest Tal reads and resolves the thread.
 3. **Open Plannotator sessions.** Each is a review or document waiting on Tal. Show the target (file name or "review" plus its worktree), the owning session, age and URL, newest first. Sessions older than 2 days whose owner session is gone go under loose ends, with `plannotator sessions --clean` or closing the tab as the suggestion.
 4. **Working.** Background sessions in state `working`, and interactive tabs with status `busy`.
 5. **Open tabs.** Idle interactive tabs active in the last 3 days.
 6. **Loose ends.** Show each with a suggested action, but do not take it:
-   - Inbox threads that wait on a session with `session_alive` false: Tal's reply is held until that session runs again. Put these first and give the `resume` command;
+   - Inbox threads where Tal spoke last (`last_author` is the person) and the session is stopped: his reply is held until that session runs again. Put these first and give the resume command;
    - idle tabs inactive for more than 3 days: suggest closing them;
    - background sessions blocked or done for more than 2 days with no in-progress bead: suggest `claude rm <id>`;
    - `dispatch-bead` slot leases whose bead has no session: suggest resuming or returning the slot;

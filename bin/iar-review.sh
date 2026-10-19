@@ -12,8 +12,8 @@
 #   - label + comment writes happen here, outside the sandbox
 #   - the sandbox cannot run or even import code (no writable tmp), so WE run the test command
 #     first, outside the sandbox, and hand the reviewer its exit code and full output. An
-#     APPROVED verdict becomes CHANGES REQUESTED when the tests fail, and NEEDS HUMAN when no
-#     test command was given: a code review alone is never a plain approval.
+#     APPROVED verdict becomes CHANGES REQUESTED when the tests fail, and any verdict becomes
+#     NEEDS HUMAN when no test command was given: a code review alone is never a plain approval.
 #
 # Usage: iar-review.sh <bead-id> <worktree> <base-sha> [test-command...]
 #        e.g. iar-review.sh <id> <slot> <base> iar-run-tests.sh <slot> <pytest-args>
@@ -50,9 +50,10 @@ $(cat "$HOME/dotfiles/iar/reviewer-scope.md")" < /dev/null >> "$rlog" 2>&1 || tr
 
 v=$(sed '1,/^=== END TESTS ===$/d' "$rlog" | grep -oE "VERDICT: (APPROVED|CHANGES REQUESTED|NEEDS HUMAN)" | tail -1 || true)
 note=""
-if [ "$v" = "VERDICT: APPROVED" ] && [ "$trc" != 0 ]; then
-  if [ -z "$trc" ]; then v="VERDICT: NEEDS HUMAN"; note=" — code review approved, but NO TESTS RAN"
-  else v="VERDICT: CHANGES REQUESTED"; note=" — code review approved, but the tests FAILED (exit $trc)"; fi
+if [ -n "$v" ] && [ -z "$trc" ]; then
+  note=" — reviewer said ${v#VERDICT: }, but NO TESTS RAN"; v="VERDICT: NEEDS HUMAN"
+elif [ "$v" = "VERDICT: APPROVED" ] && [ "$trc" != 0 ]; then
+  v="VERDICT: CHANGES REQUESTED"; note=" — code review approved, but the tests FAILED (exit $trc)"
 fi
 case "$v" in
   "VERDICT: APPROVED")

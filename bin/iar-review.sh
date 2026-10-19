@@ -48,7 +48,7 @@ codex exec -m gpt-5.6-sol -s read-only "You are the independent REVIEWER for bea
 
 $(cat "$HOME/dotfiles/iar/reviewer-scope.md")" < /dev/null >> "$rlog" 2>&1 || true
 
-v=$(grep -oE "VERDICT: (APPROVED|CHANGES REQUESTED|NEEDS HUMAN)" "$rlog" | tail -1 || true)
+v=$(sed '1,/^=== END TESTS ===$/d' "$rlog" | grep -oE "VERDICT: (APPROVED|CHANGES REQUESTED|NEEDS HUMAN)" | tail -1 || true)
 note=""
 if [ "$v" = "VERDICT: APPROVED" ] && [ "$trc" != 0 ]; then
   if [ -z "$trc" ]; then v="VERDICT: NEEDS HUMAN"; note=" — code review approved, but NO TESTS RAN"
@@ -56,11 +56,11 @@ if [ "$v" = "VERDICT: APPROVED" ] && [ "$trc" != 0 ]; then
 fi
 case "$v" in
   "VERDICT: APPROVED")
-    br update "$id" --add-label iar:approved --remove-label iar:awaiting-review --actor "$ACTOR" >/dev/null 2>&1 || true; rc=0 ;;
+    br update "$id" --add-label iar:approved --remove-label iar:awaiting-review --remove-label iar:changes-requested --remove-label needs-human --actor "$ACTOR" >/dev/null 2>&1 || true; rc=0 ;;
   "VERDICT: CHANGES REQUESTED")
-    br update "$id" --add-label iar:changes-requested --remove-label iar:awaiting-review --actor "$ACTOR" >/dev/null 2>&1 || true; rc=1 ;;
+    br update "$id" --add-label iar:changes-requested --remove-label iar:awaiting-review --remove-label iar:approved --remove-label needs-human --actor "$ACTOR" >/dev/null 2>&1 || true; rc=1 ;;
   "VERDICT: NEEDS HUMAN")
-    br update "$id" --add-label needs-human --remove-label iar:awaiting-review --actor "$ACTOR" >/dev/null 2>&1 || true; rc=2 ;;
+    br update "$id" --add-label needs-human --remove-label iar:awaiting-review --remove-label iar:approved --remove-label iar:changes-requested --actor "$ACTOR" >/dev/null 2>&1 || true; rc=2 ;;
   *)
     echo "iar-review: no VERDICT line found — see $rlog" >&2; exit 3 ;;
 esac

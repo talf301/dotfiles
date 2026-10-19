@@ -56,7 +56,7 @@ Steps:
 1. Create or check out the branch. Read the bead, the parent spec, and the repo instructions.
 2. Implement the smallest complete change. Run tests only with `iar-run-tests.sh <slot> <pytest-args>`. Commit with single-line messages and no co-author.
 3. Run the done-when command. Fix until it passes.
-4. Review: `ACTOR=tal-bg iar-review.sh <id> <slot> <base-sha> iar-run-tests.sh <slot> <pytest-args>` (exit 0 approved, 1 changes requested, 2 needs human, 3 no verdict). It runs the tests outside the sandbox and gives the reviewer their output; failed tests or no test command can never give exit 0. Read `/tmp/swarm-logs/review-<id>.log`. Fix the actionable findings and review again, at most 2 fix rounds. On exit 2 or after 2 rounds, ask Tal.
+4. Review: `ACTOR=tal-bg iar-review.sh <id> <slot> <base-sha>` (exit 0 approved, 1 changes requested, 2 needs human, 3 no verdict). The reviewer picks the tests, the script runs them outside the sandbox, and the reviewer judges their output; failed tests or no tests run can never give exit 0. Read `/tmp/swarm-logs/review-<id>.log`. Fix the actionable findings and review again, at most 2 fix rounds. On exit 2 or after 2 rounds, ask Tal.
 5. Push the branch: `git push -u origin u/tfriedman/iar-<id>`.
 6. Add a bead comment from a file (`br comments add <id> --actor tal-bg -f <file>`): what changed, the tests executed (command and pass/fail counts) apart from checks only reviewed, the code review verdict, open risks.
 7. Post to Tal's Plannotator Inbox with your `plannotator_inbox` tool:

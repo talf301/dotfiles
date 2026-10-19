@@ -36,7 +36,7 @@ The moment something needs a human decision, ask the user inline (AskUserQuestio
 1. Write `/tmp/iar-review-<id>.txt`: base SHA, head SHA, the acceptance criteria, a concise change summary, exact checks run + results, known risks. Attach: `br comments add <id> --actor tal-solo -f /tmp/iar-review-<id>.txt` (always `-f`, never `-m` prose — quoting bites).
 2. `br update <id> --add-label iar:awaiting-review --remove-label iar:changes-requested --actor tal-solo`.
 3. Run `iar-review.sh <id> <wt> <base-sha>` via Bash with `run_in_background` (it takes minutes). It captures criteria, lets codex pick the tests from the diff, runs them outside the sandbox, has codex judge with their output, stamps the verdict label, and posts the verdict comment itself. Failed or uncollectable tests turn APPROVED into CHANGES REQUESTED; no tests run turns any verdict into NEEDS HUMAN. Exit codes: 0 approved, 1 changes requested, 2 needs human, 3 no verdict parsed.
-4. When it lands, read `$LOG_DIR/review-<id>.log` (the executed test output is at its top) and summarize for the user in two separate parts: the executed test run (command, pass/fail counts) and the code review (findings + verdict). Never call a code review alone a test result.
+4. When it lands, read `$LOG_DIR/review-<id>.log` (the executed test output sits between `=== TESTS` and `=== END TESTS`) and summarize for the user in two separate parts: the executed test run (command, pass/fail counts) and the code review (findings + verdict). Never call a code review alone a test result.
 
 ## 5. Fix loop
 

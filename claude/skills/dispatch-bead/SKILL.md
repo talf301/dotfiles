@@ -56,14 +56,14 @@ Steps:
 1. Create or check out the branch. Read the bead, the parent spec, and the repo instructions.
 2. Implement the smallest complete change. Run tests only with `iar-run-tests.sh <slot> <pytest-args>`. Commit with single-line messages and no co-author.
 3. Run the done-when command. Fix until it passes.
-4. Review: `ACTOR=tal-bg iar-review.sh <id> <slot> <base-sha>` (exit 0 approved, 1 changes requested, 2 needs human, 3 no verdict). Read `/tmp/swarm-logs/review-<id>.log`. Fix the actionable findings and review again, at most 2 fix rounds. On exit 2 or after 2 rounds, ask Tal.
+4. Review: `ACTOR=tal-bg iar-review.sh <id> <slot> <base-sha>` (exit 0 approved, 1 changes requested, 2 needs human, 3 no verdict). The reviewer picks the tests, the script runs them outside the sandbox, and the reviewer judges their output; failed tests or no tests run can never give exit 0. Read `/tmp/swarm-logs/review-<id>.log`. Fix the actionable findings and review again, at most 2 fix rounds. On exit 2 or after 2 rounds, ask Tal.
 5. Push the branch: `git push -u origin u/tfriedman/iar-<id>`.
-6. Add a bead comment from a file (`br comments add <id> --actor tal-bg -f <file>`): what changed, the checks you ran with results, the review verdict, open risks.
+6. Add a bead comment from a file (`br comments add <id> --actor tal-bg -f <file>`): what changed, the tests executed (command and pass/fail counts) apart from checks only reviewed, the code review verdict, open risks.
 7. Post to Tal's Plannotator Inbox with your `plannotator_inbox` tool:
    - **Finished:** call `get_guide_brief`, then `submit_guide` with a guided review of `<base-sha>..HEAD`, subject `<session name>: ready for review`. Put open risks and anything you decided under the rules below in the guide's intent. End the body with one `:::question`: integrate into the PR group now, or the fix you would make first, with your recommendation.
    - **Blocked on a decision only Tal can make** (at any step): `send_message` with one `:::question` block that has a `Stopped:` line, the evidence, 2–3 options and your recommendation. Then wait for the answer.
    - If the tool is missing or fails, say so in your summary and use the summary as the question.
-8. End with a short summary. Its first line is exactly `READY: <one-line result>` or `QUESTION: <the one question>`. Then add the Inbox thread link, what changed, the checks and the verdict. Then wait. Do not integrate, open a PR or return the slot.
+8. End with a short summary. Its first line is exactly `READY: <one-line result>` or `QUESTION: <the one question>`. Then add the Inbox thread link, what changed, the executed tests with results, and the code review verdict as separate items. Then wait. Do not integrate, open a PR or return the slot.
 
 When Tal replies (from the Inbox, the reply arrives in this session by itself):
 - **"Integrate", or a yes to integrating:** follow steps 6 and 7 of `~/dotfiles/claude/skills/next-bead/SKILL.md` (merge into the PR-group branch or offer a draft PR, close the bead, return the treehouse slot). Then post one line in the same thread (`send_message` with `reply_to`) saying what landed, and resolve the thread (`resolve_message`).

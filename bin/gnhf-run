@@ -1,0 +1,86 @@
+#!/bin/bash
+# Run gnhf on a fresh Precog treehouse slot, then start a background walkthrough session.
+# usage: gnhf-run <name> <prompt.md> [--base <ref>] [--quota-floor <percent>] [gnhf flags...]
+#   Leases a slot as agent:gnhf:<name> and puts it on a new branch u/tfriedman/gnhf-<name> from
+#   --base (default origin/main). Writes build/gnhf/{base,env.sh}; freezes the hydra-check baseline
+#   if the prompt names hydra-check. Runs gnhf --agent claude --current-branch in the foreground.
+#   A quota watchdog sends one Ctrl+C when the weekly Claude quota falls to --quota-floor percent
+#   remaining (default 60). When gnhf exits, it starts `claude --bg` with the gnhf-walkthrough skill.
+#   The slot stays leased and nothing is pushed.
+set -euo pipefail
+DOTFILES=$(cd "$(dirname "$(realpath "$0")")/.." && pwd)
+REPO=/Users/tal/Documents/precog
+[ $# -ge 2 ] || { sed -n '2,9s/^# \{0,1\}//p' "$0"; exit 2; }
+name=$1
+prompt=$(realpath "$2")
+shift 2
+base=origin/main
+floor=60
+flags=()
+while [ $# -gt 0 ]; do
+  case $1 in
+    --base) base=$2; shift 2 ;;
+    --quota-floor) floor=$2; shift 2 ;;
+    *) flags+=("$1"); shift ;;
+  esac
+done
+branch=u/tfriedman/gnhf-$name
+
+echo "gnhf-run: leasing a precog slot as agent:gnhf:$name (about 4 min)"
+slot=$(cd "$REPO" && treehouse get --lease --lease-holder "agent:gnhf:$name" | tail -1) || true
+[ -e "$slot/.git" ] || { echo "gnhf-run: treehouse leased no slot (see its message above)"; exit 1; }
+echo "gnhf-run: slot $slot"
+cd "$slot"
+[ -z "$(git status --porcelain)" ] || { echo "gnhf-run: slot is not clean"; exit 1; }
+git fetch -q origin
+git switch -q --no-track -c "$branch" "$base"
+mkdir -p build/gnhf
+git rev-parse HEAD >build/gnhf/base
+PTH=$REPO/.venv/lib/python3.12/site-packages/__bazel_bin__.pth
+{
+  echo "# source me: main-checkout venv Python (the slot venv cannot load libswipl) with this slot's code"
+  echo "export PY=$REPO/.venv/bin/python"
+  echo "export PYTHONPATH=$(sed -e "s#^\.\./\.\./\.\./\.\./#$slot/#" -e "s#^$REPO/#$slot/#" "$PTH" | paste -sd: -)"
+} >build/gnhf/env.sh
+echo "gnhf-run: branch $branch at $(git log -1 --format='%h %s')"
+if grep -q hydra-check "$prompt"; then
+  echo "gnhf-run: the prompt names hydra-check; freezing its baseline (about 5 min unless cached)"
+  "$DOTFILES/gnhf/hydra-check.sh" baseline
+fi
+
+# One SIGINT to this process group is what Ctrl+C sends: gnhf finishes the current iteration and stops.
+pgid=$(ps -o pgid= $$ | tr -d ' ')
+watchdog() {
+  while true; do
+    left=$(quota-axi --provider claude --json 2>/dev/null |
+      jq -r '.providers[0].windows[] | select(.id=="seven_day") | .percentRemaining')
+    echo "$(date '+%F %T') weekly remaining=${left:-?} floor=$floor"
+    if [[ -n $left && ${left%.*} -le $floor ]]; then
+      echo "floor reached, sending one Ctrl+C"
+      kill -INT -- "-$pgid"
+      return
+    fi
+    sleep 600
+  done
+}
+watchdog >>build/gnhf/watchdog.log 2>&1 &
+watchdog_pid=$!
+trap ':' INT  # survive the Ctrl+C so the walkthrough still starts
+set +e
+gnhf --agent claude --current-branch ${flags[@]+"${flags[@]}"} "$(cat "$prompt")"
+gnhf_rc=$?
+set -e
+trap - INT
+kill "$watchdog_pid" 2>/dev/null || true
+
+run=$(ls -t .gnhf/runs 2>/dev/null | head -1)
+echo "gnhf-run: gnhf exited with $gnhf_rc; slot $slot stays leased on $branch"
+if [ -z "$run" ] || [ ! .gnhf/runs/"$run" -nt build/gnhf/base ]; then
+  echo "gnhf-run: gnhf wrote no run directory; no walkthrough"
+  exit "$gnhf_rc"
+fi
+walkthrough=(claude --bg --settings "$DOTFILES/iar/dispatch-settings.json" --name "gnhf walkthrough: $name"
+  "Follow $DOTFILES/claude/skills/gnhf-walkthrough/SKILL.md for gnhf run $run in slot $slot (name $name, branch $branch).")
+echo "gnhf-run: starting the walkthrough (to rerun it, from the slot):$(printf ' %q' "${walkthrough[@]}")"
+"${walkthrough[@]}"
+echo "gnhf-run: return the slot when you are done: treehouse return $slot"

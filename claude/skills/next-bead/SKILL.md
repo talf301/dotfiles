@@ -9,6 +9,8 @@ You are the orchestrator. Delegate implementation to subagents, including when c
 
 Constants (same as the swarm): `BEADS_DIR=/Users/tal/.local/share/beads/precog/.beads` on every `br` call, `REPO=/Users/tal/Documents/precog`, `LOG_DIR=/tmp/swarm-logs`, actor `tal-solo`.
 
+Any post to Tal's Plannotator Inbox, from this skill or from a dispatched session that follows steps 6–7, follows `~/dotfiles/iar/inbox-etiquette.md`.
+
 ## 1. Pick & claim
 
 - With a bead id argument: use it.
@@ -75,6 +77,7 @@ Proceed after independent approval and the final human review are satisfied.
 
 - `pr:<slug>` bead: ensure the bead branch is pushed, then integrate it from the lease without creating another worktree. Start from the current `origin/u/tfriedman/pr/<slug>` HEAD, or `origin/main` for the first member; merge `u/tfriedman/iar-<id>` with `--no-ff`, and push the resulting HEAD to `origin/u/tfriedman/pr/<slug>`. THEN `br close <id> --reason "integrated into u/tfriedman/pr/<slug>" --actor tal-solo`. Merge-then-push-then-close ordering is load-bearing: closing unblocks dependents, which must base from a group branch containing this bead. On conflict or rejected push: do not close; resolve it with the user. Then offer to pick up the next ready bead in the group; when the group completes, shipping is `swarm pr` / the TUI `p` key as usual.
 - Standalone bead: ensure the bead branch is pushed, then offer the user a draft PR (`gh pr create --draft --base main`, comment the URL on the bead, label `pr-open`, and close the bead) or leave it approved and pushed for `swarm pr`.
+- If the bead has an Inbox thread, post one line in it that says what landed, then `resolve_message` the thread.
 - Return the Treehouse lease after the durable remote branch or PR is confirmed. Remote branch cleanup stays with `swarm done`.
 
 ## 7. Completion summary

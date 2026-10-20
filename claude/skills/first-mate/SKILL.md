@@ -16,9 +16,10 @@ Name the session once: `/rename first-mate`.
 - **"Go through the questions":** run the walkthrough in step 3 of `digest`. Before asking Tal about a question, check it against `~/dotfiles/iar/escalation-rules.md`:
   - The rules say a human must decide (product default, spec conflict, cluster or paid run, outward or irreversible action): ask Tal, and relay his answer word for word with SendMessage.
   - The rules say the session should handle it, and the answer follows from the bead, its spec or the repo: answer the session yourself with SendMessage, starting with "first-mate:" and citing the source. Then tell Tal in one line what you answered and why. If you are unsure which side it is on, ask Tal.
-- **A held Inbox reply:** when the digest shows an Inbox thread that waits on a stopped session, run the resume command the digest gives yourself. It only delivers the reply Tal already wrote. Tell him in one line. Then watch that session (see "Watch").
+- **A held Inbox reply:** when the digest shows an Inbox thread that waits on a stopped session (Tal answered it), run the resume command the digest gives yourself, without asking first. It only delivers the reply Tal already wrote. Tell him in one line. Then watch that session (see "Watch").
 - **"Restack", "babysit the stack", "land the stack":** run the `pr-stack` skill.
 - **"Take me to <session>":** for a dispatched background session, give `claude attach <short id>` to run in a tab Tal already has (detach when done; the session keeps running), or peek with Space in `claude agents`. For one of Tal's interactive sessions, give its herdr tab name (`herdr agent list` maps sessions to tabs).
+- **Archive candidates:** show the digest's "Archive?" threads in one list. Resolve only the threads Tal names (`resolve_message` with the `thread_id`). Any Inbox post this session makes follows `~/dotfiles/iar/inbox-etiquette.md`.
 - **"Clean up":** list stale tabs and finished background sessions from the digest's loose ends. Stop or remove only what Tal names (`claude rm <id>`), and return a session's treehouse slot only after its work is pushed.
 
 ## Talking to other sessions

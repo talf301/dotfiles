@@ -1,0 +1,10 @@
+## Inbox etiquette (required)
+
+Every session that posts to Tal's Plannotator Inbox (`plannotator_inbox` tool, or the stdio server `plannotator inbox mcp`) follows these rules, so his list shows one clear item per decision.
+
+- **One project for all precog work.** Pass `project_path: "/Users/tal/.local/share/precog/Precog agents"` on every `send_message`, `submit_guide`, `read_thread` and `wait_for_reply` about precog, from any working folder (main checkout, treehouse slot, `/tmp`). The Inbox lists it as `Precog agents`. The folder is outside `~/Documents` because the Inbox server can refuse folders there (`project_path: no such folder`). Give `attachments` as absolute paths: relative ones resolve against this folder. `resolve_message` takes no `project_path`.
+- **One thread per unit of work.** Pass `thread: "<unit name>"` on every send (a dispatched session uses its session name, for example `precog-kb02: Inbox etiquette`), or `reply_to` to answer inside a thread. Before you start a thread, call `read_thread` with `asked_by: "anyone"` and join an open thread about the same decision instead of opening a second one.
+- **Subject states the decision**, in under 40 characters, with the short bead id first: `gywc: open draft PR?`, `kb02: merge into master?`. Not a status (`ready for review`) and not a folder name. The subject is set by the first message of a thread.
+- **Withdraw moot questions.** When a question no longer applies, or a newer message replaces it, name it in `supersedes` (`"<message id>/<key>"`, keys from `read_thread`). Never leave an open question that no longer applies.
+- **Resolve when done.** Call `resolve_message` on the thread after you acted on Tal's answer and nothing is left for him to read, or when the work lands (after one line in the thread that says what landed).
+- **Replies.** In Claude Code the reply arrives in the session by itself: end your turn, do not call `wait_for_reply`. A stopped session gets the reply only when it is resumed; the `first-mate` skill resumes it.

@@ -88,7 +88,10 @@ first=$(grep -m1 -Eo '[a-z]+_[0-9]{4}\.txt' "$LOGS/digest-diff.txt" | head -1)
 
 base_tests=$(cat "$BASE/test_count")
 # Net lines split into production code and tests (*_test.py, conftest.py); the metric is production lines.
-git add -N -- hydra 2>/dev/null  # count new untracked files in the diff
+# A copy of the index with intent-to-add entries counts new untracked files; the slot's own index is untouched.
+cp "$(git rev-parse --path-format=absolute --git-path index)" "$RUN/index-for-net-lines"
+export GIT_INDEX_FILE=$RUN/index-for-net-lines
+git add -N -- hydra 2>/dev/null
 read -r src_add src_del test_add test_del < <(git diff --numstat "$BASE_SHA" -- hydra | awk '
   $3 ~ /(_test\.py|conftest\.py)$/ {ta+=$1; td+=$2; next} {sa+=$1; sd+=$2}
   END {print sa+0, sd+0, ta+0, td+0}')

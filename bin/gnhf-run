@@ -76,7 +76,7 @@ set -e
 trap - INT
 kill "$watchdog_pid" 2>/dev/null || true
 
-run=$(ls -t .gnhf/runs 2>/dev/null | head -1)
+run=$(ls -t .gnhf/runs 2>/dev/null | head -1) || true
 echo "gnhf-run: gnhf exited with $gnhf_rc; slot $slot stays leased on $branch"
 if [ -z "$run" ] || [ ! .gnhf/runs/"$run" -nt build/gnhf/base ]; then
   echo "gnhf-run: gnhf wrote no run directory; no walkthrough"

@@ -40,7 +40,8 @@ PTH=$REPO/.venv/lib/python3.12/site-packages/__bazel_bin__.pth
 {
   echo "# source me: main-checkout venv Python (the slot venv cannot load libswipl) with this slot's code"
   echo "export PY=$REPO/.venv/bin/python"
-  echo "export PYTHONPATH=$(sed -e "s#^\.\./\.\./\.\./\.\./#$slot/#" -e "s#^$REPO/#$slot/#" "$PTH" | paste -sd: -)"
+  # Path lines only: the .pth also holds an `import` line, which the venv's site module runs itself.
+  echo "export PYTHONPATH=$(grep -E '^(/|\.\./)' "$PTH" | sed -e "s#^\.\./\.\./\.\./\.\./#$slot/#" -e "s#^$REPO/#$slot/#" | paste -sd: -)"
 } >build/gnhf/env.sh
 echo "gnhf-run: branch $branch at $(git log -1 --format='%h %s')"
 if grep -q hydra-check "$prompt"; then

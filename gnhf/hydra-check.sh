@@ -12,6 +12,7 @@ BASE_SHA=$(cat "$RUN/base") || exit 2
 BASE=$HOME/.local/share/precog/gnhf/baseline-${BASE_SHA:0:12}
 SEEDS=160
 PROCS=10
+DIGEST_FILES=$((SEEDS * 3))  # datagen_digest.py writes one file per seed for each of its 3 configs
 cd "$SLOT" || exit 2
 source "$RUN/env.sh"
 export OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES
@@ -24,13 +25,20 @@ count_tests() {
   echo "${n:-0}"
 }
 
-# Starts the datagen digest in the background, split into PROCS seed slices; the caller waits.
+# Starts the datagen digest in the background, split into PROCS seed slices; wait_digest collects them.
+digest_pids=()
 start_digest() {  # start_digest <out-dir> <log-dir>
   rm -rf "$1"
   mkdir -p "$1" "$2"
   for p in $(seq 0 $((PROCS - 1))); do
     "$PY" "$HERE/datagen_digest.py" "$1" $(seq $p $PROCS $((SEEDS - 1))) >"$2/digest-$p.log" 2>&1 &
+    digest_pids+=($!)
   done
+}
+wait_digest() {  # returns the number of digest workers that failed
+  local failed=0 pid
+  for pid in "${digest_pids[@]}"; do wait "$pid" || failed=$((failed + 1)); done
+  return $failed
 }
 
 if [ "${1:-}" = baseline ]; then
@@ -45,10 +53,16 @@ if [ "${1:-}" = baseline ]; then
   start=$(date +%s)
   start_digest "$BASE/digest" "$BASE/logs"
   tests=$(count_tests)
-  wait
+  wait_digest
+  failed_workers=$?
+  files=$(ls "$BASE/digest" | wc -l | tr -d ' ')
+  if [ "$failed_workers" -ne 0 ] || [ "$files" -ne "$DIGEST_FILES" ] || [ "$tests" -eq 0 ]; then
+    echo "baseline FAILED: failed_workers=$failed_workers files=$files/$DIGEST_FILES tests=$tests (see $BASE/logs/)"
+    exit 2
+  fi
   # test_count is written last: it marks the baseline as complete.
   echo "$tests" >"$BASE/test_count"
-  echo "baseline ${BASE_SHA:0:10} tests=$tests files=$(ls "$BASE/digest" | wc -l | tr -d ' ') $(($(date +%s) - start))s: $BASE"
+  echo "baseline ${BASE_SHA:0:10} tests=$tests files=$files $(($(date +%s) - start))s: $BASE"
   exit 0
 fi
 
@@ -62,9 +76,10 @@ pytest_rc=$?
 tests=$(count_tests)
 npx -y pyright@1.1.414 --pythonpath "$SLOT/.venv/bin/python" hydra >"$LOGS/pyright.log" 2>&1
 pyright_rc=$?
-wait
+wait_digest
+failed_workers=$?
 
-expected=$(ls "$BASE/digest" | wc -l | tr -d ' ')
+expected=$DIGEST_FILES
 got=$(ls "$RUN/digest" | wc -l | tr -d ' ')
 diff -rq "$BASE/digest" "$RUN/digest" >"$LOGS/digest-diff.txt" 2>&1
 digest_diffs=$(grep -c . "$LOGS/digest-diff.txt")
@@ -83,8 +98,10 @@ net_tests=$((test_add - test_del))
 fail=()
 [ $pytest_rc -ne 0 ] && fail+=("pytest(see $LOGS/pytest.log)")
 [ $pyright_rc -ne 0 ] && fail+=("pyright(see $LOGS/pyright.log)")
+[ "$failed_workers" -ne 0 ] && fail+=("digest-workers $failed_workers failed(see $LOGS/digest-*.log)")
 [ "$got" -ne "$expected" ] && fail+=("digest-files $got/$expected(see $LOGS/digest-*.log)")
 [ "$digest_diffs" -ne 0 ] && fail+=("digest-diff $digest_diffs files(see $LOGS/digest-diff.txt, $LOGS/digest-first-diff.txt)")
+[ "$tests" -eq 0 ] && fail+=("test-collection(no tests collected)")
 [ "$tests" -lt "$base_tests" ] && fail+=("test-count $tests<$base_tests")
 
 secs=$(($(date +%s) - start))

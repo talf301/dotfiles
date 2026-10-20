@@ -53,8 +53,10 @@ fi
 pgid=$(ps -o pgid= $$ | tr -d ' ')
 watchdog() {
   while true; do
+    # A failed or non-numeric lookup is logged and retried at the next poll.
     left=$(quota-axi --provider claude --json 2>/dev/null |
-      jq -r '.providers[0].windows[] | select(.id=="seven_day") | .percentRemaining')
+      jq -r '.providers[0].windows[] | select(.id=="seven_day") | .percentRemaining' 2>/dev/null) || left=
+    [[ $left =~ ^[0-9]+(\.[0-9]+)?$ ]] || left=
     echo "$(date '+%F %T') weekly remaining=${left:-?} floor=$floor"
     if [[ -n $left && ${left%.*} -le $floor ]]; then
       echo "floor reached, sending one Ctrl+C"

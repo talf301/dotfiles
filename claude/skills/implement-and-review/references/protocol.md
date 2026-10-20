@@ -162,7 +162,7 @@ codex's stdin/tempdir behavior) collapse into two rules:
 ## Provider launch rules
 
 - From Codex: use native Sol subagents for review. Launch Claude Code implementers as completion-aware local sessions; never detach them without a tracked callback.
-- From Claude Code: use native Claude subagents for implementation. Launch Sol reviewers with `codex exec -m gpt-5.6-sol` in read-only mode as completion-aware local sessions, stdin closed (see Test execution above).
+- From Claude Code: use native Claude subagents for implementation. Launch Sol reviewers with `codex exec -m gpt-6-sol` in read-only mode as completion-aware local sessions, stdin closed (see Test execution above).
 - If the requested provider is unavailable or lacks quota, report the affected task and ask before substituting another model.
 - Interactive single-bead runs keep normal permission boundaries — you are present to approve.
 - Autonomous swarm spawns (`swarm-supervisor.sh`) run headless in `--permission-mode bypassPermissions` because a `-p` session cannot answer prompts and a scoped allowlist is brittle. This drops the permission gate: the fence is the isolated worktree plus this being the operator's own machine and beads under active watch. Move spawns into a container/VM before running untrusted work.

@@ -5,7 +5,7 @@ description: Pick up the next ready Bead (or a named one) and drive it through t
 
 # Next Bead (interactive IAR)
 
-You are the orchestrator. Delegate implementation to subagents, including when commits must run sequentially, to preserve the main session’s context. The independent reviewer is `iar-review.sh` (codex `gpt-5.6-sol`, read-only). Labels stay the shared state so `swarm` / `swarm-status.sh` keep reflecting reality — but this bead is NOT swarm work: never assign it to a `swarm-*` actor.
+You are the orchestrator. Delegate implementation to subagents, including when commits must run sequentially, to preserve the main session’s context. The independent reviewer is `iar-review.sh` (codex `gpt-6-sol`, read-only). Labels stay the shared state so `swarm` / `swarm-status.sh` keep reflecting reality — but this bead is NOT swarm work: never assign it to a `swarm-*` actor.
 
 Constants (same as the swarm): `BEADS_DIR=/Users/tal/.local/share/beads/precog/.beads` on every `br` call, `REPO=/Users/tal/Documents/precog`, `LOG_DIR=/tmp/swarm-logs`, actor `tal-solo`.
 

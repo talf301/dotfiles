@@ -20,7 +20,7 @@ Read [references/protocol.md](references/protocol.md) before launching agents.
 ## Defaults
 
 - Implementer: latest Claude Opus through Claude Code.
-- Reviewer: `gpt-5.6-sol` through Codex.
+- Reviewer: `gpt-6-sol` through Codex.
 - Reverse roles when the user asks.
 - Run at most three independent implementations concurrently; batch the rest.
 - Allow two fix/re-review cycles. Escalate unresolved findings to the user: the agent with context posts a `br comments` ESCALATION on the Bead, tags it `needs-human`, and holds its claim (the gate). Resume with `--remove-label needs-human --assignee "" --status open`. See `swarm-status.sh` for what is waiting (it shows each escalation's latest comment inline).

@@ -57,6 +57,20 @@ else
   echo "BUILD ~/Applications/ClaudeGo.app"
 fi
 
+# --- BoardRefresh.app: launchd's every-minute board.md refresh (an app bundle may write into iCloud Drive) ---
+if [ $DRY = 1 ]; then echo "BUILD ~/Applications/BoardRefresh.app"
+else
+  _br="$HOME/Applications/BoardRefresh.app/Contents"
+  mkdir -p "$_br/MacOS" && clang -O2 -o "$_br/MacOS/board-refresh" "$REPO/iar/board-refresh.c"
+  [ -f "$_br/Info.plist" ] || plutil -create xml1 "$_br/Info.plist"
+  for kv in CFBundleIdentifier=local.boardrefresh CFBundleExecutable=board-refresh CFBundleName=BoardRefresh CFBundlePackageType=APPL; do
+    plutil -replace "${kv%%=*}" -string "${kv#*=}" "$_br/Info.plist"
+  done
+  plutil -replace LSBackgroundOnly -bool true "$_br/Info.plist"
+  codesign -f -s - "$HOME/Applications/BoardRefresh.app"
+  echo "BUILD ~/Applications/BoardRefresh.app"
+fi
+
 # --- macOS UI configs (these tools don't read nikud's XDG_CONFIG_HOME) ---
 link "sketchybar"     "$HOME/.config/sketchybar"
 link ".aerospace.toml" "$HOME/.aerospace.toml"

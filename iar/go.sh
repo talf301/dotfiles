@@ -1,12 +1,13 @@
 #!/usr/bin/env zsh
 # Put Tal in a Claude session: focus its herdr pane when one runs it, else open a herdr tab running
-# `claude attach` (background sessions only). ClaudeGo.app calls this for claudego://<sessionId> links on board.md.
+# `claude attach` (background sessions only). ClaudeGo.app calls this for claudego://s/<sessionId> links on board.md.
 # Usage: go.sh [--dry] <sessionId>
 
 export XDG_CONFIG_HOME="$HOME/nikud/xdg_config_home"
 JQ=/usr/bin/jq HERDR=/opt/homebrew/bin/herdr CLAUDE=$HOME/.local/bin/claude
 dry=""; [[ $1 == --dry ]] && { dry=echo; shift }
 sid=$1
+print -r -- "$(date '+%F %T') go $*" >> "$HOME/Library/Logs/session-board-actions.log"
 [[ -n $sid ]] || { print -u2 "usage: go.sh [--dry] <sessionId>"; exit 2 }
 
 agent=$("$CLAUDE" agents --json --all 2>/dev/null | "$JQ" -c --arg s "$sid" 'first(.[] | select(.sessionId == $s or .id == $s)) // empty')

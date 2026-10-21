@@ -182,7 +182,7 @@ def classify(data, now):
         name = s.get("name") or s.get("title") or s["sessionId"][:8]
         title = f" ({clip(s['title'], 50)})" if s.get("title") and s["title"] != name else ""
         pr = f" [PR]({s['pr']})" if s.get("pr") else ""
-        jump = f" [open](claudego://{s['sessionId']})"
+        jump = f" [open](claudego://s/{s['sessionId']})"
         if s.get("kind") == "background" and s.get("id") and s.get("state") != "working":
             jump += f" [remove](claudego://act/rm/{s['id']})"
         line = f"**{name}**{title} — {clip(said)} · {ago(active, now)}{pr}{jump}"

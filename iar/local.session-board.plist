@@ -6,11 +6,7 @@
 	<string>local.session-board</string>
 	<key>ProgramArguments</key>
 	<array>
-		<string>/usr/bin/open</string>
-		<string>-g</string>
-		<string>-j</string>
-		<string>-a</string>
-		<string>/Users/tal/Applications/ClaudeGo.app</string>
+		<string>/Users/tal/Applications/BoardRefresh.app/Contents/MacOS/board-refresh</string>
 	</array>
 	<key>StartInterval</key>
 	<integer>60</integer>

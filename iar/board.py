@@ -85,10 +85,11 @@ def parse_slots(text):
 
 def inbox_threads():
     """Unresolved Inbox threads. Each jsonl file is an event log: the last record for an id wins."""
-    messages, questions = {}, {}
+    messages, questions, first_seq = {}, {}, {}
     for path in glob.glob(f"{INBOX}/projects/*/messages.jsonl"):
         for row in json_lines(open(path).read()):
             messages[row["id"]] = row["record"]
+            first_seq.setdefault(row["id"], row["seq"])
     for path in glob.glob(f"{INBOX}/projects/*/questions.jsonl"):
         for row in json_lines(open(path).read()):
             questions[row["id"]] = row["record"]
@@ -113,8 +114,20 @@ def inbox_threads():
             "last_author": posts[-1]["author"]["kind"],
             "last_at": posts[-1]["created_at"],
             "open_questions": open_questions,
+            "quiet": inbox_quiet(root, posts, first_seq, bool(open_questions)),
         })
     return result
+
+
+def inbox_quiet(root, posts, first_seq, asking):
+    """The Inbox's own Quiet rule (plannotator shared/inbox list.ts inboxSectionOf, store.ts readAt): Mark read
+    with no message after it, or nothing asked and every agent message seen (a reply of Tal's counts as a look)."""
+    seq = lambda m: first_seq.get(m["id"], 0)
+    read_seq = root.get("person_read_seq")
+    if read_seq is not None and not any(seq(m) > read_seq for m in posts if not (m.get("set_aside") and m["author"]["kind"] == "person")):
+        return True
+    seen = max([root.get("person_seen_seq") or 0] + [seq(m) for m in posts if m["author"]["kind"] == "person"])
+    return not asking and not any(m["author"]["kind"] == "agent" and seq(m) > seen for m in posts)
 
 
 def ago(when, now):
@@ -155,6 +168,8 @@ def classify(data, now):
         elif t["last_author"] == "person" and t["session"] not in live_ids:
             add("Loose ends", f"Your Inbox reply waits on a stopped session: {link(t)} · {when}"
                 f" [resolve](claudego://act/resolve/{t['id']})", last)
+        elif t.get("quiet"):
+            sec["Old"].append(f"Inbox (Quiet) {link(t)} · {when} [resolve](claudego://act/resolve/{t['id']})")
         elif t["last_author"] != "person":
             add("Ready / to read", f"Inbox {link(t)} · {when} [resolve](claudego://act/resolve/{t['id']})", last)
 
@@ -228,7 +243,7 @@ def render(sec):
         if sec[name]:
             body += ["", f"## {name}", *[f"- {line}" for line in sec[name]]]
     if sec["Old"]:
-        body += ["", f"> [!note]- Old ({len(sec['Old'])}): quiet more than {OLD.days} days", *[f"> - {line}" for line in sec["Old"]]]
+        body += ["", f"> [!note]- Old ({len(sec['Old'])}): quiet more than {OLD.days} days, or Quiet in the Inbox", *[f"> - {line}" for line in sec["Old"]]]
     return "\n".join(body) + "\n"
 
 
@@ -269,6 +284,12 @@ def self_test():
         "inbox": [{"id": "m1", "subject": "pick", "session": "z", "last_author": "agent", "last_at": t(1),
                    "open_questions": ["A or B?"]}],
     }
+    agent = lambda i: {"id": i, "author": {"kind": "agent"}}
+    seqs = {"r": 1, "m2": 5}
+    assert inbox_quiet({"id": "r", "person_seen_seq": 3}, [agent("r")], seqs, False)
+    assert not inbox_quiet({"id": "r", "person_seen_seq": 3}, [agent("r"), agent("m2")], seqs, False)
+    assert not inbox_quiet({"id": "r", "person_seen_seq": 9}, [agent("r")], seqs, True)
+    assert inbox_quiet({"id": "r", "person_read_seq": 6}, [agent("r"), agent("m2")], seqs, True)
     sec = classify(data, now)
     assert len(sec["Needs you"]) == 2, sec["Needs you"]
     assert any("precog-x1" in line for line in sec["Stalled"]), sec["Stalled"]

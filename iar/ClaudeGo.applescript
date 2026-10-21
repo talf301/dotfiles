@@ -5,6 +5,12 @@ on run
 	do shell script "$HOME/dotfiles/iar/board.py"
 end run
 
+-- launchd's `open -a` reaches an instance that is still running as reopen. Without this handler AppleScript shows
+-- its startup screen, which a background-only app never displays, and the app hangs on it.
+on reopen
+	do shell script "$HOME/dotfiles/iar/board.py"
+end reopen
+
 on open location u
 	set linkPath to text 12 thru -1 of u
 	if linkPath starts with "act/" then

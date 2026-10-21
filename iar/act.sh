@@ -6,6 +6,7 @@
 export BEADS_DIR="$HOME/.local/share/beads/precog/.beads" PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/bin:/bin"
 POOL=$HOME/.treehouse/precog-28077b
 verb=$1 arg=$2
+print -r -- "$(date '+%F %T') $*" >> "$HOME/Library/Logs/session-board-actions.log"
 
 ask() {  # ask <message> <button>… — prints the chosen button, exits on Cancel
   local buttons=$(printf '"%s", ' "${@:2}")

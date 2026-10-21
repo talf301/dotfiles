@@ -1,6 +1,7 @@
 #!/usr/bin/env zsh
 # Cleanup actions behind claudego://act/<verb>/<arg> links on board.md. Every action asks first in a dialog.
-# Usage: act.sh rm <session id> | bead <bead id> | slot <slot number> | plannotator <pid>
+# Resolve runs without a dialog: the Inbox can reopen a thread.
+# Usage: act.sh rm <session id> | bead <bead id> | slot <slot number> | plannotator <pid> | resolve <thread id>
 
 export BEADS_DIR="$HOME/.local/share/beads/precog/.beads" PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/bin:/bin"
 POOL=$HOME/.treehouse/precog-28077b
@@ -31,6 +32,11 @@ case $verb in
     [[ -z $dirty && -z $unpushed ]] || { tell "Slot $arg holds work that is not pushed, so it stays leased:\n\n${dirty}${unpushed//\"/\'}"; exit 1 }
     ask "Return slot $arg ($(git -C "$dir" branch --show-current))? It is clean and pushed." Return >/dev/null
     (cd "$dir" && treehouse return --force "$dir") ;;
+  resolve)
+    printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"board","version":"1"}}}' \
+      '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
+      "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"resolve_message\",\"arguments\":{\"message_id\":\"$arg\",\"resolved\":true}}}" |
+      timeout 20 plannotator inbox mcp >/dev/null 2>&1 ;;
   plannotator)
     ps -o command= -p "$arg" | grep -q plannotator || { tell "Plannotator session $arg is gone"; exit 0 }
     ask "Close Plannotator session $arg?" Close >/dev/null

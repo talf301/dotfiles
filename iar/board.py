@@ -153,9 +153,10 @@ def classify(data, now):
         if t["open_questions"]:
             add("Needs you", f"Inbox {link(t)} — {clip(t['open_questions'][0])} · {when}", last)
         elif t["last_author"] == "person" and t["session"] not in live_ids:
-            add("Loose ends", f"Your Inbox reply waits on a stopped session: {link(t)} · {when}", last)
+            add("Loose ends", f"Your Inbox reply waits on a stopped session: {link(t)} · {when}"
+                f" [resolve](claudego://act/resolve/{t['id']})", last)
         elif t["last_author"] != "person":
-            add("Ready / to read", f"Inbox {link(t)} · {when}", last)
+            add("Ready / to read", f"Inbox {link(t)} · {when} [resolve](claudego://act/resolve/{t['id']})", last)
 
     for s in sorted(sessions, key=lambda s: s.get("last_active") or "", reverse=True):
         if s.get("name") == "first-mate" and s.get("state") != "working":

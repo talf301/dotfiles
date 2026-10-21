@@ -16,6 +16,9 @@ obsidian=$(windows md.obsidian | head -1)
 
 term=$(grep -m1 . "$STATE" 2>/dev/null)
 if [[ -z $term ]] || ! windows com.github.wez.wezterm | grep -qx "$term"; then
+  # Started from inside a Claude session, the window would inherit that session's identity (child session, no
+  # transcript, Remote Control clash).
+  unset -m 'CLAUDE*' 'AI_AGENT*' 'HERDR*'
   before=$(windows com.github.wez.wezterm)
   open -n -a WezTerm --args start --cwd "$VAULT" -- zsh -lic 'claude --continue || claude; exec zsh -l'
   term=""
@@ -28,3 +31,6 @@ if [[ -z $term ]] || ! windows com.github.wez.wezterm | grep -qx "$term"; then
 fi
 [[ -n $term ]] && "$AS" move-node-to-workspace --window-id "$term" "$WS"
 "$AS" workspace "$WS"
+# Side by side on a wide second monitor; on the laptop screen alone, one window at a time full size
+# (switch with alt-cmd-ctrl-h/l).
+if (( $("$AS" list-monitors --count) > 1 )); then "$AS" layout tiles horizontal; else "$AS" layout h_accordion; fi

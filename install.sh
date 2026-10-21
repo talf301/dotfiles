@@ -52,6 +52,7 @@ else
   plutil -replace CFBundleIdentifier -string local.claudego "$HOME/Applications/ClaudeGo.app/Contents/Info.plist"
   plutil -replace LSBackgroundOnly -bool true "$HOME/Applications/ClaudeGo.app/Contents/Info.plist"
   plutil -replace CFBundleURLTypes -json '[{"CFBundleURLName":"claudego","CFBundleURLSchemes":["claudego"]}]' "$HOME/Applications/ClaudeGo.app/Contents/Info.plist"
+  codesign -f -s - "$HOME/Applications/ClaudeGo.app"
   /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$HOME/Applications/ClaudeGo.app"
   echo "BUILD ~/Applications/ClaudeGo.app"
 fi

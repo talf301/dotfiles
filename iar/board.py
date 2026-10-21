@@ -27,6 +27,7 @@ BEADS_DIR = f"{HOME}/.local/share/beads/precog/.beads"
 
 WORKING_QUIET = timedelta(hours=4)  # a working session silent this long is probably hung
 RECENT = timedelta(days=3)  # idle tabs and unreported endings older than this move to loose ends
+OLD = timedelta(days=7)  # anything quiet longer than this folds into the Old section
 BEAD_RE = re.compile(r"^([a-z0-9]+-[a-z0-9.]+): ")
 
 
@@ -141,14 +142,20 @@ def classify(data, now):
     thread_sessions = {t["session"] for t in data["inbox"]}
     link = lambda t: f"[{clip(t['subject'], 80)}]({data['inbox_url']}#thread={t['id']})"
 
+    def add(name, line, when):
+        """Anything quiet longer than OLD folds into Old, except what needs Tal."""
+        old = name != "Needs you" and (when is None or now - when > OLD)
+        sec["Old" if old else name].append(line)
+
     for t in sorted(data["inbox"], key=lambda t: t["last_at"], reverse=True):
-        when = ago(parse_time(t["last_at"]), now)
+        last = parse_time(t["last_at"])
+        when = ago(last, now)
         if t["open_questions"]:
-            sec["Needs you"].append(f"Inbox {link(t)} — {clip(t['open_questions'][0])} · {when}")
+            add("Needs you", f"Inbox {link(t)} — {clip(t['open_questions'][0])} · {when}", last)
         elif t["last_author"] == "person" and t["session"] not in live_ids:
-            sec["Loose ends"].append(f"Your Inbox reply waits on a stopped session: {link(t)} · {when}")
+            add("Loose ends", f"Your Inbox reply waits on a stopped session: {link(t)} · {when}", last)
         elif t["last_author"] != "person":
-            sec["Ready / to read"].append(f"Inbox {link(t)} · {when}")
+            add("Ready / to read", f"Inbox {link(t)} · {when}", last)
 
     for s in sorted(sessions, key=lambda s: s.get("last_active") or "", reverse=True):
         if s.get("name") == "first-mate" and s.get("state") != "working":
@@ -160,59 +167,67 @@ def classify(data, now):
         title = f" ({clip(s['title'], 50)})" if s.get("title") and s["title"] != name else ""
         pr = f" [PR]({s['pr']})" if s.get("pr") else ""
         jump = f" [open](claudego://{s['sessionId']})"
+        if s.get("kind") == "background" and s.get("id") and s.get("state") != "working":
+            jump += f" [remove](claudego://act/rm/{s['id']})"
         line = f"**{name}**{title} — {clip(said)} · {ago(active, now)}{pr}{jump}"
         reported = s["sessionId"] in thread_sessions
         if s.get("kind") == "interactive":
             if s.get("status") == "waiting":
-                sec["Needs you"].append(line)
+                add("Needs you", line, active)
             elif s.get("status") == "busy":
-                sec["Working"].append(line)
+                add("Working", line, now)
             elif quiet <= RECENT:
                 tag = "" if s.get("bead") or reported else " _(untracked)_"
-                sec["Open tabs"].append(line + tag)
+                add("Open tabs", line + tag, active)
             else:
-                sec["Loose ends"].append(f"Idle tab, close it? {line}")
+                add("Loose ends", f"Idle tab, close it? {line}", active)
         elif s.get("state") == "working":
-            (sec["Stalled"] if quiet > WORKING_QUIET else sec["Working"]).append(line)
+            add("Stalled" if quiet > WORKING_QUIET else "Working", line, now)
         elif said.startswith("QUESTION:"):
             if not reported:
-                sec["Needs you"].append(line)
+                add("Needs you", line, active)
         elif said.startswith("READY:"):
             if not reported:
-                sec["Ready / to read"].append(line)
+                add("Ready / to read", line, active)
         elif s.get("bead_in_progress"):
-            sec["Stalled"].append(f"{line} — ended without READY/QUESTION, bead still in progress")
+            add("Stalled", f"{line} — ended without READY/QUESTION, bead still in progress", active)
         elif s.get("state") == "blocked" and quiet <= RECENT and not reported:
-            sec["Stalled"].append(f"{line} — ended without READY/QUESTION")
+            add("Stalled", f"{line} — ended without READY/QUESTION", active)
         elif quiet > RECENT and s.get("state") in ("blocked", "done"):
-            sec["Loose ends"].append(f"Finished, remove? {line} `claude rm {s['id']}`")
+            add("Loose ends", f"Finished: {line}", active)
 
     for b in sorted(data["beads"], key=lambda b: b.get("updated_at") or "", reverse=True):
         if b["id"] not in bead_sessions:
             who = f" ({b['assignee']})" if b.get("assignee") else ""
-            when = ago(parse_time(b.get("updated_at")), now)
-            sec["Stalled"].append(f"Bead `{b['id']}`{who} in progress with no session — {clip(b['title'], 90)} · {when}")
+            updated = parse_time(b.get("updated_at"))
+            add("Stalled", f"Bead `{b['id']}`{who} in progress with no session — {clip(b['title'], 90)} · "
+                f"{ago(updated, now)} [release/close](claudego://act/bead/{b['id']})", updated)
 
     for p in sorted(data["plannotator"], key=lambda p: p.get("started") or 0, reverse=True):
         target = os.path.basename(p.get("target") or "") or p.get("mode")
         owner = p.get("session") or "no session"
-        sec["Plannotator"].append(f"[{clip(target, 60)}]({p['url']}) — {p.get('mode')}, {owner} · {ago(parse_time(p.get('started')), now)}")
+        started = parse_time(p.get("started"))
+        add("Plannotator", f"[{clip(target, 60)}]({p['url']}) — {p.get('mode')}, {owner} · {ago(started, now)}"
+            f" [close](claudego://act/plannotator/{p['pid']})", started)
 
     for slot in data["slots"]:
         if not slot["live"]:
-            sec["Loose ends"].append(f"Slot {slot['slot']} leased by `{slot['holder']}` with no process running")
+            add("Loose ends", f"Slot {slot['slot']} leased by `{slot['holder']}` with no process running"
+                f" [return](claudego://act/slot/{slot['slot']})", now)
     return sec
 
 
-SECTIONS = ["Needs you", "Ready / to read", "Stalled", "Working", "Open tabs", "Plannotator", "Loose ends"]
+SECTIONS = ["Needs you", "Ready / to read", "Stalled", "Working", "Open tabs", "Plannotator", "Loose ends", "Old"]
 
 
 def render(sec):
     counts = " · ".join(f"{name} {len(sec[name])}" for name in SECTIONS if sec[name])
     body = [counts or "Nothing in flight."]
-    for name in SECTIONS:
+    for name in SECTIONS[:-1]:
         if sec[name]:
             body += ["", f"## {name}", *[f"- {line}" for line in sec[name]]]
+    if sec["Old"]:
+        body += ["", f"> [!note]- Old ({len(sec['Old'])}): quiet more than {OLD.days} days", *[f"> - {line}" for line in sec["Old"]]]
     return "\n".join(body) + "\n"
 
 
@@ -245,7 +260,8 @@ def self_test():
              "last_active": t(5)},
             {"sessionId": "d", "pid": 4, "kind": "interactive", "name": "chat", "status": "idle", "last_active": t(2)},
         ],
-        "beads": [{"id": "precog-x1", "title": "t"}, {"id": "precog-y2", "title": "lost", "updated_at": t(48)}],
+        "beads": [{"id": "precog-x1", "title": "t", "updated_at": t(1)}, {"id": "precog-y2", "title": "lost", "updated_at": t(48)},
+                  {"id": "precog-z3", "title": "ancient", "updated_at": t(24 * 30)}],
         "slots": parse_slots("2     leased       ~/s/2  (held by agent:x)\n3     leased       ~/s/3  (held by agent:y)\n"
                              "                   claude (63805)\n"),
         "plannotator": [],
@@ -259,7 +275,9 @@ def self_test():
     assert any("precog-y2" in line for line in sec["Stalled"])
     assert not any("Bead `precog-x1`" in line for line in sec["Stalled"])
     assert sec["Open tabs"] and "untracked" in sec["Open tabs"][0]
-    assert sec["Loose ends"] == ["Slot 2 leased by `agent:x` with no process running"], sec["Loose ends"]
+    assert sec["Loose ends"] == ["Slot 2 leased by `agent:x` with no process running [return](claudego://act/slot/2)"]
+    assert not any("precog-y2" in line for line in sec["Old"])
+    assert any("precog-z3" in line for line in sec["Old"]), sec["Old"]
     print("ok")
 
 

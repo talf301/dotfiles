@@ -42,6 +42,9 @@ if [ "$(readlink "$_claude" 2>/dev/null)" != "$HOME/.agents/skills/implement-and
   fi
 else echo "ok    $_claude"; fi
 
+# --- session board: launchd writes ~/…/vault/board.md every minute (load: launchctl bootstrap gui/$UID <plist>) ---
+link "iar/local.session-board.plist" "$HOME/Library/LaunchAgents/local.session-board.plist"
+
 # --- macOS UI configs (these tools don't read nikud's XDG_CONFIG_HOME) ---
 link "sketchybar"     "$HOME/.config/sketchybar"
 link ".aerospace.toml" "$HOME/.aerospace.toml"

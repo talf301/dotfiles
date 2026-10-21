@@ -37,6 +37,8 @@ exec-on-workspace-change = ['/bin/bash', '-c',
 [mode.main.binding]
     # See: https://nikitabobko.github.io/AeroSpace/goodies#open-a-new-window-with-applescript
     alt-cmd-ctrl-enter = 'exec-and-forget open -n -a Wezterm'
+    # Second-screen cockpit: Obsidian + Claude Code in the vault on workspace 7
+    alt-cmd-ctrl-o = 'exec-and-forget ~/dotfiles/iar/cockpit.sh'
 
     # i3 wraps focus by default
     alt-cmd-ctrl-h =         'focus --boundaries-action wrap-around-the-workspace left'
@@ -115,3 +117,8 @@ exec-on-workspace-change = ['/bin/bash', '-c',
     7 = 'secondary'
     8 = 'secondary'
     9 = 'secondary'
+
+# Obsidian lives on the second-screen cockpit workspace (see iar/cockpit.sh)
+[[on-window-detected]]
+    if.app-id = 'md.obsidian'
+    run = 'move-node-to-workspace 7'

@@ -240,9 +240,9 @@ def write(body, now):
     except OSError:
         pass
     stamp = now.astimezone().strftime("%a %H:%M")
-    with open(BOARD + ".tmp", "w") as f:
+    # In place, not tmp+rename: macOS lets a launchd job modify a file in iCloud Drive but not rename over it.
+    with open(BOARD, "w") as f:
         f.write(f"# Board\n_changed {stamp} · written by ~/dotfiles/iar/board.py_\n{body}")
-    os.replace(BOARD + ".tmp", BOARD)
     return True
 
 

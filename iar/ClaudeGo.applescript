@@ -1,5 +1,10 @@
 -- URL handler for board.md links: claudego://<sessionId> opens a session (go.sh), claudego://act/<verb>/<arg> runs
--- a cleanup action (act.sh). Build: see install.sh.
+-- a cleanup action (act.sh). Run with no URL (launchd, every minute) it refreshes board.md: macOS lets this app,
+-- not a bare launchd job, write into iCloud Drive. Build: see install.sh.
+on run
+	do shell script "$HOME/dotfiles/iar/board.py"
+end run
+
 on open location u
 	set rest to text 12 thru -1 of u
 	if rest starts with "act/" then

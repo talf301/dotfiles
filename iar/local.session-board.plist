@@ -6,7 +6,7 @@
 	<string>local.session-board</string>
 	<key>ProgramArguments</key>
 	<array>
-		<string>/Users/tal/dotfiles/iar/board.py</string>
+		<string>/Users/tal/Applications/ClaudeGo.app/Contents/MacOS/applet</string>
 	</array>
 	<key>StartInterval</key>
 	<integer>60</integer>

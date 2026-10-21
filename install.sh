@@ -45,6 +45,17 @@ else echo "ok    $_claude"; fi
 # --- session board: launchd writes ~/…/vault/board.md every minute (load: launchctl bootstrap gui/$UID <plist>) ---
 link "iar/local.session-board.plist" "$HOME/Library/LaunchAgents/local.session-board.plist"
 
+# --- ClaudeGo.app: opens claudego://<sessionId> links from board.md via iar/go.sh ---
+if [ $DRY = 1 ]; then echo "BUILD ~/Applications/ClaudeGo.app"
+else
+  osacompile -o "$HOME/Applications/ClaudeGo.app" "$REPO/iar/ClaudeGo.applescript"
+  plutil -replace CFBundleIdentifier -string local.claudego "$HOME/Applications/ClaudeGo.app/Contents/Info.plist"
+  plutil -replace LSBackgroundOnly -bool true "$HOME/Applications/ClaudeGo.app/Contents/Info.plist"
+  plutil -replace CFBundleURLTypes -json '[{"CFBundleURLName":"claudego","CFBundleURLSchemes":["claudego"]}]' "$HOME/Applications/ClaudeGo.app/Contents/Info.plist"
+  /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$HOME/Applications/ClaudeGo.app"
+  echo "BUILD ~/Applications/ClaudeGo.app"
+fi
+
 # --- macOS UI configs (these tools don't read nikud's XDG_CONFIG_HOME) ---
 link "sketchybar"     "$HOME/.config/sketchybar"
 link ".aerospace.toml" "$HOME/.aerospace.toml"

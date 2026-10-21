@@ -6,7 +6,11 @@
 	<string>local.session-board</string>
 	<key>ProgramArguments</key>
 	<array>
-		<string>/Users/tal/Applications/ClaudeGo.app/Contents/MacOS/applet</string>
+		<string>/usr/bin/open</string>
+		<string>-g</string>
+		<string>-j</string>
+		<string>-a</string>
+		<string>/Users/tal/Applications/ClaudeGo.app</string>
 	</array>
 	<key>StartInterval</key>
 	<integer>60</integer>

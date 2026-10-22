@@ -143,7 +143,15 @@ def ago(when, now):
 
 def clip(text, n=110):
     text = " ".join((text or "").split())
-    return text if len(text) <= n else text[: n - 1] + "…"
+    if len(text) <= n:
+        return text
+    text = text[: n - 1] + "…"
+    # A cut inside `code` or **bold** would swallow the rest of the board line (its links too); close it.
+    if text.count("`") % 2:
+        text += "`"
+    if text.count("**") % 2:
+        text += "**"
+    return text
 
 
 def classify(data, now):
@@ -284,6 +292,7 @@ def self_test():
         "inbox": [{"id": "m1", "subject": "pick", "session": "z", "last_author": "agent", "last_at": t(1),
                    "open_questions": ["A or B?"]}],
     }
+    assert clip("merged at `134d3abc` now", 15) == "merged at `134…`"
     agent = lambda i: {"id": i, "author": {"kind": "agent"}}
     seqs = {"r": 1, "m2": 5}
     assert inbox_quiet({"id": "r", "person_seen_seq": 3}, [agent("r")], seqs, False)

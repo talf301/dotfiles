@@ -6,8 +6,8 @@
   budget.py run BEAD RUN_ID --status started --gpu-hours EST
       Reserve EST GPU-hours for a new run, then write its `run:` comment. A per-bead lock
       makes concurrent starts safe: a start that does not fit is refused (exit 3).
-  budget.py run BEAD RUN_ID --status done|failed|killed [--gpu-hours ACTUAL]
-      Record the end of a run (default GPU-hours: its reserved estimate).
+  budget.py run BEAD RUN_ID --status done|failed|killed
+      Record the end of a run. Its reserved estimate keeps counting.
   budget.py --self-test
       Uses a scratch tracker store, allowlist and lock dir.
 
@@ -35,7 +35,7 @@ import ledger  # noqa: E402  (the only module that calls the tracker)
 
 FIELDS = ("compute", "gpu_hours", "max_runs", "kill_if", "until")
 STATUSES = ("started", "done", "failed", "killed")
-RUN_RE = re.compile(r"^run: (\S+) compute: (\S+) gpu_hours: ([0-9.]+) status: (\w+)\s*$")
+RUN_RE = re.compile(r"^run: (\S+) compute: (\S+) gpu_hours: (\S+) status: (\w+)\s*$")
 EXIT_INVALID, EXIT_USED_UP = 1, 3
 
 
@@ -110,7 +110,8 @@ def runs(comments):
     for c in comments:
         m = RUN_RE.match(c.get("text", "").strip())
         if m:
-            out[m.group(1)] = (float(m.group(3)), m.group(4))
+            out[m.group(1)] = (_positive(f"run {m.group(1)} gpu_hours", m.group(3), float),
+                               m.group(4))
     return out
 
 
@@ -150,6 +151,8 @@ def record(bead, run_id, status, gpu_hours=None):
         raise BudgetError(f"bad bead id {bead!r}")
     if not re.fullmatch(r"[A-Za-z0-9._:/@-]+", run_id):
         raise BudgetError(f"bad run id {run_id!r}")
+    if (gpu_hours is None) != (status != "started"):
+        raise BudgetError("give --gpu-hours (the estimate to reserve) only with --status started")
     if gpu_hours is not None:
         gpu_hours = _positive("gpu_hours", gpu_hours, float)
     lock_dir = os.environ.get("IAR_STATE_DIR") or os.path.expanduser("~/.local/state/iar")
@@ -160,8 +163,6 @@ def record(bead, run_id, status, gpu_hours=None):
         if status == "started":
             if run_id in r:
                 raise BudgetError(f"run {run_id} already exists")
-            if gpu_hours is None:
-                raise BudgetError("a start needs --gpu-hours (the estimate to reserve)")
             if datetime.datetime.now(datetime.timezone.utc) >= b["until"]:
                 raise BudgetError("budget expired", EXIT_USED_UP)
             if len(r) + 1 > b["max_runs"]:
@@ -172,9 +173,8 @@ def record(bead, run_id, status, gpu_hours=None):
         else:
             if r.get(run_id, (0, ""))[1] != "started":
                 raise BudgetError(f"run {run_id} is not running")
-            if gpu_hours is None:
-                gpu_hours = r[run_id][0]
-        text = f"run: {run_id} compute: {b['compute']} gpu_hours: {_num(gpu_hours)} status: {status}"
+            gpu_hours = r[run_id][0]  # the estimate counts, not the actual hours
+        text = f"run: {run_id} compute: {b['compute']} gpu_hours: {gpu_hours!r} status: {status}"
         ledger.comment(bead, text)
     print(text)
     return 0
@@ -225,12 +225,14 @@ def self_test():
                 c, msg = code(check, bead(**dict(ok, gpu_hours=bad)))
                 assert c == EXIT_INVALID and "positive" in msg, (bad, msg)
             assert code(record, b, "rx", "started", "inf")[0] == EXIT_INVALID
+            assert code(record, b, "rx", "started")[0] == EXIT_INVALID  # no estimate
             c, msg = code(check, bead(**dict(ok, until="2099-01-01T00:00")))
             assert c == EXIT_INVALID and "zone" in msg, msg
 
             # used-up block: hours, runs, and time
             assert record(b, "r1", "started", 6) == 0
             assert code(record, b, "r2", "started", 5)[0] == EXIT_USED_UP  # 6+5 > 10
+            assert code(record, b, "r1", "failed", 1)[0] == EXIT_INVALID  # estimate is fixed
             assert record(b, "r1", "failed") == 0  # failed runs keep counting
             assert runs(ledger.show(b)["comments"]) == {"r1": (6.0, "failed")}
             assert record(b, "r2", "started", 4) == 0
@@ -241,6 +243,12 @@ def self_test():
             c, msg = code(record, b2, "r2", "started", 1)
             assert c == EXIT_USED_UP and "max_runs" in msg, msg
             assert code(check, bead(**dict(ok, until="2020-01-01T00:00Z")))[0] == EXIT_USED_UP
+
+            # tiny estimates round-trip (repr may use 1e-05) and keep counting
+            b4 = bead(**dict(ok, gpu_hours=0.00002))
+            assert record(b4, "t1", "started", 0.00001) == 0
+            assert code(record, b4, "t2", "started", 0.000011)[0] == EXIT_USED_UP
+            assert runs(ledger.show(b4)["comments"]) == {"t1": (0.00001, "started")}
 
             # concurrent reservations: 5 starts of 3 h on a 10 h budget -> exactly 3 fit
             b3 = bead(**dict(ok, max_runs=6))

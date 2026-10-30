@@ -22,6 +22,7 @@ IAR_STATE_DIR (lock dir, default ~/.local/state/iar).
 import argparse
 import datetime
 import fcntl
+import math
 import os
 import re
 import subprocess
@@ -58,7 +59,7 @@ def _positive(name, value, kind):
         v = kind(value)
     except ValueError:
         v = 0
-    if not v > 0:
+    if not (v > 0 and math.isfinite(v)):
         raise BudgetError(f"{name}: must be a positive {kind.__name__}, got {value!r}")
     return v
 
@@ -220,6 +221,10 @@ def self_test():
             assert c == EXIT_INVALID and "no ```budget:```" in msg, msg
             c, msg = code(check, bead(**{k: v for k, v in ok.items() if k != "kill_if"}))
             assert c == EXIT_INVALID and "kill_if" in msg, msg
+            for bad in ("inf", "nan", "0", "-1"):
+                c, msg = code(check, bead(**dict(ok, gpu_hours=bad)))
+                assert c == EXIT_INVALID and "positive" in msg, (bad, msg)
+            assert code(record, b, "rx", "started", "inf")[0] == EXIT_INVALID
             c, msg = code(check, bead(**dict(ok, until="2099-01-01T00:00")))
             assert c == EXIT_INVALID and "zone" in msg, msg
 

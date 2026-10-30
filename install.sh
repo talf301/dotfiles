@@ -75,6 +75,9 @@ fi
 link "sketchybar"     "$HOME/.config/sketchybar"
 link ".aerospace.toml" "$HOME/.aerospace.toml"
 
+# --- dcg: user config (dcg reads ~/.config/dcg even with nikud's XDG_CONFIG_HOME) ---
+link "dcg/config.toml" "$HOME/.config/dcg/config.toml"
+
 # --- nvim: nikud owns the XDG link (~/nikud/xdg_config_home/nvim → ~/dotfiles/nvim).
 #     Ensure it exists if nikud is checked out but the link is missing. ---
 if [ -d "$HOME/nikud/xdg_config_home" ]; then

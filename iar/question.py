@@ -144,7 +144,8 @@ def inbox_post(qid, f, project, thread):
             continue
         r = m.get("result") or {}
         thread_id = (r.get("structuredContent") or {}).get("thread_id")
-        if m.get("error") or r.get("isError") or not thread_id:
+        # A non-zero exit is a failure too; the rerun is safe (idempotency_key = question id).
+        if m.get("error") or r.get("isError") or not thread_id or p.returncode != 0:
             raise RuntimeError(f"Inbox refused send_message: {json.dumps(m)[:400]}")
         return thread_id
     raise RuntimeError(f"Inbox gave no answer (exit {p.returncode}): {p.stderr.strip()[:400]}")
@@ -167,7 +168,7 @@ def ask(a):
         raise ValueError(f"--default must be one of the options {a.option}")
     if not 2 <= len(a.option) <= 3 or len(set(a.option)) != len(a.option):
         raise ValueError("give 2 or 3 different options")
-    if "\n" in a.question or not a.question.strip() or any("\n" in o for o in a.option):
+    if any("\n" in x or not x.strip() for x in [a.question, *a.option]):
         raise ValueError("the question and each option are one non-empty line")
     deadline = ""
     if a.gated == "no":
@@ -441,6 +442,8 @@ def self_test():
             assert rc == 3 and "inbox:pending" in ledger.show(q6)["labels"], (rc, q6)
             rc, again = run(main_ask, [a2, "Inbox down?", "--blocks", "yes", *base])
             assert rc == 3 and again == q6, (rc, again)
+            os.environ["IAR_INBOX_CMD"] = f"sh -c '{fake}; exit 1'"  # answers, then fails
+            assert run(main_ask, [a2, "Inbox down?", "--blocks", "yes", *base]) == (3, q6)
             os.environ["IAR_INBOX_CMD"] = fake
             assert run(main_ask, [a2, "Inbox down?", "--blocks", "yes", *base]) == (0, q6)
             s = ledger.show(q6)
@@ -450,6 +453,8 @@ def self_test():
             assert len(kids) == 1, kids
             assert run(main_ask, [a2, "Bad", "--blocks", "no", "-o", "A", "-o", "B",
                                   "--default", "C", "--reversible", "yes", "--gated", "no"])[0] == 2
+            assert run(main_ask, [a2, "Blank", "--blocks", "no", "-o", "A", "-o", " ",
+                                  "--default", "A", "--reversible", "yes", "--gated", "no"])[0] == 2
         finally:
             for k, v in saved.items():
                 os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)

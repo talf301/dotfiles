@@ -19,7 +19,7 @@ CLI (output is JSON on stdout):
   ledger blocked [-l LABEL] [-t TYPE]                           -> list of issues
   ledger show ID                                                -> issue with labels, deps, comments
   ledger update ID [-s STATUS] [--assignee A] [--claim] [--title T] [-p N] [--notes T]
-                [--add-label L]... [--remove-label L]...      -> issue
+                [--add-label L]... [--remove-label L]... [-d TEXT]  -> issue
   ledger close ID [--reason R]                                  -> issue
   ledger --self-test                                            (uses a scratch store)
 """
@@ -110,9 +110,10 @@ def show(issue):
 
 
 def update(issue, status=None, assignee=None, claim=False, title=None,
-           priority=None, notes=None, add_labels=(), remove_labels=()):
+           priority=None, notes=None, add_labels=(), remove_labels=(), description=None):
     args = ["update", issue, *_opt("--status", status), *_opt("--assignee", assignee),
-            *_opt("--title", title), *_opt("--priority", priority), *_opt("--notes", notes)]
+            *_opt("--title", title), *_opt("--priority", priority), *_opt("--notes", notes),
+            *_opt("--description", description)]
     args += ["--claim"] if claim else []
     for name in add_labels:
         args.append(f"--add-label={name}")
@@ -156,8 +157,9 @@ def self_test():
             assert blocked() == [] and {i["id"] for i in ready()} == {a["id"], q["id"]}
 
             u = update(a["id"], status="in_progress", assignee="agent:t#1",
-                       add_labels=["y"], remove_labels=["auto"])
+                       add_labels=["y"], remove_labels=["auto"], description="-new\nbody")
             s = show(a["id"])
+            assert s["description"] == "-new\nbody", s
             assert u["id"] == a["id"] and s["status"] == "in_progress", u
             assert s["assignee"] == "agent:t#1" and sorted(s["labels"]) == ["decision:auto", "y"]
 
@@ -234,6 +236,7 @@ def main(argv=None):
     s.add_argument("--notes")
     s.add_argument("--add-label", action="append", default=[])
     s.add_argument("--remove-label", action="append", default=[])
+    s.add_argument("-d", "--description")
 
     s = sub.add_parser("close")
     s.add_argument("id")
@@ -272,7 +275,7 @@ def main(argv=None):
             out = show(a.id)
         elif a.cmd == "update":
             out = update(a.id, a.status, a.assignee, a.claim, a.title, a.priority,
-                         a.notes, a.add_label, a.remove_label)
+                         a.notes, a.add_label, a.remove_label, a.description)
         else:
             out = close(a.id, a.reason)
     except (LedgerError, OSError) as e:

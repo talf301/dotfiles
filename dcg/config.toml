@@ -1,0 +1,12 @@
+# dcg user config. Live path: ~/.config/dcg/config.toml (symlink, see install.sh).
+# Test: dcg/test.sh
+#
+# Agents write state files with heredocs and `>` redirects. dcg blocks truncating
+# redirects into $HOME. Exempt only the agent-owned dirs below; all other home and
+# system paths stay blocked. /tmp/claude-*/ (the scratchpad) is already allowed by dcg.
+# dcg 0.13.9 does not exempt quoted targets, so paths with spaces cannot be exempted.
+[rules."core.filesystem:redirect-truncate-root-home"]
+exempt_target_globs = [
+  "~/.treehouse/**",
+  "~/.local/state/iar/**",
+]

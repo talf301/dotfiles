@@ -67,11 +67,13 @@ def _positive(name, value, kind):
 def parse(description):
     """Return the budget dict from a bead description, or raise BudgetError."""
     blocks = [b for b in re.findall(r"^```[^\n]*\n(.*?)^```", description or "", re.M | re.S)
-              if b.strip().startswith("budget:")]
+              if b.strip().startswith("budget")]
     if not blocks:
         raise BudgetError("no ```budget:``` block in the bead description")
     if len(blocks) > 1:
         raise BudgetError("more than one budget block")
+    if blocks[0].strip().splitlines()[0].strip() != "budget:":
+        raise BudgetError("the block's first line must be exactly `budget:`")
     out = {}
     for line in blocks[0].strip().splitlines()[1:]:
         if not line.strip():
@@ -215,6 +217,10 @@ def self_test():
             # unknown field, compute not allowlisted, missing block / field, bad until
             c, msg = code(check, bead(**ok, region="us-east-1"))
             assert c == EXIT_INVALID and "unknown field 'region'" in msg, msg
+            for head in ("budget: extra", "budget:other", "budgets:"):
+                d = ledger.show(b)["description"].replace("budget:\n", head + "\n", 1)
+                c, msg = code(check, ledger.create("t", description=d)["id"])
+                assert c == EXIT_INVALID and "exactly `budget:`" in msg, (head, msg)
             c, msg = code(check, bead(**dict(ok, compute="new-cluster")))
             assert c == EXIT_INVALID and "not in the compute allowlist" in msg, msg
             c, msg = code(check, ledger.create("t", description="no block")["id"])

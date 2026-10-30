@@ -6,10 +6,10 @@
 
 Steps, in order. If a step fails, bg undoes the earlier steps in reverse order and
 writes the bead comment `attempt-failed: <step> attempt=<n> <error>`:
-  lease    treehouse get --lease, holder agent:<bead>#<n>     undo: return --if-lease-id, check status
+  lease    treehouse get --lease, holder agent:<bead>#<n>     undo: return each slot that holder has
   claim    status in_progress, assignee agent:<bead>#<n>      undo: status open, assignee cleared
   brief    render iar/brief.md to $LOG_DIR/dispatch-<bead>-<n>.md   undo: delete it
-  start    claude --bg --settings iar/dispatch-settings.json  undo: claude stop
+  start    claude --bg --settings iar/dispatch-settings.json  undo: stop sessions in the slot
   comment  attempt: <n> session: <sid> slot: <path> branch: <ref> brief: <path>
 The comment is last because `claude --bg` ignores --session-id: the session id exists only
 after start (spec order lease, claim, comment, brief, start; see decision comment on precog-lxt4).
@@ -62,9 +62,10 @@ def next_attempt(issue):
     return max(nums, default=0) + 1
 
 
-def lease_gone(lease_id):
-    """True if no slot holds lease_id. Reads `status --json` by key: same on treehouse v2 and v3."""
-    return all(s.get("lease_id") != lease_id for s in json.loads(sh(["treehouse", "status", "--json"], cwd=REPO)))
+def held_by(holder):
+    """Slots leased to holder. Reads `status --json` by key: same on treehouse v2 and v3."""
+    return [s for s in json.loads(sh(["treehouse", "status", "--json"], cwd=REPO))
+            if s.get("lease_holder") == holder]
 
 
 def base_and_branch(issue, slot):
@@ -104,16 +105,15 @@ def dispatch(bead, done_when, name=None):
     undo, a = [], {"attempt": n}  # undo: (label, fn) pairs, run in reverse
     step = "lease"
     try:
+        def unlease():  # finds the lease by holder, so it works when get's output is lost
+            for s in held_by(holder):
+                sh(["treehouse", "return", s["path"], "--force", "--if-lease-id", s["lease_id"]], cwd=REPO)
+            if held_by(holder):
+                raise StepError(f"lease {holder} still held after return")
+        undo.append(("lease", unlease))
         out = sh(["treehouse", "get", "--lease", "--json", "--lease-holder", holder], cwd=REPO,
                  timeout=LEASE_TIMEOUT_S)
-        lease = json.loads(out[out.index("{"):])
-        a["slot"], lease_id = lease["path"], lease["lease_id"]
-
-        def unlease():
-            sh(["treehouse", "return", a["slot"], "--force", "--if-lease-id", lease_id], cwd=REPO)
-            if not lease_gone(lease_id):
-                raise StepError(f"lease {lease_id} still held after return")
-        undo.append(("lease", unlease))
+        a["slot"] = json.loads(out[out.index("{"):])["path"]
         if fault == step:
             raise StepError("injected fault")
 
@@ -137,13 +137,19 @@ def dispatch(bead, done_when, name=None):
             raise StepError("injected fault")
 
         step = "start"
+
+        def unstart():  # stops every session in our fresh slot, so it works when the id is lost
+            # ponytail: no wait for a session that is not yet in `claude agents`; add a poll if seen
+            for s in json.loads(sh(["claude", "agents", "--json"])):
+                if os.path.realpath(s.get("cwd") or "/") == os.path.realpath(a["slot"]):
+                    sh(["claude", "stop", s["id"]])
+        undo.append(("start", unstart))
         out = sh(["claude", "--bg", "--settings", str(SETTINGS), "--name", name,
                   f"Read and follow {brief}"], cwd=a["slot"])
         m = re.search(r"backgrounded\W+(\w+)", out)
         if not m:
             raise StepError(f"claude --bg printed no session id: {out.strip()[:200]}")
         short = m.group(1)
-        undo.append(("start", lambda: sh(["claude", "stop", short])))
         a["session"] = ""
         for _ in range(AGENTS_WAIT_S):
             hit = [s for s in json.loads(sh(["claude", "agents", "--json"])) if s.get("id") == short]
@@ -193,6 +199,8 @@ if a[0] == "get":
     lid = uuid.uuid4().hex
     leases[slot] = {"lease_id": lid, "holder": a[a.index("--lease-holder") + 1]}
     save()
+    if os.environ.get("FAKE_GET_GARBAGE"):
+        sys.exit("lease made, then a crash")
     print(json.dumps({"path": slot, "lease_id": lid, "lease_holder": leases[slot]["holder"]}))
 elif a[0] == "return":
     if os.environ.get("FAKE_RETURN_EXIT"):
@@ -220,6 +228,10 @@ if "--bg" in a:
     sid = str(uuid.uuid4())
     ss.append({"id": sid[:8], "sessionId": sid, "kind": "background", "state": "working",
                "name": a[a.index("--name") + 1], "cwd": os.getcwd(), "argv": a})
+    if os.environ.get("FAKE_BG_GARBAGE"):
+        print("unexpected output")
+        json.dump(ss, open(st, "w"))
+        sys.exit(0)
     print("warning: --bg manages the session id; ignoring --session-id")
     print("backgrounded · %s · %s" % (sid[:8], ss[-1]["name"]))
 elif a[:1] == ["agents"]:
@@ -247,7 +259,8 @@ def self_test():
             "commit", "-q", "--allow-empty", "-m", "init"])
         main_sha = sh(["git", "-C", str(origin), "rev-parse", "HEAD"]).strip()
         old = {k: os.environ.get(k) for k in ("BEADS_DIR", "PATH", "FAKE", "FAKE_ORIGIN",
-                                              "BG_FAULT_AFTER", "FAKE_RETURN_EXIT", "FAKE_TH_V3")}
+                                              "BG_FAULT_AFTER", "FAKE_RETURN_EXIT", "FAKE_TH_V3",
+                                              "FAKE_GET_GARBAGE", "FAKE_BG_GARBAGE")}
         os.environ.update(BEADS_DIR=str(r / ".beads"), PATH=f"{binp}:{os.environ['PATH']}",
                           FAKE=str(fake), FAKE_ORIGIN=str(origin))
         REPO, LOG_DIR = str(r), r / "state"
@@ -285,6 +298,18 @@ def self_test():
             # The next attempt on the same bead is attempt 2.
             assert quiet(b, "true") == 1 and leases() == {}
             assert ledger.show(b)["comments"][-1]["text"].startswith("attempt-failed: comment attempt=2")
+
+            # A step that fails half-way (lease made or session started, output lost) is undone too.
+            os.environ["BG_FAULT_AFTER"] = ""
+            for step, var in (("lease", "FAKE_GET_GARBAGE"), ("start", "FAKE_BG_GARBAGE")):
+                os.environ[var] = "1"
+                b = ledger.create(f"half {step}", type="task")["id"]
+                assert quiet(b, "true") == 1, step
+                os.environ[var] = ""
+                s = ledger.show(b)
+                assert s["status"] == "open" and not s.get("assignee"), (step, s)
+                assert leases() == {} and sessions() == [], (step, leases(), sessions())
+                assert s["comments"][-1]["text"].startswith(f"attempt-failed: {step} attempt=1"), s
 
             # A lease that treehouse does not return (v3 exit 3) is reported, not hidden.
             os.environ["BG_FAULT_AFTER"], os.environ["FAKE_RETURN_EXIT"] = "claim", "3"

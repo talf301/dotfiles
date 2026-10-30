@@ -118,31 +118,53 @@ def dispatch(bead, done_when, name=None):
             raise StepError("injected fault")
 
         step = "claim"
+        def unclaim():  # registered first: the update can land even when its answer is lost
+            if ledger.show(bead).get("assignee") == holder:
+                ledger.update(bead, status="open", assignee="")
+            if ledger.show(bead).get("assignee") == holder:
+                raise StepError(f"{bead} still claimed by {holder}")
+        undo.append(("claim", unclaim))
         ledger.update(bead, status="in_progress", assignee=holder)
-        undo.append(("claim", lambda: ledger.update(bead, status="open", assignee="")))
         if fault == step:
             raise StepError("injected fault")
 
         step = "brief"
         base, a["branch"], action = base_and_branch(issue, a["slot"])
         LOG_DIR.mkdir(parents=True, exist_ok=True)
-        brief = LOG_DIR / f"dispatch-{bead}-{n}.md"
+        brief, base_file = LOG_DIR / f"dispatch-{bead}-{n}.md", LOG_DIR / f"base-{bead}"
         a["brief"] = str(brief)
+        old_base = base_file.read_text() if base_file.exists() else None
+
+        def unbrief():
+            brief.unlink(missing_ok=True)
+            if old_base is None:
+                base_file.unlink(missing_ok=True)
+            else:
+                base_file.write_text(old_base)
+        undo.append(("brief", unbrief))
         brief.write_text(render({"bead": bead, "title": issue["title"], "name": name, "attempt": n,
                                  "slot": a["slot"], "base_sha": base, "branch": a["branch"],
                                  "branch_action": action, "done_when": done_when}))
-        undo.append(("brief", lambda: brief.unlink(missing_ok=True)))
-        (LOG_DIR / f"base-{bead}").write_text(base + "\n")
+        base_file.write_text(base + "\n")
         if fault == step:
             raise StepError("injected fault")
 
         step = "start"
 
-        def unstart():  # stops every session in our fresh slot, so it works when the id is lost
-            # ponytail: no wait for a session that is not yet in `claude agents`; add a poll if seen
-            for s in json.loads(sh(["claude", "agents", "--json"])):
-                if os.path.realpath(s.get("cwd") or "/") == os.path.realpath(a["slot"]):
-                    sh(["claude", "stop", s["id"]])
+        def in_slot():  # sessions in our fresh slot that are not stopped
+            return [s for s in json.loads(sh(["claude", "agents", "--json"]))
+                    if os.path.realpath(s.get("cwd") or "/") == os.path.realpath(a["slot"])
+                    and s.get("state") != "stopped"]
+
+        def unstart():  # by slot, not id, so it works when the id is lost
+            for _ in range(AGENTS_WAIT_S):  # a new session can take a moment to be listed
+                if in_slot():
+                    break
+                time.sleep(1)
+            for s in in_slot():
+                sh(["claude", "stop", s["id"]])
+            if in_slot():
+                raise StepError("session still running in slot after claude stop")
         undo.append(("start", unstart))
         out = sh(["claude", "--bg", "--settings", str(SETTINGS), "--name", name,
                   f"Read and follow {brief}"], cwd=a["slot"])
@@ -220,13 +242,14 @@ elif a[0] == "status":
 '''
 
 FAKE_CLAUDE = r'''#!/usr/bin/env python3
-import json, os, sys, uuid
+import json, os, sys, time, uuid
 st = os.path.join(os.environ["FAKE"], "sessions.json")
 ss = json.load(open(st)) if os.path.exists(st) else []
 a = sys.argv[1:]
 if "--bg" in a:
     sid = str(uuid.uuid4())
     ss.append({"id": sid[:8], "sessionId": sid, "kind": "background", "state": "working",
+               "listed_at": time.time() + float(os.environ.get("FAKE_LIST_DELAY") or 0),
                "name": a[a.index("--name") + 1], "cwd": os.getcwd(), "argv": a})
     if os.environ.get("FAKE_BG_GARBAGE"):
         print("unexpected output")
@@ -235,7 +258,7 @@ if "--bg" in a:
     print("warning: --bg manages the session id; ignoring --session-id")
     print("backgrounded · %s · %s" % (sid[:8], ss[-1]["name"]))
 elif a[:1] == ["agents"]:
-    print(json.dumps([s for s in ss if s["state"] != "stopped"]))
+    print(json.dumps([s for s in ss if s["listed_at"] <= time.time()]))  # real `claude agents --json` lists stopped sessions as state "stopped"
 elif a[:1] == ["stop"]:
     for s in ss:
         if s["id"] == a[1]:
@@ -260,7 +283,7 @@ def self_test():
         main_sha = sh(["git", "-C", str(origin), "rev-parse", "HEAD"]).strip()
         old = {k: os.environ.get(k) for k in ("BEADS_DIR", "PATH", "FAKE", "FAKE_ORIGIN",
                                               "BG_FAULT_AFTER", "FAKE_RETURN_EXIT", "FAKE_TH_V3",
-                                              "FAKE_GET_GARBAGE", "FAKE_BG_GARBAGE")}
+                                              "FAKE_GET_GARBAGE", "FAKE_BG_GARBAGE", "FAKE_LIST_DELAY")}
         os.environ.update(BEADS_DIR=str(r / ".beads"), PATH=f"{binp}:{os.environ['PATH']}",
                           FAKE=str(fake), FAKE_ORIGIN=str(origin))
         REPO, LOG_DIR = str(r), r / "state"
@@ -272,7 +295,7 @@ def self_test():
                 return json.loads(p.read_text()) if p.exists() else {}
 
             def sessions():
-                return json.loads(sh(["claude", "agents", "--json"]))
+                return [s for s in json.loads(sh(["claude", "agents", "--json"])) if s["state"] != "stopped"]
 
             def quiet(*args):  # dispatch() with its stdout and stderr lines hidden
                 saved = sys.stdout, sys.stderr
@@ -288,6 +311,9 @@ def self_test():
                 os.environ["FAKE_TH_V3"] = "1" if i % 2 else ""
                 b = ledger.create(f"fault {step}", type="task")["id"]
                 os.environ["BG_FAULT_AFTER"] = step
+                if step == "start":  # an earlier base file is restored, not deleted
+                    LOG_DIR.mkdir(exist_ok=True)
+                    (LOG_DIR / f"base-{b}").write_text("old\n")
                 assert quiet(b, "true") == 1, step
                 s = ledger.show(b)
                 assert s["status"] == "open" and not s.get("assignee"), (step, s)
@@ -295,21 +321,44 @@ def self_test():
                 texts = [c["text"] for c in s["comments"]]
                 assert texts[-1].startswith(f"attempt-failed: {step} attempt=1 injected fault"), texts
                 assert not (LOG_DIR / f"dispatch-{b}-1.md").exists(), step
+                base_file = LOG_DIR / f"base-{b}"
+                assert (base_file.read_text() == "old\n") if step == "start" else not base_file.exists()
             # The next attempt on the same bead is attempt 2.
             assert quiet(b, "true") == 1 and leases() == {}
             assert ledger.show(b)["comments"][-1]["text"].startswith("attempt-failed: comment attempt=2")
 
             # A step that fails half-way (lease made or session started, output lost) is undone too.
             os.environ["BG_FAULT_AFTER"] = ""
+            # The started session is listed only after 2 s; undo waits for it before the lease goes.
+            os.environ["FAKE_LIST_DELAY"] = "2"
             for step, var in (("lease", "FAKE_GET_GARBAGE"), ("start", "FAKE_BG_GARBAGE")):
                 os.environ[var] = "1"
                 b = ledger.create(f"half {step}", type="task")["id"]
                 assert quiet(b, "true") == 1, step
                 os.environ[var] = ""
+                time.sleep(2)  # a session the undo missed would be listed by now
                 s = ledger.show(b)
                 assert s["status"] == "open" and not s.get("assignee"), (step, s)
                 assert leases() == {} and sessions() == [], (step, leases(), sessions())
                 assert s["comments"][-1]["text"].startswith(f"attempt-failed: {step} attempt=1"), s
+
+            os.environ["FAKE_LIST_DELAY"] = ""
+            # A claim that lands but whose answer is lost is undone.
+            real_update = ledger.update
+
+            def lossy_update(*args, **kw):
+                real_update(*args, **kw)
+                ledger.update = real_update
+                raise ledger.LedgerError("br update: no answer in 30s")
+            ledger.update = lossy_update
+            b = ledger.create("claim lost", type="task")["id"]
+            try:
+                assert quiet(b, "true") == 1
+            finally:
+                ledger.update = real_update
+            s = ledger.show(b)
+            assert s["status"] == "open" and not s.get("assignee") and leases() == {}, s
+            assert s["comments"][-1]["text"].startswith("attempt-failed: claim attempt=1"), s
 
             # A lease that treehouse does not return (v3 exit 3) is reported, not hidden.
             os.environ["BG_FAULT_AFTER"], os.environ["FAKE_RETURN_EXIT"] = "claim", "3"

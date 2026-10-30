@@ -7,7 +7,7 @@ description: Check a ready Bead against the background readiness gate, then star
 
 You are the dispatcher. You check the gate, claim, lease, write the brief and start the session. The background session does the work. Tal watches all sessions in `claude agents` (agent view), where each background session is named after its bead.
 
-Constants: `BEADS_DIR=/Users/tal/.local/share/beads/precog/.beads` on every `br` call, `REPO=/Users/tal/Documents/precog`, `LOG_DIR=/tmp/swarm-logs`, actor `tal-bg`. Shared texts: `~/dotfiles/iar/scope-self-review.md`, `~/dotfiles/iar/escalation-rules.md`, `~/dotfiles/iar/inbox-etiquette.md`.
+Constants: `BEADS_DIR=/Users/tal/.local/share/beads/precog/.beads` on every `br` call, `REPO=/Users/tal/Documents/precog`, `LOG_DIR=/tmp/swarm-logs`, actor `tal-bg`. Shared texts: `~/dotfiles/iar/scope-self-review.md`, `~/dotfiles/iar/autonomy.md`, `~/dotfiles/iar/escalation-rules.md`, `~/dotfiles/iar/inbox-etiquette.md`.
 
 ## 1. Pick
 
@@ -71,6 +71,8 @@ When Tal replies (from the Inbox, the reply arrives in this session by itself):
 - **A live code review in Plannotator:** follow step 5b of `/next-bead`.
 
 <full text of ~/dotfiles/iar/scope-self-review.md>
+
+<full text of ~/dotfiles/iar/autonomy.md>
 
 <full text of ~/dotfiles/iar/escalation-rules.md>
 

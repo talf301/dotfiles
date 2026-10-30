@@ -7,13 +7,22 @@
 #   --capture  rewrite both fixtures from the live precog pool (run after a treehouse upgrade)
 set -euo pipefail
 
+live=; capture=
+for a in "$@"; do
+  case "$a" in
+    --live) live=1 ;;
+    --capture) capture=1 ;;
+    *) echo "usage: $0 [--live] [--capture]" >&2; exit 2 ;;
+  esac
+done
+
 REPO="${PRECOG_REPO:-$HOME/Documents/precog}"
 FIX="$(cd "$(dirname "$0")" && pwd)/fixtures"
 txt="$FIX/treehouse-status.txt"; json="$FIX/treehouse-status.json"
 
 echo "treehouse $(treehouse --version 2>/dev/null)"
 
-if [ "${1:-}" = --capture ]; then
+if [ -n "$capture" ]; then
   (cd "$REPO" && treehouse status 2>/dev/null) > "$txt"
   (cd "$REPO" && treehouse status --json 2>/dev/null) | jq . > "$json"
   echo "captured $txt and $json"
@@ -29,7 +38,7 @@ grep -qE '^[0-9]+ +leased +~?/.*\(held by [^)]+\)' "$txt"
 grep -qE '^[0-9]+ +available +~?/' "$txt"
 echo "fixtures ok"
 
-if [ "${1:-}" = --live ]; then
+if [ -n "$live" ]; then
   cd "$REPO"
   lease=$(treehouse get --lease --json --no-fetch --lease-holder "agent:treehouse-check" 2>/dev/null)
   path=$(jq -r .path <<< "$lease"); lid=$(jq -r .lease_id <<< "$lease")

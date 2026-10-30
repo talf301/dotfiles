@@ -1,0 +1,13 @@
+1     leased       ~/.treehouse/precog-28077b/1/precog  (held by agent:dispatch-bead:precog-ug28.1)
+                   2.1.314 (30373)
+2     available    ~/.treehouse/precog-28077b/2/precog
+3     available    ~/.treehouse/precog-28077b/3/precog
+4     leased       ~/.treehouse/precog-28077b/4/precog  (held by agent:gnhf-refactor-run)
+5     available    ~/.treehouse/precog-28077b/5/precog
+6     leased       ~/.treehouse/precog-28077b/6/precog  (held by agent:hydra-pyplan-stack)
+7     available    ~/.treehouse/precog-28077b/7/precog
+8     leased       ~/.treehouse/precog-28077b/8/precog  (held by agent:gnhf-benchmark-run)
+9     available    ~/.treehouse/precog-28077b/9/precog
+10    available    ~/.treehouse/precog-28077b/10/precog
+11    available    ~/.treehouse/precog-28077b/11/precog
+12    leased       ~/.treehouse/precog-28077b/12/precog  (held by agent:dispatch-bead:precog-gywc)

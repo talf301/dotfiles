@@ -141,7 +141,7 @@ def check(bead, now=None):
           f"kill_if: {b['kill_if']}")
     if now >= b["until"]:
         raise BudgetError("budget expired", EXIT_USED_UP)
-    if hours_left <= 0 or runs_left <= 0:
+    if hours_left <= 1e-9 or runs_left <= 0:
         raise BudgetError("budget used up", EXIT_USED_UP)
     return 0
 
@@ -169,7 +169,7 @@ def record(bead, run_id, status, gpu_hours=None):
                 raise BudgetError("budget expired", EXIT_USED_UP)
             if len(r) + 1 > b["max_runs"]:
                 raise BudgetError(f"max_runs {b['max_runs']} reached", EXIT_USED_UP)
-            if used + gpu_hours > b["gpu_hours"]:
+            if used + gpu_hours > b["gpu_hours"] + 1e-9:  # float sums, e.g. 0.1 + 0.2
                 raise BudgetError(f"{_num(gpu_hours)} GPU-hours do not fit: "
                                   f"{_num(b['gpu_hours'] - used)} left", EXIT_USED_UP)
         else:
@@ -249,6 +249,9 @@ def self_test():
             c, msg = code(record, b2, "r2", "started", 1)
             assert c == EXIT_USED_UP and "max_runs" in msg, msg
             assert code(check, bead(**dict(ok, until="2020-01-01T00:00Z")))[0] == EXIT_USED_UP
+
+            b5 = bead(**dict(ok, gpu_hours=0.3))  # 0.1 + 0.2 fits 0.3
+            assert record(b5, "f1", "started", 0.1) == 0 and record(b5, "f2", "started", 0.2) == 0
 
             # tiny estimates round-trip (repr may use 1e-05) and keep counting
             b4 = bead(**dict(ok, gpu_hours=0.00002))

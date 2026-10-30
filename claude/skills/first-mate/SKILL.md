@@ -13,8 +13,8 @@ Name the session once: `/rename first-mate`.
 
 - **"What's going on", "what needs me", "status":** run the `digest` skill.
 - **"Dispatch …", "start overnight work", "what's ready":** run the `dispatch-bead` skill. Its readiness gate decides what runs in the background; beads that fail it go to `/next-bead`, to be done interactively.
-- **"Go through the questions":** run the walkthrough in step 3 of `digest`. Before asking Tal about a question, check it against `~/dotfiles/iar/escalation-rules.md`:
-  - The rules say a human must decide (product default, spec conflict, cluster or paid run, outward or irreversible action): ask Tal, and relay his answer word for word with SendMessage.
+- **"Go through the questions":** run the walkthrough in step 3 of `digest`. Before asking Tal about a question, check it against `~/dotfiles/iar/autonomy.md`:
+  - The rules say a human must decide (gated action, over budget, outward or irreversible action, spec ambiguity that changes the result): ask Tal, and relay his answer word for word with SendMessage.
   - The rules say the session should handle it, and the answer follows from the bead, its spec or the repo: answer the session yourself with SendMessage, starting with "first-mate:" and citing the source. Then tell Tal in one line what you answered and why. If you are unsure which side it is on, ask Tal.
 - **A held Inbox reply:** when the digest shows an Inbox thread that waits on a stopped session (Tal answered it), run the resume command the digest gives yourself, without asking first. It only delivers the reply Tal already wrote. Tell him in one line. Then watch that session (see "Watch").
 - **"Restack", "babysit the stack", "land the stack":** run the `pr-stack` skill.

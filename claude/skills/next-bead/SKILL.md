@@ -7,7 +7,7 @@ description: Pick up the next ready Bead (or a named one) and drive it through t
 
 You are the orchestrator. Delegate implementation to subagents, including when commits must run sequentially, to preserve the main session’s context. The independent reviewer is `iar-review.sh` (codex `gpt-6-sol`, read-only). Labels stay the shared state so `swarm` / `swarm-status.sh` keep reflecting reality — but this bead is NOT swarm work: never assign it to a `swarm-*` actor.
 
-Constants (same as the swarm): `BEADS_DIR=/Users/tal/.local/share/beads/precog/.beads` on every `br` call, `REPO=/Users/tal/Documents/precog`, `LOG_DIR=/tmp/swarm-logs`, actor `tal-solo`.
+Constants (same as the swarm): `BEADS_DIR=/Users/tal/.local/share/beads/precog/.beads` on every `br` call, `REPO=/Users/tal/Documents/precog`, `LOG_DIR=~/.local/state/iar`, actor `tal-solo`.
 
 Any post to Tal's Plannotator Inbox, from this skill or from a dispatched session that follows steps 6–7, follows `~/dotfiles/iar/inbox-etiquette.md`.
 
@@ -42,7 +42,7 @@ git -C "$WT" diff --numstat <prev> HEAD -- . ':(exclude)**/__snapshots__/**' ':(
 
 Complete all planned chunks without waiting for human review between commits; the split is for the user’s understanding. Push each committed head with `git -C "$WT" push -u origin u/tfriedman/iar-<id>` so the work survives lease return and is available from every clone.
 
-The moment something needs a human decision, ask the user inline (AskUserQuestion) — do NOT stamp `needs-human` while the session is live. Only if handing off unresolved (session ending): write the escalation to `/tmp/iar-esc-<id>.txt` (first line `ESCALATION — <question>`, then resume commands), attach with `br comments add <id> --actor tal-solo -f <file>`, add `needs-human` (plus `needs-fable` if the block is structural), keep the claim.
+The moment something needs a human decision, ask the user inline (AskUserQuestion) — do NOT stamp `needs-human` while the session is live. Only if handing off unresolved (session ending): write the escalation to `~/.local/state/iar/esc-<id>.txt` (first line `ESCALATION — <question>`, then resume commands), attach with `br comments add <id> --actor tal-solo -f <file>`, add `needs-human` (plus `needs-fable` if the block is structural), keep the claim.
 
 ## 4. Independent review
 

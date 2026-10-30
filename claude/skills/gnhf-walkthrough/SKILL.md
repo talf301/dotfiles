@@ -7,7 +7,7 @@ description: Turn a finished gnhf run in a Precog treehouse slot into a walkthro
 
 You get a slot path, a gnhf run id, a run name and a branch. Tal did not write this code and did not watch the run. Your page must let him decide what to keep without reading the diffs first.
 
-**Read-only.** Do not switch commits, commit, rebase, push, open PRs, change Beads, edit files in the slot or return the slot. Write only to `/tmp/swarm-logs/`. Do not rerun the check: each iteration already ran it, and the logs hold the result.
+**Read-only.** Do not switch commits, commit, rebase, push, open PRs, change Beads, edit files in the slot or return the slot. Write only to `~/.local/state/iar/`. Do not rerun the check: each iteration already ran it, and the logs hold the result.
 
 ## 1. Gather
 
@@ -54,7 +54,7 @@ For each iteration with `success: false`: what it tried, why it was rejected (th
 
 ## 4. Build the page
 
-Load the `plannotator-visual-explainer` skill and build one HTML file at `/tmp/swarm-logs/gnhf-walkthrough-<run id>.html`:
+Load the `plannotator-visual-explainer` skill and build one HTML file at `~/.local/state/iar/gnhf-walkthrough-<run id>.html`:
 
 1. **Orientation:** the goal in one paragraph; a run table (status and stop reason, iterations kept and failed, wall time, total tokens, base `BASE..HEAD`, branch); the metric at the base and at HEAD.
 2. **One card per commit:** subject, what changed and why, production and test line deltas, metric delta, check result, quality problems with `file:line`, verdict badge, and short code excerpts where they show the point.

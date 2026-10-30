@@ -7,7 +7,7 @@ description: Check a ready Bead against the background readiness gate, then star
 
 You are the dispatcher. You check the gate, claim, lease, write the brief and start the session. The background session does the work. Tal watches all sessions in `claude agents` (agent view), where each background session is named after its bead.
 
-Constants: `BEADS_DIR=/Users/tal/.local/share/beads/precog/.beads` on every `br` call, `REPO=/Users/tal/Documents/precog`, `LOG_DIR=/tmp/swarm-logs`, actor `tal-bg`. Shared texts: `~/dotfiles/iar/scope-self-review.md`, `~/dotfiles/iar/escalation-rules.md`, `~/dotfiles/iar/inbox-etiquette.md`.
+Constants: `BEADS_DIR=/Users/tal/.local/share/beads/precog/.beads` on every `br` call, `REPO=/Users/tal/Documents/precog`, `LOG_DIR=~/.local/state/iar`, actor `tal-bg`. Shared texts: `~/dotfiles/iar/scope-self-review.md`, `~/dotfiles/iar/escalation-rules.md`, `~/dotfiles/iar/inbox-etiquette.md`.
 
 ## 1. Pick
 
@@ -56,7 +56,7 @@ Steps:
 1. Create or check out the branch. Read the bead, the parent spec, and the repo instructions.
 2. Implement the smallest complete change. Run tests only with `iar-run-tests.sh <slot> <pytest-args>`. Commit with single-line messages and no co-author.
 3. Run the done-when command. Fix until it passes.
-4. Review: `ACTOR=tal-bg iar-review.sh <id> <slot> <base-sha>` (exit 0 approved, 1 changes requested, 2 needs human, 3 no verdict). The reviewer picks the tests, the script runs them outside the sandbox, and the reviewer judges their output; failed tests or no tests run can never give exit 0. Read `/tmp/swarm-logs/review-<id>.log`. Fix the actionable findings and review again, at most 2 fix rounds. On exit 2 or after 2 rounds, ask Tal.
+4. Review: `ACTOR=tal-bg iar-review.sh <id> <slot> <base-sha>` (exit 0 approved, 1 changes requested, 2 needs human, 3 no verdict). The reviewer picks the tests, the script runs them outside the sandbox, and the reviewer judges their output; failed tests or no tests run can never give exit 0. Read `~/.local/state/iar/review-<id>.log`. Fix the actionable findings and review again, at most 2 fix rounds. On exit 2 or after 2 rounds, ask Tal.
 5. Push the branch: `git push -u origin u/tfriedman/iar-<id>`.
 6. Add a bead comment from a file (`br comments add <id> --actor tal-bg -f <file>`): what changed, the tests executed (command and pass/fail counts) apart from checks only reviewed, the code review verdict, open risks.
 7. Post to Tal's Plannotator Inbox with your `plannotator_inbox` tool, following the Inbox etiquette below: the fixed precog `project_path`, `thread: "<session name>"` on every send, a subject that states the decision.
@@ -82,7 +82,7 @@ Session name: `<id>: <short description>`, where the description is 2–4 plain 
 Then start the session from the slot so it works there and agent view creates no extra worktree:
 
 ```bash
-cd <slot> && claude --bg --settings ~/dotfiles/iar/dispatch-settings.json --name "<session name>" "Read and follow /tmp/swarm-logs/dispatch-<id>.md"
+cd <slot> && claude --bg --settings ~/dotfiles/iar/dispatch-settings.json --name "<session name>" "Read and follow ~/.local/state/iar/dispatch-<id>.md"
 ```
 
 ## 5. Report

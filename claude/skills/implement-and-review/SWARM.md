@@ -160,7 +160,7 @@ br update <bead> --remove-label needs-human                 # drops the gate →
 ```
 The supervisor still owns the bead and resumes it at whatever phase its `iar:`
 label says, in the existing worktree. If a cap put it there, also clear that
-phase's counter under `/tmp/swarm-logs/`. (For an enforced directive rather than
+phase's counter under `~/.local/state/iar/`. (For an enforced directive rather than
 a note, `--agent-context '<json>'` is the governing-instructions channel.)
 
 **B — resolve it yourself, no agent needed** (answer is "close it" / "I'll handle it"):
@@ -189,7 +189,7 @@ swarm pr <bead>     # push branch + gh pr create --draft --base main
 | `PHASE_CAP` | 2 | spawn attempts per phase before `needs-human` |
 | `FIX_CAP` | 2 | review→changes cycles before `needs-human` |
 | `ACTOR` | `swarm-<host>-<pid>` | claim identity (assignee + audit trail) |
-| `LOG_DIR` | `/tmp/swarm-logs` | per-bead logs + phase/attempt state files |
+| `LOG_DIR` | `~/.local/state/iar` | per-bead logs + phase/attempt state files |
 | `REPO` | `/Users/tal/Documents/precog` | repo the worktrees branch from |
 | `BEADS_DIR` | precog `.beads` | Beads store |
 | `DRY_RUN` | 0 | `1` = print intended actions, mutate nothing |

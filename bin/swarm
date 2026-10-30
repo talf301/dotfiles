@@ -24,7 +24,7 @@ set -uo pipefail
 export BEADS_DIR="${BEADS_DIR:-/Users/tal/.local/share/beads/precog/.beads}"
 REPO="${REPO:-/Users/tal/Documents/precog}"
 REFRESH="${SWARM_REFRESH:-2}"       # TUI auto-refresh seconds
-LOG_DIR="${LOG_DIR:-/tmp/swarm-logs}"
+LOG_DIR="${LOG_DIR:-$HOME/.local/state/iar}"
 SELF="$(command -v swarm || echo "$HOME/.local/bin/swarm")"
 PR_BRANCH_PREFIX="${PR_BRANCH_PREFIX:-u/tfriedman/pr}"  # PR-group integration branches; u/<user>/ prefix per repo convention so they never collide with anyone else's branches
 

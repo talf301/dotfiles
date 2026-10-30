@@ -61,7 +61,10 @@ def iso(t):
 
 
 def parse_time(s):
-    return dt.datetime.fromisoformat(s.replace("Z", "+00:00")).astimezone(dt.timezone.utc)
+    t = dt.datetime.fromisoformat(s.replace("Z", "+00:00"))
+    if t.tzinfo is None:
+        raise ValueError(f"time {s!r} has no UTC offset (write it as ...Z)")
+    return t.astimezone(dt.timezone.utc)
 
 
 @contextlib.contextmanager
@@ -162,6 +165,8 @@ def find_open(asking, title):
 
 
 def ask(a):
+    if not a.session:
+        raise ValueError("no asking session: pass --session or set CLAUDE_CODE_SESSION_ID")
     if a.gated == "yes" and a.deadline:
         raise ValueError("a gated question has no deadline")
     if a.default not in a.option:
@@ -356,7 +361,9 @@ def self_test():
         return rc, out.getvalue().strip()
 
     with tempfile.TemporaryDirectory() as root:
-        saved = {k: os.environ.get(k) for k in ("BEADS_DIR", "IAR_INBOX_CMD", "IAR_STATE_DIR")}
+        saved = {k: os.environ.get(k) for k in ("BEADS_DIR", "IAR_INBOX_CMD", "IAR_STATE_DIR",
+                                                 "CLAUDE_CODE_SESSION_ID")}
+        os.environ.pop("CLAUDE_CODE_SESSION_ID", None)
         os.environ["BEADS_DIR"] = os.path.join(root, ".beads")
         os.environ["IAR_STATE_DIR"] = root
         log = os.path.join(root, "inbox.log")
@@ -451,10 +458,15 @@ def self_test():
             assert parse_body(s["description"])["inbox_thread"] == "msg_T1"
             kids = [d for d in ledger.show(a2)["dependents"] if d["title"].endswith("Inbox down?")]
             assert len(kids) == 1, kids
-            assert run(main_ask, [a2, "Bad", "--blocks", "no", "-o", "A", "-o", "B",
-                                  "--default", "C", "--reversible", "yes", "--gated", "no"])[0] == 2
-            assert run(main_ask, [a2, "Blank", "--blocks", "no", "-o", "A", "-o", " ",
-                                  "--default", "A", "--reversible", "yes", "--gated", "no"])[0] == 2
+            flags = ["--blocks", "no", "--reversible", "yes", "--gated", "no", "--session", "s1"]
+            assert run(main_ask, [a2, "Bad", "-o", "A", "-o", "B", "--default", "C", *flags])[0] == 2
+            assert run(main_ask, [a2, "Blank", "-o", "A", "-o", " ", "--default", "A", *flags])[0] == 2
+            assert run(main_ask, [a2, "Local", "--blocks", "no", "--deadline",
+                                  "2026-01-01T00:00:00", *base])[0] == 2
+            assert run(main_ask, [a2, "No session", "--blocks", "no",
+                                  *[x for x in base if x not in ("--session", "s1")]])[0] == 2
+            assert not [d for d in ledger.show(a2)["dependents"]
+                        if d["title"].endswith(("Bad", "Blank", "Local", "No session"))]
         finally:
             for k, v in saved.items():
                 os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)

@@ -1,0 +1,351 @@
+#!/usr/bin/env python3
+"""bg: the single launch path for a background bead session (one attempt).
+
+  bg <bead> --done-when CMD [--name "<bead>: <2-4 words>"]
+  bg --self-test
+
+Steps, in order. If a step fails, bg undoes the earlier steps in reverse order and
+writes the bead comment `attempt-failed: <step> attempt=<n> <error>`:
+  lease    treehouse get --lease, holder agent:<bead>#<n>     undo: return --if-lease-id, check status
+  claim    status in_progress, assignee agent:<bead>#<n>      undo: status open, assignee cleared
+  brief    render iar/brief.md to $LOG_DIR/dispatch-<bead>-<n>.md   undo: delete it
+  start    claude --bg --settings iar/dispatch-settings.json  undo: claude stop
+  comment  attempt: <n> session: <sid> slot: <path> branch: <ref> brief: <path>
+The comment is last because `claude --bg` ignores --session-id: the session id exists only
+after start (spec order lease, claim, comment, brief, start; see decision comment on precog-lxt4).
+
+Env: BEADS_DIR (default: Precog store), REPO (default ~/Documents/precog), LOG_DIR (default
+~/.local/state/iar). BG_FAULT_AFTER=<step> injects a failure after that step (tests only).
+Prints one JSON line on success.
+"""
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+IAR = Path(__file__).resolve().parent.parent / "iar"
+sys.path.insert(0, str(IAR))
+import ledger  # noqa: E402
+
+os.environ.setdefault("BEADS_DIR", "/Users/tal/.local/share/beads/precog/.beads")
+REPO = os.environ.get("REPO", os.path.expanduser("~/Documents/precog"))
+LOG_DIR = Path(os.environ.get("LOG_DIR", os.path.expanduser("~/.local/state/iar")))
+SETTINGS = IAR / "dispatch-settings.json"
+LEASE_TIMEOUT_S = 900  # a lease fetches origin; about 4 min on Precog
+AGENTS_WAIT_S = 30
+ATTEMPT_RE = re.compile(r"attempt(?:: |-failed: \S+ attempt=)(\d+)\b")
+
+
+class StepError(RuntimeError):
+    pass
+
+
+def sh(cmd, cwd=None, timeout=120):
+    try:
+        p = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout)
+    except (subprocess.TimeoutExpired, OSError) as e:
+        raise StepError(f"{cmd[0]} {cmd[1]}: {e}")
+    if p.returncode != 0:
+        raise StepError(f"{cmd[0]} {cmd[1]} exit {p.returncode}: {(p.stderr or p.stdout).strip()[-300:]}")
+    return p.stdout
+
+
+def next_attempt(issue):
+    nums = [int(m.group(1)) for c in issue.get("comments") or []
+            if (m := ATTEMPT_RE.match(c.get("text", "")))]
+    return max(nums, default=0) + 1
+
+
+def lease_gone(lease_id):
+    """True if no slot holds lease_id. Reads `status --json` by key: same on treehouse v2 and v3."""
+    return all(s.get("lease_id") != lease_id for s in json.loads(sh(["treehouse", "status", "--json"], cwd=REPO)))
+
+
+def base_and_branch(issue, slot):
+    def ref(name):
+        try:
+            return sh(["git", "-C", slot, "rev-parse", "--verify", "--quiet", name]).strip()
+        except StepError:
+            return ""
+    branch = f"u/tfriedman/iar-{issue['id']}"
+    slugs = [x[3:] for x in issue.get("labels") or [] if x.startswith("pr:")]
+    base = (slugs and ref(f"origin/u/tfriedman/pr/{slugs[0]}")) or ref("origin/main")
+    if not base:
+        raise StepError("no base: origin/main not found in slot")
+    action = f"resume origin/{branch}" if ref(f"origin/{branch}") else f"create it at {base}"
+    return base, branch, action
+
+
+def render(values):
+    text = (IAR / "brief.md").read_text()
+    text = re.sub(r"\{\{include ([\w.-]+)\}\}", lambda m: (IAR / m.group(1)).read_text().strip(), text)
+    text = re.sub(r"\{\{(\w+)\}\}", lambda m: str(values[m.group(1)]), text)  # KeyError on unknown
+    if "{{" in text:
+        raise StepError("brief: unrendered {{...}} left")
+    return text
+
+
+def dispatch(bead, done_when, name=None):
+    issue = ledger.show(bead)
+    if issue["status"] != "open" or issue.get("assignee"):
+        print(f"bg: {bead} is {issue['status']}, assignee {issue.get('assignee')}: not dispatchable",
+              file=sys.stderr)
+        return 1
+    n = next_attempt(issue)
+    holder = f"agent:{bead}#{n}"
+    name = name or f"{bead}: {issue['title'][:40]}"
+    fault = os.environ.get("BG_FAULT_AFTER")
+    undo, a = [], {"attempt": n}  # undo: (label, fn) pairs, run in reverse
+    step = "lease"
+    try:
+        out = sh(["treehouse", "get", "--lease", "--json", "--lease-holder", holder], cwd=REPO,
+                 timeout=LEASE_TIMEOUT_S)
+        lease = json.loads(out[out.index("{"):])
+        a["slot"], lease_id = lease["path"], lease["lease_id"]
+
+        def unlease():
+            sh(["treehouse", "return", a["slot"], "--force", "--if-lease-id", lease_id], cwd=REPO)
+            if not lease_gone(lease_id):
+                raise StepError(f"lease {lease_id} still held after return")
+        undo.append(("lease", unlease))
+        if fault == step:
+            raise StepError("injected fault")
+
+        step = "claim"
+        ledger.update(bead, status="in_progress", assignee=holder)
+        undo.append(("claim", lambda: ledger.update(bead, status="open", assignee="")))
+        if fault == step:
+            raise StepError("injected fault")
+
+        step = "brief"
+        base, a["branch"], action = base_and_branch(issue, a["slot"])
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        brief = LOG_DIR / f"dispatch-{bead}-{n}.md"
+        a["brief"] = str(brief)
+        brief.write_text(render({"bead": bead, "title": issue["title"], "name": name, "attempt": n,
+                                 "slot": a["slot"], "base_sha": base, "branch": a["branch"],
+                                 "branch_action": action, "done_when": done_when}))
+        undo.append(("brief", lambda: brief.unlink(missing_ok=True)))
+        (LOG_DIR / f"base-{bead}").write_text(base + "\n")
+        if fault == step:
+            raise StepError("injected fault")
+
+        step = "start"
+        out = sh(["claude", "--bg", "--settings", str(SETTINGS), "--name", name,
+                  f"Read and follow {brief}"], cwd=a["slot"])
+        m = re.search(r"backgrounded\W+(\w+)", out)
+        if not m:
+            raise StepError(f"claude --bg printed no session id: {out.strip()[:200]}")
+        short = m.group(1)
+        undo.append(("start", lambda: sh(["claude", "stop", short])))
+        a["session"] = ""
+        for _ in range(AGENTS_WAIT_S):
+            hit = [s for s in json.loads(sh(["claude", "agents", "--json"])) if s.get("id") == short]
+            if hit:
+                a["session"] = hit[0]["sessionId"]
+                break
+            time.sleep(1)
+        if not a["session"]:
+            raise StepError(f"session {short} not in claude agents after {AGENTS_WAIT_S}s")
+        if fault == step:
+            raise StepError("injected fault")
+
+        step = "comment"
+        ledger.comment(bead, f"attempt: {n} session: {a['session']} slot: {a['slot']} "
+                             f"branch: {a['branch']} brief: {a['brief']}")
+        if fault == step:
+            raise StepError("injected fault")
+    except (StepError, ledger.LedgerError, OSError, ValueError, KeyError) as e:
+        errors = [f"{type(e).__name__}: {e}" if not isinstance(e, StepError) else str(e)]
+        for label, fn in reversed(undo):
+            try:
+                fn()
+            except (StepError, ledger.LedgerError, OSError, ValueError) as ue:
+                errors.append(f"UNDO {label} FAILED: {ue}")
+        text = f"attempt-failed: {step} attempt={n} " + "; ".join(errors)
+        try:
+            ledger.comment(bead, text)
+        except ledger.LedgerError as ce:
+            print(f"bg: could not write comment: {ce}", file=sys.stderr)
+        print(f"bg: {text}", file=sys.stderr)
+        return 1
+    print(json.dumps({"bead": bead, "name": name, **a}))
+    return 0
+
+
+# ---------------------------------------------------------------- self-test
+
+FAKE_TREEHOUSE = r'''#!/usr/bin/env python3
+import json, os, subprocess, sys, uuid
+st = os.path.join(os.environ["FAKE"], "leases.json")
+leases = json.load(open(st)) if os.path.exists(st) else {}
+a = sys.argv[1:]
+def save(): json.dump(leases, open(st, "w"))
+if a[0] == "get":
+    slot = os.path.join(os.environ["FAKE"], "slot-%d" % len(os.listdir(os.environ["FAKE"])))
+    subprocess.run(["git", "clone", "-q", os.environ["FAKE_ORIGIN"], slot], check=True)
+    lid = uuid.uuid4().hex
+    leases[slot] = {"lease_id": lid, "holder": a[a.index("--lease-holder") + 1]}
+    save()
+    print(json.dumps({"path": slot, "lease_id": lid, "lease_holder": leases[slot]["holder"]}))
+elif a[0] == "return":
+    if os.environ.get("FAKE_RETURN_EXIT"):
+        sys.exit(int(os.environ["FAKE_RETURN_EXIT"]))  # v3: exit 3 = not returned
+    if leases.get(a[1], {}).get("lease_id") == a[a.index("--if-lease-id") + 1]:
+        del leases[a[1]]
+    save()
+elif a[0] == "status":
+    rows = [{"name": "9", "path": "/x/9", "status": "available", "lease_id": "", "lease_holder": ""}]
+    for p, l in leases.items():
+        rows.append({"name": p, "path": p, "status": "leased", "lease_id": l["lease_id"],
+                     "lease_holder": l["holder"], "processes": []})
+    if os.environ.get("FAKE_TH_V3"):
+        for r in rows:
+            r["branch"] = "main"
+    print(json.dumps(rows))
+'''
+
+FAKE_CLAUDE = r'''#!/usr/bin/env python3
+import json, os, sys, uuid
+st = os.path.join(os.environ["FAKE"], "sessions.json")
+ss = json.load(open(st)) if os.path.exists(st) else []
+a = sys.argv[1:]
+if "--bg" in a:
+    sid = str(uuid.uuid4())
+    ss.append({"id": sid[:8], "sessionId": sid, "kind": "background", "state": "working",
+               "name": a[a.index("--name") + 1], "cwd": os.getcwd(), "argv": a})
+    print("warning: --bg manages the session id; ignoring --session-id")
+    print("backgrounded · %s · %s" % (sid[:8], ss[-1]["name"]))
+elif a[:1] == ["agents"]:
+    print(json.dumps([s for s in ss if s["state"] != "stopped"]))
+elif a[:1] == ["stop"]:
+    for s in ss:
+        if s["id"] == a[1]:
+            s["state"] = "stopped"
+json.dump(ss, open(st, "w"))
+'''
+
+
+def self_test():
+    global REPO, LOG_DIR
+    with tempfile.TemporaryDirectory() as root:
+        r = Path(root)
+        fake, binp, origin = r / "fake", r / "bin", r / "origin"
+        for d in (fake, binp):
+            d.mkdir()
+        for exe, src in (("treehouse", FAKE_TREEHOUSE), ("claude", FAKE_CLAUDE)):
+            (binp / exe).write_text(src)
+            (binp / exe).chmod(0o755)
+        sh(["git", "init", "-q", "-b", "main", str(origin)])
+        sh(["git", "-C", str(origin), "-c", "user.email=t@t", "-c", "user.name=t",
+            "commit", "-q", "--allow-empty", "-m", "init"])
+        main_sha = sh(["git", "-C", str(origin), "rev-parse", "HEAD"]).strip()
+        old = {k: os.environ.get(k) for k in ("BEADS_DIR", "PATH", "FAKE", "FAKE_ORIGIN",
+                                              "BG_FAULT_AFTER", "FAKE_RETURN_EXIT", "FAKE_TH_V3")}
+        os.environ.update(BEADS_DIR=str(r / ".beads"), PATH=f"{binp}:{os.environ['PATH']}",
+                          FAKE=str(fake), FAKE_ORIGIN=str(origin))
+        REPO, LOG_DIR = str(r), r / "state"
+        try:
+            sh(["br", "init", "--prefix", "bg"], cwd=root)
+
+            def leases():
+                p = fake / "leases.json"
+                return json.loads(p.read_text()) if p.exists() else {}
+
+            def sessions():
+                return json.loads(sh(["claude", "agents", "--json"]))
+
+            def quiet(*args):  # dispatch() with its stdout and stderr lines hidden
+                saved = sys.stdout, sys.stderr
+                sys.stdout = sys.stderr = open(os.devnull, "w")
+                try:
+                    return dispatch(*args)
+                finally:
+                    sys.stdout.close()
+                    sys.stdout, sys.stderr = saved
+
+            # E7: a fault after each step leaves no claim, no lease and an attempt-failed comment.
+            for i, step in enumerate(("lease", "claim", "brief", "start", "comment")):
+                os.environ["FAKE_TH_V3"] = "1" if i % 2 else ""
+                b = ledger.create(f"fault {step}", type="task")["id"]
+                os.environ["BG_FAULT_AFTER"] = step
+                assert quiet(b, "true") == 1, step
+                s = ledger.show(b)
+                assert s["status"] == "open" and not s.get("assignee"), (step, s)
+                assert leases() == {} and sessions() == [], (step, leases(), sessions())
+                texts = [c["text"] for c in s["comments"]]
+                assert texts[-1].startswith(f"attempt-failed: {step} attempt=1 injected fault"), texts
+                assert not (LOG_DIR / f"dispatch-{b}-1.md").exists(), step
+            # The next attempt on the same bead is attempt 2.
+            assert quiet(b, "true") == 1 and leases() == {}
+            assert ledger.show(b)["comments"][-1]["text"].startswith("attempt-failed: comment attempt=2")
+
+            # A lease that treehouse does not return (v3 exit 3) is reported, not hidden.
+            os.environ["BG_FAULT_AFTER"], os.environ["FAKE_RETURN_EXIT"] = "claim", "3"
+            b = ledger.create("return fails", type="task")["id"]
+            assert quiet(b, "true") == 1
+            last = ledger.show(b)["comments"][-1]["text"]
+            assert "UNDO lease FAILED" in last and ledger.show(b)["status"] == "open", last
+            os.environ["FAKE_RETURN_EXIT"] = ""
+            leases_left = leases()
+            assert len(leases_left) == 1
+            sh(["treehouse", "return", *leases_left, "--if-lease-id",
+                next(iter(leases_left.values()))["lease_id"]])
+
+            # Success: one attempt comment matching the claude agents session id.
+            os.environ["BG_FAULT_AFTER"] = ""
+            b = ledger.create("ok bead", type="task", labels=["pr:none-such"])["id"]
+            assert quiet(b, "make test", f"{b}: ok bead") == 0
+            s = ledger.show(b)
+            att = [c["text"] for c in s["comments"] if c["text"].startswith("attempt")]
+            (sess,) = sessions()
+            (slot,) = leases()
+            assert os.path.realpath(sess["cwd"]) == os.path.realpath(slot), (sess, slot)
+            assert att == [f"attempt: 1 session: {sess['sessionId']} slot: {slot} "
+                           f"branch: u/tfriedman/iar-{b} brief: {LOG_DIR}/dispatch-{b}-1.md"], att
+            assert s["status"] == "in_progress" and s["assignee"] == f"agent:{b}#1", s
+            (lease,) = leases().values()
+            assert lease["holder"] == f"agent:{b}#1", lease
+            argv = sess["argv"]
+            assert argv[argv.index("--settings") + 1] == str(SETTINGS) and SETTINGS.exists(), argv
+            brief = (LOG_DIR / f"dispatch-{b}-1.md").read_text()
+            assert main_sha in brief and "make test" in brief and "Escalate only for" in brief
+            assert (LOG_DIR / f"base-{b}").read_text().strip() == main_sha
+            # A claimed bead is refused before any side effect.
+            assert quiet(b, "true") == 1 and len(leases()) == 1
+        finally:
+            for k, v in old.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+    print("bg self-test: ok")
+
+
+def main():
+    p = argparse.ArgumentParser(prog="bg", description=__doc__.split("\n")[0])
+    p.add_argument("bead", nargs="?")
+    p.add_argument("--done-when")
+    p.add_argument("--name")
+    p.add_argument("--self-test", action="store_true")
+    a = p.parse_args()
+    if a.self_test:
+        self_test()
+        return 0
+    if not a.bead or not a.done_when:
+        p.error("bead and --done-when are required")
+    try:
+        return dispatch(a.bead, a.done_when, a.name)
+    except ledger.LedgerError as e:  # the pre-check read failed: nothing was done
+        print(f"bg: {e}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

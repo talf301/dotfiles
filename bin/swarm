@@ -9,6 +9,8 @@
 #   swarm status              one-shot text snapshot (swarm-status.sh)
 #   swarm on [once]           start the supervisor poller (loop, or a single tick)
 #   swarm add "<title>"       create a ready bead, print its id
+#   swarm dispatch <id> --done-when "<cmd>" [--name "<id>: <words>"]
+#                             start a background session on a bead via bin/bg (the only launch path)
 #   swarm answer <id> "<m>"   record a decision + resume (drops needs-human)
 #   swarm chat <id>           open a live Fable session on a hard/structural bead in a NEW tab
 #   swarm pr <id>             push the approved branch + open a DRAFT PR (base: main)
@@ -321,6 +323,7 @@ case "${1:-tui}" in
             fi
             exec swarm-supervisor.sh "$@" ;;
   add)      shift; br create "$1" ${2:+--acceptance-criteria "$2"} -p "${3:-2}" --json 2>/dev/null | jq -r '.id // .issue.id' ;;
+  dispatch) shift; exec "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/bg" "$@" ;;  # path, not the bg builtin
   answer)   shift; id="$1"; shift || true; [ $# -gt 0 ] && br update "$id" --notes "$*" >/dev/null 2>&1; br update "$id" --remove-label needs-human >/dev/null 2>&1; echo "resumed $id" ;;
   chat)     shift; _chat "$1" ;;
   pr)       shift; _pr "$1" ;;
@@ -339,5 +342,5 @@ case "${1:-tui}" in
   __close)   shift; _close "${1:-}" ;;
   __resume)  shift; _resume "${1:-}" ;;
   __toggle)  _toggle ;;
-  *) echo "usage: swarm [status|on|add|answer|chat|pr|done|close|resume]  (bare = live TUI)"; exit 1 ;;
+  *) echo "usage: swarm [status|on|add|dispatch|answer|chat|pr|done|close|resume]  (bare = live TUI)"; exit 1 ;;
 esac

@@ -156,10 +156,11 @@ def inbox_post(qid, f, project, thread):
 
 # --- ask ---
 
-def find_open(asking, title):
+def find_open(asking, question):
+    """The open question bead under `asking` whose title is `Q(<short id>): <question>`."""
     for d in ledger.show(asking).get("dependents") or []:
-        if d.get("dependency_type") == "parent-child" and d["title"] == title \
-                and d["status"] != "closed":
+        if d.get("dependency_type") == "parent-child" and d["status"] != "closed" \
+                and d["title"].startswith("Q(") and d["title"].split("): ", 1)[-1] == question:
             return ledger.show(d["id"])
     return None
 
@@ -187,18 +188,19 @@ def ask(a):
             deadline = iso(now() + DEFAULT_DEADLINE)
 
     asking = ledger.show(a.asking)
-    title = f"Q({short(a.asking)}): {a.question}"
     with locked():
-        q = find_open(a.asking, title)
+        q = find_open(a.asking, a.question)
         if q is None:
             f = {"question": a.question, "asking": a.asking, "session": a.session or "",
                  "blocks": a.blocks, "default": a.default, "reversible": a.reversible,
                  "gated": a.gated, "deadline": deadline, "inbox_thread": "pending"}
             # inbox:pending from birth: a crash before the post leaves the bead for the reconciler.
-            q = ledger.create(title, type="task", parent=a.asking,
+            q = ledger.create(f"Q(?): {a.question}", type="task", parent=a.asking,
                               labels=["question", "no-swarm", "inbox:pending"],
                               description=render_body(f, a.option, a.context or ""))
             q["labels"] = ["question", "no-swarm", "inbox:pending"]
+        if q["title"].startswith("Q(?)"):  # the id is known only after create
+            ledger.update(q["id"], title=f"Q({short(q['id'])}): {a.question}")
     qid = q["id"]
     f = parse_body(q.get("description"))
     if f.get("blocks") == "yes":
@@ -249,8 +251,8 @@ def effective_answer(q):
 
 def answer(qid, text, at=None, source="human", timeout=False):
     """Returns one of: answered, overrode-timeout, late, noop."""
-    if not re.fullmatch(r"\S+", source):
-        raise ValueError("--source is one word")
+    if not re.fullmatch(r"\S+", source) or (source == "timeout" and not timeout):
+        raise ValueError("--source is one word; 'timeout' is only for --timeout")
     with locked():
         return _answer(qid, text, at, source, timeout)
 
@@ -390,7 +392,7 @@ def self_test():
             blocked = {i["id"] for i in ledger.blocked()}
             assert a1 in blocked and a2 not in blocked, blocked
             s = ledger.show(q1)
-            assert s["title"] == f"Q({short(a1)}): Keep the cache?" and s["parent"] == a1, s
+            assert s["title"] == f"Q({short(q1)}): Keep the cache?" and s["parent"] == a1, s
             assert sorted(s["labels"]) == ["no-swarm", "question"], s["labels"]
             f = parse_body(s["description"])
             assert f["inbox_thread"] == "msg_T1" and f["options"] == ["Keep", "Drop"], f
@@ -429,6 +431,7 @@ def self_test():
             # a human answer recorded before the timeout write wins over it.
             past = iso(now() - dt.timedelta(minutes=1))
             rc, q3 = run(main_ask, [a2, "Port?", "--blocks", "no", "--deadline", past, *base])
+            assert run(main_answer, [q3, "Keep", "--source", "timeout"])[0] == 2
             assert run(main_answer, [q3, "--timeout"]) == (0, "answered")
             assert run(main_answer, [q3, "--timeout"]) == (0, "noop")
             assert "decision:auto" in ledger.show(a2)["labels"]
@@ -459,8 +462,9 @@ def self_test():
             kids = [d for d in ledger.show(a2)["dependents"] if d["title"].endswith("Inbox down?")]
             assert len(kids) == 1, kids
             flags = ["--blocks", "no", "--reversible", "yes", "--gated", "no", "--session", "s1"]
-            assert run(main_ask, [a2, "Bad", "-o", "A", "-o", "B", "--default", "C", *flags])[0] == 2
-            assert run(main_ask, [a2, "Blank", "-o", "A", "-o", " ", "--default", "A", *flags])[0] == 2
+            for q, opt, default in (("Bad", "B", "C"), ("Blank", " ", "A")):
+                assert run(main_ask, [a2, q, "-o", "A", "-o", opt, "--default", default,
+                                      *flags])[0] == 2
             assert run(main_ask, [a2, "Local", "--blocks", "no", "--deadline",
                                   "2026-01-01T00:00:00", *base])[0] == 2
             assert run(main_ask, [a2, "No session", "--blocks", "no",

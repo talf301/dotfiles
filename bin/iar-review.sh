@@ -25,7 +25,7 @@ set -euo pipefail
 
 id="${1:?bead id}"; wt="${2:?worktree}"; base="${3:?base sha}"; shift 3
 export BEADS_DIR="${BEADS_DIR:-/Users/tal/.local/share/beads/precog/.beads}"
-LOG_DIR="${LOG_DIR:-/tmp/swarm-logs}"
+LOG_DIR="${LOG_DIR:-$HOME/.local/state/iar}"
 ACTOR="${ACTOR:-tal-solo}"
 mkdir -p "$LOG_DIR"
 

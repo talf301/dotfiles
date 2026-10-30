@@ -1,0 +1,11 @@
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          { "type": "command", "command": "$HOME/dotfiles/iar/notify-stop.sh" }
+        ]
+      }
+    ]
+  }
+}

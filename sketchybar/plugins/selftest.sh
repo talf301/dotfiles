@@ -11,9 +11,11 @@ printf '#!/bin/sh\ncase "$*" in *muted*) echo false;; *) echo "${FAKE_VOL:-50}";
 printf '#!/bin/sh\nprintf "%%s\\n" "$FAKE_IPCONFIG"\n'                    > $STUB/ipconfig
 printf '#!/bin/sh\nprintf "%%s\\n" "$FAKE_IFCONFIG"\n'                    > $STUB/ifconfig
 printf '#!/bin/sh\nprintf "%%s" "$FAKE_SONG"\n'                             > $STUB/curl
+printf '#!/bin/sh\nprintf "%%s" "$FAKE_QUOTA_JSON"\n'                       > $STUB/quota-axi
 printf '#!/bin/sh\nprintf "%%s\n" "$FAKE_DISPLAY_COUNT"\n'                > $STUB/aerospace
+printf '#!/bin/sh\nprintf "%%s\n" "$*" >> "$SB_LOG"\n'                  > $STUB/launchctl
 printf '#!/bin/sh\nprintf "%%s\n" "$*" >> "$SB_LOG"\n'                  > $STUB/open
-chmod +x $STUB/sketchybar $STUB/pmset $STUB/osascript $STUB/ipconfig $STUB/ifconfig $STUB/curl $STUB/aerospace $STUB/open
+chmod +x $STUB/sketchybar $STUB/pmset $STUB/osascript $STUB/ipconfig $STUB/ifconfig $STUB/curl $STUB/quota-axi $STUB/aerospace $STUB/launchctl $STUB/open
 export PATH="$STUB:$PATH"
 
 typeset -i fail=0
@@ -22,6 +24,16 @@ check() {  # check <desc> <expected substring>
     else print "  FAIL $1 -- wanted '$2' got '$(<$SB_LOG)'"; fail=1; fi
 }
 glyph() { printf "\\U$1" }
+
+# --- AI budgets: weekly usage, never stale cache ---
+: > $SB_LOG
+FAKE_QUOTA_JSON='{"providers":[{"state":{"stale":false},"windows":[{"kind":"weekly","percentUsed":42}]}]}' \
+    NAME=codex_budget QUOTA_AXI_BIN="$STUB/quota-axi" zsh -f ./ai_budget.sh codex
+check "AI budget shows weekly usage" "label=42%"
+: > $SB_LOG
+FAKE_QUOTA_JSON='{"providers":[{"state":{"stale":true},"windows":[{"kind":"weekly","percentUsed":42}]}]}' \
+    NAME=codex_budget QUOTA_AXI_BIN="$STUB/quota-axi" zsh -f ./ai_budget.sh codex
+check "AI budget rejects stale cache" "label=?%"
 
 # --- battery: icon bucket per percentage ---
 for spec in 100:F0079 95:F0082 85:F0081 75:F0080 65:F007F 55:F007E 42:F007D 35:F007C 25:F007B 15:F007A 5:F0083; do
@@ -42,19 +54,24 @@ for spec in 0:F0581 20:F057F 50:F0580 90:F057E; do
     check "volume ${spec%%:*}% icon" "$(glyph ${spec#*:})"
 done
 
-# --- calendar: countdown formatting, then the guards ---
+# --- calendar: countdown formatting from an absolute event time, then the guards ---
 CACHE="$HOME/.cache/sketchybar/nextevent"
 SAVE=$(<$CACHE 2>/dev/null)
-cal() { print -n "$1" > $CACHE; : > $SB_LOG; NAME=calendar zsh -f ./calendar.sh }
-for spec in "Standup|300::Standup · 5m" "Long|7800::Long · 2h10m" "Soon|30::Soon · now" "Started|-240::Started · now"; do
+NOW=10000
+cal() { print -n "$1" > $CACHE; : > $SB_LOG; NOW=$NOW NAME=calendar zsh -f ./calendar.sh }
+for spec in "Standup|10300::Standup · 5m" "Long|17800::Long · 2h10m" "Soon|10030::Soon · now" "Started|9760::Started · now"; do
     cal "${spec%%::*}"; check "calendar ${spec%%::*}" "${spec#*::}"
 done
-for bad in "Old|-301" "garbage" ""; do
+check "calendar refreshes the EventKit cache" "kickstart gui/$(id -u)/local.sketchybar.nextevent"
+print -n "After Sleep|14200" > $CACHE
+: > $SB_LOG; NOW=13600 NAME=calendar zsh -f ./calendar.sh
+check "calendar countdown advances while helper does not run" "After Sleep · 10m"
+for bad in "Old|9699" "garbage" ""; do
     cal "$bad"; check "calendar hides '$bad'" "drawing=off"
 done
-cal "$(printf 'A%.0s' {1..40})|300"; check "calendar truncates long title" "…"
-: > $SB_LOG; print -n "Standup|300|https://meet.example.com/standup" > $CACHE
-NAME=calendar SENDER=mouse.clicked zsh -f ./calendar.sh
+cal "$(printf 'A%.0s' {1..40})|10300"; check "calendar truncates long title" "…"
+: > $SB_LOG; print -n "Standup|10300|https://meet.example.com/standup" > $CACHE
+NOW=$NOW NAME=calendar SENDER=mouse.clicked zsh -f ./calendar.sh
 check "calendar opens meeting URL" "https://meet.example.com/standup"
 print -n "$SAVE" > $CACHE
 

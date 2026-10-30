@@ -26,6 +26,7 @@ REPO="${REPO:-/Users/tal/Documents/precog}"
 REFRESH="${SWARM_REFRESH:-2}"       # TUI auto-refresh seconds
 LOG_DIR="${LOG_DIR:-/tmp/swarm-logs}"
 SELF="$(command -v swarm || echo "$HOME/.local/bin/swarm")"
+PR_BRANCH_PREFIX="${PR_BRANCH_PREFIX:-u/tfriedman/pr}"  # PR-group integration branches; u/<user>/ prefix per repo convention so they never collide with anyone else's branches
 
 # colors (ANSI-C \033 so no raw ESC bytes live in the source)
 NC=$'\033[0m'; RED=$'\033[1;31m'; GRN=$'\033[1;32m'; CYAN=$'\033[36m'; DIM=$'\033[2m'
@@ -49,6 +50,19 @@ _list() {
     # PR opened
     echo "$ipj" | jq -r --arg cy "$CYAN" --arg nc "$NC" \
       '.issues[]? | select((.labels//[])|index("pr-open")) | [.id, ($cy+"🔀 PR open"+$nc), .title] | @tsv'
+    # completed PR groups not yet shipped: every member closed on integrate, the group's integration
+    # branch ($PR_BRANCH_PREFIX/<slug>) still local, no member labelled pr-open. Row carries a member
+    # bead id so enter/p/preview work unchanged.
+    br list --all --json 2>/dev/null | jq -r '
+      [.issues[]? | select((.labels//[]) | any(startswith("pr:")))]
+      | group_by([.labels[] | select(startswith("pr:"))][0]) | .[]
+      | select(all(.[]; .status=="closed") and (any(.[]; (.labels//[])|index("pr-open")) | not))
+      | [([.[0].labels[] | select(startswith("pr:"))][0]), .[-1].id, length] | @tsv' \
+    | while IFS=$'\t' read -r prlabel mid n; do
+        slug="${prlabel#pr:}"
+        git -C "$REPO" rev-parse --verify "$PR_BRANCH_PREFIX/$slug" >/dev/null 2>&1 || continue
+        printf '%s\t%s\t%s\n' "$mid" "${GRN}🚢 group ready (p:PR)${NC}" "$PR_BRANCH_PREFIX/$slug — $n bead(s) integrated, PR not opened"
+      done
     # swarm-claimed work: phase from label + whether an agent process is live for it
     echo "$ipj" | jq -r '.issues[]? | select((.assignee//"")|startswith("swarm-")) | [.id, (((.labels//[])|join(","))|if .=="" then "none" else . end), .title] | @tsv' \
     | while IFS=$'\t' read -r id labels title; do
@@ -99,14 +113,34 @@ _close()  { local id="$1"; [ -z "$id" ] && return; printf '\nClose %s? [y/N] ' "
 
 _pr() {  # $1 = id — push the branch and open a DRAFT PR (never a local merge into main)
   local id="$1"; [ -z "$id" ] && return
-  # PR-group aware: a bead labelled pr:<slug> ships as part of the shared pr/<slug> branch (all the
-  # group's beads, in dep order). No pr: label -> the per-bead branch (its own 1-bead PR, unchanged).
+  # PR-group aware: a bead labelled pr:<slug> ships as part of the shared $PR_BRANCH_PREFIX/<slug>
+  # branch (all the group's beads, in dep order). No pr: label -> the per-bead branch (its own
+  # 1-bead PR, unchanged).
+  # --all: group members are closed by the time the group ships (integrate closes them), and a
+  # plain `br list --id` returns nothing for closed beads — the lookup must see them.
   local branch slug
-  slug="$(br list --id "$id" --json 2>/dev/null | jq -r '.issues[0].labels // [] | map(select(startswith("pr:"))) | .[0] // empty' | sed 's/^pr://')"
-  if [ -n "$slug" ] && git -C "$REPO" rev-parse --verify "pr/$slug" >/dev/null 2>&1; then branch="pr/$slug"; else branch="u/tfriedman/iar-$id"; fi
+  slug="$(br list --all --id "$id" --json 2>/dev/null | jq -r '.issues[0].labels // [] | map(select(startswith("pr:"))) | .[0] // empty' | sed 's/^pr://')"
+  if [ -n "$slug" ] && git -C "$REPO" rev-parse --verify "$PR_BRANCH_PREFIX/$slug" >/dev/null 2>&1; then branch="$PR_BRANCH_PREFIX/$slug"; else branch="u/tfriedman/iar-$id"; fi
   if ! git -C "$REPO" rev-parse --verify "$branch" >/dev/null 2>&1; then echo "no branch $branch"; sleep 2; return; fi
-  local title; title="$(br list --id "$id" --json 2>/dev/null | jq -r ".issues[0].title // \"iar-$id\"")"
-  printf '\nOpen a DRAFT PR for %s\n  branch: %s → main\n  title:  %s\nProceed? [y/N] ' "$id" "$branch" "$title"; read -r yn
+  local title; title="$(br list --all --id "$id" --json 2>/dev/null | jq -r ".issues[0].title // \"iar-$id\"")"
+  # PR base is known information: stacked groups branch off another group's integration branch, so
+  # the base is the DEEPEST other $PR_BRANCH_PREFIX/* branch that is an ancestor of this tip
+  # (fewest commits left between them). No such ancestor -> main, same as before.
+  # main is scored too (not just a fallback) so an empty just-cut group branch parked at an old
+  # main commit can never beat it — a group base must strictly reduce the commits left in the PR.
+  local base="main" best cand n
+  best="$(git -C "$REPO" rev-list --count "main..$branch" 2>/dev/null || echo 999999)"
+  for cand in $(git -C "$REPO" for-each-ref --format='%(refname:short)' "refs/heads/$PR_BRANCH_PREFIX/*"); do
+    [ "$cand" = "$branch" ] && continue
+    git -C "$REPO" merge-base --is-ancestor "$cand" "$branch" 2>/dev/null || continue
+    git -C "$REPO" merge-base --is-ancestor "$branch" "$cand" 2>/dev/null && continue  # same tip
+    n="$(git -C "$REPO" rev-list --count "$cand..$branch" 2>/dev/null)" || continue
+    [ "$n" -lt "$best" ] && { best="$n"; base="$cand"; }
+  done
+  if [ "$base" != "main" ] && ! git -C "$REPO" ls-remote --exit-code origin "refs/heads/$base" >/dev/null 2>&1; then
+    echo "base $base isn't on origin yet — ship that group first (press p on it), then retry $id"; sleep 3; return
+  fi
+  printf '\nOpen a DRAFT PR for %s\n  branch: %s → %s\n  title:  %s\nProceed? [y/N] ' "$id" "$branch" "$base" "$title"; read -r yn
   case "$yn" in [yY]*) : ;; *) echo "cancelled"; sleep 1; return ;; esac
   echo "→ pushing $branch …"
   local push_out push_rc
@@ -114,30 +148,38 @@ _pr() {  # $1 = id — push the branch and open a DRAFT PR (never a local merge 
   echo "$push_out" | tail -2
   [ "$push_rc" -ne 0 ] && { echo "✗ push failed"; sleep 3; return; }
   local body url
-  body="Implements ${title}. Opened as a draft by the IAR swarm after cross-model review; see bead ${id} for acceptance criteria and the review thread.
-
-Beads: ${id}"
-  url="$(cd "$REPO" && gh pr create --draft --base main --head "$branch" --title "$title" --body "$body" 2>&1 | tail -1)"
+  body="Implements ${title}. Opened as a draft by the IAR swarm after cross-model review; see bead ${id} for acceptance criteria and the review thread."
+  url="$(cd "$REPO" && gh pr create --draft --base "$base" --head "$branch" --title "$title" --body "$body" 2>&1 | tail -1)"
   case "$url" in
-    https://*) br comments add "$id" -m "Draft PR opened: $url" >/dev/null 2>&1
-               br update "$id" --add-label pr-open --remove-label iar:approved >/dev/null 2>&1
-               echo "✓ draft PR: $url" ;;
+    https://*)
+      # Label every group member (not just the row's bead) so the completed-group row clears.
+      local members m
+      if [ -n "$slug" ]; then
+        members="$(br list --all --json 2>/dev/null | jq -r --arg L "pr:$slug" '.issues[] | select((.labels//[])|index($L)) | .id')"
+      else
+        members="$id"
+      fi
+      for m in $members; do
+        br comments add "$m" -m "Draft PR opened: $url" >/dev/null 2>&1
+        br update "$m" --add-label pr-open --remove-label iar:approved >/dev/null 2>&1
+      done
+      echo "✓ draft PR: $url" ;;
     *)         echo "✗ gh pr create: $url" ;;
   esac
   sleep 3
 }
 
 _done() {  # $1 = id — post-merge tidy. A pr:<slug> bead cleans the WHOLE group (every member's iar
-           # worktree/branch + the pr/<slug> branch and its integration worktree); else the one bead.
+           # worktree/branch + the group's integration branch and its worktree); else the one bead.
   local id="$1"; [ -z "$id" ] && return
   local slug
-  slug="$(br list --id "$id" --json 2>/dev/null | jq -r '.issues[0].labels // [] | map(select(startswith("pr:"))) | .[0] // empty' | sed 's/^pr://')"
+  slug="$(br list --all --id "$id" --json 2>/dev/null | jq -r '.issues[0].labels // [] | map(select(startswith("pr:"))) | .[0] // empty' | sed 's/^pr://')"
   if [ -n "$slug" ]; then
     # --all so already-closed members (they close on integrate) are still found.
     local members m count
     members="$(br list --all --json 2>/dev/null | jq -r --arg L "pr:$slug" '.issues[] | select((.labels//[])|index($L)) | .id')"
     count="$(printf '%s\n' "$members" | grep -c .)"
-    printf '\nDone with PR-group %s (%s beads)? → close all + remove their worktrees/branches + delete pr/%s and its worktree  [y/N] ' "$slug" "$count" "$slug"; read -r yn
+    printf '\nDone with PR-group %s (%s beads)? → close all + remove their worktrees/branches + delete %s/%s and its worktree  [y/N] ' "$slug" "$count" "$PR_BRANCH_PREFIX" "$slug"; read -r yn
     case "$yn" in [yY]*) : ;; *) echo "cancelled"; sleep 1; return ;; esac
     for m in $members; do
       br close "$m" --reason "PR-group $slug merged via swarm" >/dev/null 2>&1
@@ -147,9 +189,9 @@ _done() {  # $1 = id — post-merge tidy. A pr:<slug> bead cleans the WHOLE grou
     done
     local pwt="$REPO/.claude/worktrees/pr-$slug"
     [ -d "$pwt" ] && git -C "$REPO" worktree remove --force "$pwt" >/dev/null 2>&1
-    git -C "$REPO" branch -D "pr/$slug" >/dev/null 2>&1
+    git -C "$REPO" branch -D "$PR_BRANCH_PREFIX/$slug" >/dev/null 2>&1
     rmdir "$LOG_DIR/pr-$slug.lock" 2>/dev/null   # stale integrate lock, if any
-    echo "✓ PR-group $slug: $count beads closed, worktrees + member branches removed, pr/$slug deleted"; sleep 2
+    echo "✓ PR-group $slug: $count beads closed, worktrees + member branches removed, $PR_BRANCH_PREFIX/$slug deleted"; sleep 2
     return
   fi
   local branch="u/tfriedman/iar-$id" wt="$REPO/.claude/worktrees/iar-$id"
@@ -193,8 +235,11 @@ _chat() {  # $1 = id — open a live Fable session on a hard/structural bead in 
     # herdr agent names are 1-32 chars of [a-z0-9_-]; bead ids run longer and can contain '.',
     # so 'fable-<id>' is rejected (invalid_agent_name) and the agent silently never starts. Sanitize
     # and keep the distinctive tail so sub-beads (…-04w.3 vs …-04w.5) stay distinct.
+    # NB: ${sid: -26} is EMPTY in bash when the id is shorter than 26 chars — every short bead
+    # would collide on the name 'fable-' and die with agent_name_taken. Trim only when needed.
     local sid; sid="$(printf '%s' "$id" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9_-' '-')"
-    local aname="fable-${sid: -26}"
+    [ "${#sid}" -gt 26 ] && sid="${sid: -26}"
+    local aname="fable-$sid"
     local pane
     pane="$(herdr tab create --cwd "$wt" --label "fable-$id" --focus 2>/dev/null | jq -r '.result.root_pane.pane_id // empty')"
     # herdr returns the pane_id before its shell reaches an interactive prompt; agent start against a
@@ -267,7 +312,14 @@ _tui() {
 case "${1:-tui}" in
   tui|"")   _tui ;;
   status)   exec swarm-status.sh ;;
-  on)       shift; exec swarm-supervisor.sh "$@" ;;
+  on)       shift
+            # single-instance guard: the TUI 's' toggle pkills first, but a bare `swarm on` used to
+            # happily start a second poller alongside a running one (two supervisors racing beads).
+            if pgrep -f "swarm-supervisor.sh" >/dev/null 2>&1; then
+              echo "poller already running (pid $(pgrep -f swarm-supervisor.sh | head -1)) — stop it first: TUI 's' toggle, or pkill -f swarm-supervisor.sh" >&2
+              exit 1
+            fi
+            exec swarm-supervisor.sh "$@" ;;
   add)      shift; br create "$1" ${2:+--acceptance-criteria "$2"} -p "${3:-2}" --json 2>/dev/null | jq -r '.id // .issue.id' ;;
   answer)   shift; id="$1"; shift || true; [ $# -gt 0 ] && br update "$id" --notes "$*" >/dev/null 2>&1; br update "$id" --remove-label needs-human >/dev/null 2>&1; echo "resumed $id" ;;
   chat)     shift; _chat "$1" ;;

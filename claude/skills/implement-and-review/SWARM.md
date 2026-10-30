@@ -58,7 +58,7 @@ flowchart TD
   acceptance criteria, implements the smallest complete solution, runs tests via
   `iar-run-tests.sh`, commits to the branch, posts a `REVIEW REQUEST` comment on
   the bead (for your record), and sets `iar:awaiting-review`.
-- **Reviewer** — `codex exec -m gpt-5.6-sol -s read-only`, cross-model. The
+- **Reviewer** — `codex exec -m gpt-6-sol -s read-only`, cross-model. The
   read-only sandbox blocks the file locks `br` and CASS need, so the **supervisor**
   captures the acceptance criteria into a file and the reviewer judges the
   `git diff base..HEAD` + files only. It ends with `VERDICT: APPROVED` or

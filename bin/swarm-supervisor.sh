@@ -34,13 +34,27 @@ set -euo pipefail
 export BEADS_DIR="${BEADS_DIR:-/Users/tal/.local/share/beads/precog/.beads}"
 REPO="${REPO:-/Users/tal/Documents/precog}"
 MAIN="${MAIN:-main}"                        # trunk that PR branches (and standalone beads) branch off of
-MAX_INFLIGHT="${MAX_INFLIGHT:-3}"          # cap concurrently-owned beads
-POLL_SECS="${POLL_SECS:-60}"
+MAX_INFLIGHT="${MAX_INFLIGHT:-5}"          # cap concurrently-owned beads
+POLL_SECS="${POLL_SECS:-15}"               # each phase change waits up to one poll; a tick is only a few br calls
 LOG_DIR="${LOG_DIR:-/tmp/swarm-logs}"
-ACTOR="${ACTOR:-swarm-$(hostname -s)}"     # claim identity — STABLE per host (no $$), so a restarted poller reclaims its own in-flight beads instead of orphaning them. Single poller per host (the `swarm` toggle enforces one); set ACTOR explicitly to run more.
+ACTOR="${ACTOR:-swarm-precog}"             # claim identity — pinned, NOT hostname-derived: EC2 private IPs (hence `hostname -s`) roll on stop/start, which would mint a new actor and orphan in-flight claims. A fixed name means a restarted poller reclaims its own beads. One poller per DB (the `swarm` toggle enforces one); set ACTOR explicitly to run more.
+PR_BRANCH_PREFIX="${PR_BRANCH_PREFIX:-u/tfriedman/pr}"  # PR-group integration branches; u/<user>/ prefix per repo convention so they never collide with anyone else's branches
 PHASE_CAP="${PHASE_CAP:-2}"                # max spawn attempts in one phase before needs-human
 FIX_CAP="${FIX_CAP:-2}"                    # max review->changes cycles before needs-human
+PHASE_TIMEOUT="${PHASE_TIMEOUT:-5400}"     # seconds a phase process may run before it is killed; the retry then counts against PHASE_CAP
 DRY_RUN="${DRY_RUN:-0}"
+
+# Single-instance guard: two pollers race the same beads and double-spawn workers (fixer A and
+# fixer B both writing one worktree). `swarm on` and the TUI toggle check this too, but a bare
+# `nohup swarm-supervisor.sh &` bypasses both — enforce it here. DRY_RUN passes through: a dry
+# tick mutates nothing and is the self-check path.
+if [ "$DRY_RUN" != 1 ]; then
+  _others="$(pgrep -f 'swarm-supervisor\.sh' | grep -vw "$$" || true)"
+  if [ -n "$_others" ]; then
+    echo "swarm-supervisor: another poller is already running (pid $(printf '%s\n' $_others | head -1)); refusing to start a second one" >&2
+    exit 1
+  fi
+fi
 mkdir -p "$LOG_DIR"
 
 # ---- tiny state helpers (throwaway counters under $LOG_DIR, keyed by bead) -------------------
@@ -50,11 +64,20 @@ over_cap() { [ "$(val "$1")" -gt "$2" ]; }   # fix-cycles: allow N cycles, escal
 maxed()    { [ "$(val "$1")" -ge "$2" ]; }   # attempts: escalate once N failed tries reached
 
 inflight()   { br list --assignee "$ACTOR" --status in_progress --json 2>/dev/null | jq '.issues | length'; }
-proc_alive() { pgrep -f "iar-worker:$1" >/dev/null 2>&1; }   # any phase process for this bead
+proc_alive() { pgrep -f "iar-worker:$1|iar-review\.sh $1 " >/dev/null 2>&1; }   # any phase process for this bead
+# no_swarm: a bead the swarm must never implement — either explicitly labelled `no-swarm` (by
+# spec-to-beads) or any wayfinder:<phase> map bead (design/grilling/research/prototype decisions
+# owned by the human; an unassigned wayfinder bead was claimed the moment its blocker closed —
+# assignment must not be the only guard on a map).
+# Read LIVE from `br list --id` (not `br scheduler`'s snapshot, whose labels can lag a just-applied
+# label) so it's authoritative at both claim time and advance time — labelling an in-flight bead
+# `no-swarm` cleanly ejects it from the pipeline.
+no_swarm()   { br list --id "$1" --json 2>/dev/null | jq -e '.issues[0].labels // [] | any(.[]; . == "no-swarm" or startswith("wayfinder:"))' >/dev/null 2>&1; }
 
 # ---- PR-group helpers: a bead labelled pr:<slug> bases off the PR branch, not main ---------------
 # A PR-group is the integration unit — one or more beads that ship as one PR — carried as a `pr:<slug>`
 # label (orthogonal to epics, which are parent-child organization and do NOT drive integration).
+# The integration branch is $PR_BRANCH_PREFIX/<slug> (i.e. u/tfriedman/pr/<slug>).
 # prgroup_of: the pr:<slug> a bead belongs to, or '' (a bead with no pr: label is its own 1-bead PR,
 # branched off main, terminal for a human PR — i.e. exactly the old behavior).
 prgroup_of() { br list --id "$1" --json 2>/dev/null | jq -r '.issues[0].labels // [] | map(select(startswith("pr:"))) | .[0] // empty' | sed 's/^pr://'; }
@@ -63,7 +86,7 @@ prgroup_of() { br list --id "$1" --json 2>/dev/null | jq -r '.issues[0].labels /
 prgroup_base() {
   local slug="$1" pb
   [ -z "$slug" ] && { git -C "$REPO" rev-parse HEAD; return 0; }
-  pb="pr/$slug"
+  pb="$PR_BRANCH_PREFIX/$slug"
   if git -C "$REPO" show-ref --verify -q "refs/heads/$pb"; then
     git -C "$REPO" rev-parse "$pb"
   else
@@ -95,7 +118,7 @@ load_worktree() {
     return 0   # explicit: a bare `return` here would propagate the `&&` test's exit 1 and set -e would kill the caller
   fi
   BASE=$(prgroup_base "$PRG")                    # PR-group members cut from the PR branch HEAD (sees merged siblings); standalone from main
-  [ "$DRY_RUN" = 1 ] && { echo "  DRY: $id base=${PRG:+pr/$PRG @ }$BASE"; return 0; }
+  [ "$DRY_RUN" = 1 ] && { echo "  DRY: $id base=${PRG:+$PR_BRANCH_PREFIX/$PRG @ }$BASE"; return 0; }
   git -C "$REPO" worktree add -b "$branch" "$WT" "$BASE" >/dev/null 2>&1 \
     || git -C "$REPO" worktree add "$WT" "$branch" >/dev/null 2>&1   # branch may already exist
   echo "$BASE" > "$basef"
@@ -116,41 +139,23 @@ escalate_stuck() {  # $1 bead  $2 why
 spawn_impl() {  # $1 bead  $2 role(implement|fix)
   local id="$1" role="${2:-implement}"; load_worktree "$id"
   if [ "$DRY_RUN" = 1 ]; then echo "  DRY: would spawn ${role} for $id in $WT"; return; fi
+  date +%s > "$LOG_DIR/started-$id"
   local extra=""
   [ "$role" = fix ] && extra="You are FIXING a prior review. First read the reviewer's findings in $LOG_DIR/review-$id.log (and 'br comments $id' for the recorded verdict), then address only actionable findings. "
-  ( cd "$WT" && claude -p "You are the IMPLEMENTER for bead $id (iar-worker:$id). ${extra}Work ONLY inside this worktree ($WT); never edit anything outside it. Read the bead ('br show $id'), its acceptance criteria, repo instructions, and relevant CASS. Implement the smallest complete solution. Run tests only with: iar-run-tests.sh $WT <pytest-args> (never bazel, never bare pytest). Commit all task changes to the current branch. Then record a review-request note on the bead: WRITE a file /tmp/iar-review-$id.txt containing base SHA $BASE, the head SHA, the acceptance criteria, a concise change summary, the exact checks you ran and their results, and any known risks; then run: br comments add $id --actor $ACTOR -f /tmp/iar-review-$id.txt . (Write the file with your editor — do NOT pack this prose into a shell -m argument, quoting will bite you.) Finally run EXACTLY: br update $id --add-label iar:awaiting-review --remove-label iar:changes-requested --actor $ACTOR . Do not set other labels; do not close the bead; then stop. If you are blocked or need a human decision, record it on the bead: WRITE a file /tmp/iar-esc-$id.txt whose first line is 'ESCALATION — <your exact question and what input you need>', then a line 'To decide+resume: br update $id --notes \"<decision>\" then br update $id --remove-label needs-human', then a line 'To resolve directly: br close $id'; then run: br comments add $id --actor $ACTOR -f /tmp/iar-esc-$id.txt . (Write the file with your editor — do NOT pack prose into -m.) Then run: br update $id --add-label needs-human --actor $ACTOR (leave it in_progress — do NOT release the claim). If the block is STRUCTURAL or needs a rethink rather than a quick factual decision, ALSO run: br update $id --add-label needs-fable --actor $ACTOR (this flags it so the human can open a fresh Fable session on it). Then stop." \
+  ( cd "$WT" && claude -p "You are the IMPLEMENTER for bead $id (iar-worker:$id). ${extra}Work ONLY inside this worktree ($WT); never edit anything outside it. Read the bead ('br show $id'), its acceptance criteria, repo instructions, and relevant CASS. Implement the smallest complete solution. Run tests only with: iar-run-tests.sh $WT <pytest-args> (never bazel, never bare pytest). Commit all task changes to the current branch. Then record a review-request note on the bead: WRITE a file /tmp/iar-review-$id.txt containing base SHA $BASE, the head SHA, the acceptance criteria, a concise change summary, the exact checks you ran and their results, and any known risks; then run: br comments add $id --actor $ACTOR -f /tmp/iar-review-$id.txt . (Write the file with your editor — do NOT pack this prose into a shell -m argument, quoting will bite you.) Finally run EXACTLY: br update $id --add-label iar:awaiting-review --remove-label iar:changes-requested --actor $ACTOR . Do not set other labels; do not close the bead; then stop. If you are blocked or need a human decision, record it on the bead: WRITE a file /tmp/iar-esc-$id.txt whose first line is 'ESCALATION — <your exact question and what input you need>', then a line 'To decide+resume: br update $id --notes \"<decision>\" then br update $id --remove-label needs-human', then a line 'To resolve directly: br close $id'; then run: br comments add $id --actor $ACTOR -f /tmp/iar-esc-$id.txt . (Write the file with your editor — do NOT pack prose into -m.) Then run: br update $id --add-label needs-human --actor $ACTOR (leave it in_progress — do NOT release the claim). If the block is STRUCTURAL or needs a rethink rather than a quick factual decision, ALSO run: br update $id --add-label needs-fable --actor $ACTOR (this flags it so the human can open a fresh Fable session on it). Then stop.
+
+$(cat "$HOME/dotfiles/iar/scope-self-review.md")" \
       --permission-mode bypassPermissions --add-dir "$WT" >"$LOG_DIR/impl-$id.log" 2>&1 ) &
 }
 
-# REVIEWER: read-only codex/Sol. The read-only sandbox blocks the file locks br + CASS need, so the
-# reviewer must NOT touch them — the supervisor (full access) captures the acceptance criteria and
-# injects them; the reviewer judges the git diff + files only. codex echoes the prompt (names both
-# verdicts) so we stamp the LAST verdict line; stdin is closed or codex hangs reading it; nohup
-# detaches the wrapper so a tick exiting can't orphan it; the marker keeps it matchable until the
-# label is stamped; the label write runs in the wrapper (outside the sandbox), so it can mutate beads.
+# REVIEWER: iar-review.sh (shared with the solo /next-bead flow) runs read-only codex and stamps the
+# verdict label + comment outside the sandbox. nohup detaches it so a tick exiting can't orphan it;
+# proc_alive matches its command line until the label is stamped.
 spawn_reviewer() {  # $1 bead
   local id="$1"; load_worktree "$id"
   if [ "$DRY_RUN" = 1 ]; then echo "  DRY: would spawn reviewer for $id ($BASE..HEAD in $WT)"; return; fi
-  local critf="$LOG_DIR/crit-$id.txt"; br show "$id" 2>/dev/null | tr -d '\r' > "$critf"
-  nohup bash -c '
-    id="$1"; wt="$2"; base="$3"; actor="$4"; rlog="$5"; critf="$6"
-    cd "$wt" || exit 1
-    codex exec -m gpt-5.6-sol -s read-only "You are the independent REVIEWER for bead $id (iar-worker:$id). Do NOT run br and do NOT search CASS (the read-only sandbox blocks their locks). Do NOT modify anything. Read the acceptance criteria with: cat $critf . Review ONLY the fixed range $base..HEAD: run git diff $base HEAD and read the changed files. You cannot run pytest under read-only; use non-writing checks (python3 -c import, ast.parse) and the implementer stated results. Judge against the criteria and repo standards (correctness, security, tests, maintainability, scope creep). List findings (file:line, impact, concrete fix), then print exactly one final line, choosing ONE of three verdicts: VERDICT: APPROVED  or  VERDICT: CHANGES REQUESTED  or  VERDICT: NEEDS HUMAN . Use NEEDS HUMAN when the remaining gap CANNOT be closed by an automated headless implementer for a valid structural reason — it requires credentials, VPN, real hardware, a cluster/live run, or a human decision the sandbox cannot provide — so more fix cycles would only re-hit the same dead end; in that case make your findings state exactly what human action is required. Prefer NEEDS HUMAN over CHANGES REQUESTED whenever the fix is a human-only action rather than a code change the implementer could make." < /dev/null > "$rlog" 2>&1 || true
-    # Take the LAST verdict line: codex echoes the prompt (which names every verdict), so the
-    # real answer is always the final match. stdin closed above or codex hangs reading it.
-    v=$(grep -oE "VERDICT: (APPROVED|CHANGES REQUESTED|NEEDS HUMAN)" "$rlog" | tail -1)
-    if [ "$v" = "VERDICT: APPROVED" ]; then
-      br update "$id" --add-label iar:approved --remove-label iar:awaiting-review --actor "$actor" >/dev/null 2>&1 || true
-    elif [ "$v" = "VERDICT: CHANGES REQUESTED" ]; then
-      br update "$id" --add-label iar:changes-requested --remove-label iar:awaiting-review --actor "$actor" >/dev/null 2>&1 || true
-    elif [ "$v" = "VERDICT: NEEDS HUMAN" ]; then
-      # reviewer judged the block human-only: escalate straight to the hold state, skip the fix loop.
-      br update "$id" --add-label needs-human --remove-label iar:awaiting-review --actor "$actor" >/dev/null 2>&1 || true
-    fi
-    # Record the verdict on the bead (durable human/fixer-readable provenance; replaces the old mail).
-    [ -n "$v" ] && br comments add "$id" --actor "reviewer:sol" -m "$v (reviewer:sol) — full findings in $rlog" >/dev/null 2>&1 || true
-    : # iar-worker:'"$id"' — marker: keep wrapper matchable until label stamped
-  ' _ "$id" "$WT" "$BASE" "$ACTOR" "$LOG_DIR/review-$id.log" "$critf" >"$LOG_DIR/revwrap-$id.log" 2>&1 &
+  date +%s > "$LOG_DIR/started-$id"
+  ACTOR="$ACTOR" LOG_DIR="$LOG_DIR" nohup iar-review.sh "$id" "$WT" "$BASE" >"$LOG_DIR/revwrap-$id.log" 2>&1 &
 }
 
 # INTEGRATE: an approved PR-group bead's done-condition is its code merged into the PR branch (the
@@ -161,7 +166,7 @@ spawn_reviewer() {  # $1 bead
 # ponytail: one mkdir-lock per PR-group serializes concurrent integrates; a real queue only if a
 # group ever gets wide enough to actually contend.
 integrate_bead() {  # $1 bead  $2 pr-slug
-  local id="$1" slug="$2" pb="pr/$2" bb="u/tfriedman/iar-$1"
+  local id="$1" slug="$2" pb="$PR_BRANCH_PREFIX/$2" bb="u/tfriedman/iar-$1"
   local pwt="$REPO/.claude/worktrees/pr-$2" lock="$LOG_DIR/pr-$2.lock"
   local tries=0
   while ! mkdir "$lock" 2>/dev/null; do tries=$((tries+1)); [ "$tries" -gt 120 ] && { echo "[$(date +%T)] $id integrate: lock busy, retry next tick"; return 0; }; sleep 1; done
@@ -182,7 +187,17 @@ integrate_bead() {  # $1 bead  $2 pr-slug
 # Advance ONE owned bead by at most one phase step. Never acts while a worker for it is alive.
 advance() {  # $1 bead
   local id="$1" cur; cur=$(phase_of "$id")
-  proc_alive "$id" && { [ "$DRY_RUN" = 1 ] && echo "  $id: phase=$cur (worker running)"; return 0; }
+  if proc_alive "$id"; then
+    [ "$DRY_RUN" = 1 ] && echo "  $id: phase=$cur (worker running)"
+    # A finished `claude -p` can fail to exit and hold the bead forever. Kill it once over the
+    # limit; the next tick respawns the same phase, so PHASE_CAP still bounds retries.
+    local sf="$LOG_DIR/started-$id"
+    if [ "$DRY_RUN" != 1 ] && [ -f "$sf" ] && [ $(( $(date +%s) - $(val "$sf") )) -gt "$PHASE_TIMEOUT" ]; then
+      echo "[$(date +%T)] $id $cur worker over ${PHASE_TIMEOUT}s -> killed"
+      pkill -f "iar-worker:$id|iar-review\.sh $id " || true
+    fi
+    return 0
+  fi
 
   if [ "$DRY_RUN" = 1 ]; then echo "  $id: phase=$cur -> would spawn/advance"; return 0; fi
 
@@ -214,13 +229,21 @@ advance() {  # $1 bead
 tick() {
   # 1. Advance every bead this supervisor already owns.
   br list --assignee "$ACTOR" --status in_progress --json 2>/dev/null | jq -r '.issues[].id' \
-  | while IFS= read -r id; do [ -n "$id" ] && advance "$id"; done
+  | while IFS= read -r id; do
+      [ -z "$id" ] && continue
+      if no_swarm "$id"; then echo "[$(date +%T)] skip owned $id (no-swarm/wayfinder) — release with: br update $id --assignee \"\" -s open"; continue; fi
+      advance "$id"
+    done
 
   # 2. Claim new ready work up to the cap, then let advance() kick off its implement phase.
   br scheduler --format json 2>/dev/null \
-    | jq -r '.recommendations[] | select(.evidence.stale_claim.classification=="unassigned") | .issue.id' \
+    | jq -r '.recommendations[] | select(.evidence.stale_claim.classification=="unassigned") | select(.issue.issue_type=="task") | select((.issue.labels // []) | any(.[]; . == "no-swarm" or startswith("wayfinder:")) | not) | .issue.id' \
   | while IFS= read -r id; do
       [ -z "$id" ] && continue
+      # Authoritative no-swarm gate: the jq filter above reads `br scheduler`'s coordination snapshot,
+      # whose labels can lag a just-applied `--add-label no-swarm`. Re-check LIVE so a design/non-code
+      # bead is never claimed on stale snapshot data.
+      if no_swarm "$id"; then echo "[$(date +%T)] skip $id (no-swarm/wayfinder)"; continue; fi
       if [ "$(inflight)" -ge "$MAX_INFLIGHT" ]; then echo "[$(date +%T)] at capacity ($MAX_INFLIGHT), holding"; break; fi
       if [ "$DRY_RUN" = 1 ]; then echo "  DRY: would claim $id -> implement"; continue; fi
       if br update "$id" --claim --actor "$ACTOR" >/dev/null 2>&1 \

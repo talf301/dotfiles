@@ -42,6 +42,35 @@ if [ "$(readlink "$_claude" 2>/dev/null)" != "$HOME/.agents/skills/implement-and
   fi
 else echo "ok    $_claude"; fi
 
+# --- session board: launchd writes ~/…/vault/board.md every minute (load: launchctl bootstrap gui/$UID <plist>) ---
+link "iar/local.session-board.plist" "$HOME/Library/LaunchAgents/local.session-board.plist"
+
+# --- ClaudeGo.app: opens claudego://<sessionId> links from board.md via iar/go.sh ---
+if [ $DRY = 1 ]; then echo "BUILD ~/Applications/ClaudeGo.app"
+else
+  osacompile -o "$HOME/Applications/ClaudeGo.app" "$REPO/iar/ClaudeGo.applescript"
+  plutil -replace CFBundleIdentifier -string local.claudego "$HOME/Applications/ClaudeGo.app/Contents/Info.plist"
+  plutil -replace LSBackgroundOnly -bool true "$HOME/Applications/ClaudeGo.app/Contents/Info.plist"
+  plutil -replace CFBundleURLTypes -json '[{"CFBundleURLName":"claudego","CFBundleURLSchemes":["claudego"]}]' "$HOME/Applications/ClaudeGo.app/Contents/Info.plist"
+  codesign -f -s - "$HOME/Applications/ClaudeGo.app"
+  /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$HOME/Applications/ClaudeGo.app"
+  echo "BUILD ~/Applications/ClaudeGo.app"
+fi
+
+# --- BoardRefresh.app: launchd's every-minute board.md refresh (an app bundle may write into iCloud Drive) ---
+if [ $DRY = 1 ]; then echo "BUILD ~/Applications/BoardRefresh.app"
+else
+  _br="$HOME/Applications/BoardRefresh.app/Contents"
+  mkdir -p "$_br/MacOS" && clang -O2 -o "$_br/MacOS/board-refresh" "$REPO/iar/board-refresh.c"
+  [ -f "$_br/Info.plist" ] || plutil -create xml1 "$_br/Info.plist"
+  for kv in CFBundleIdentifier=local.boardrefresh CFBundleExecutable=board-refresh CFBundleName=BoardRefresh CFBundlePackageType=APPL; do
+    plutil -replace "${kv%%=*}" -string "${kv#*=}" "$_br/Info.plist"
+  done
+  plutil -replace LSBackgroundOnly -bool true "$_br/Info.plist"
+  codesign -f -s - "$HOME/Applications/BoardRefresh.app"
+  echo "BUILD ~/Applications/BoardRefresh.app"
+fi
+
 # --- macOS UI configs (these tools don't read nikud's XDG_CONFIG_HOME) ---
 link "sketchybar"     "$HOME/.config/sketchybar"
 link ".aerospace.toml" "$HOME/.aerospace.toml"

@@ -4,6 +4,7 @@ return {
     "coder/claudecode.nvim",
     dependencies = { "folke/snacks.nvim" }, -- LazyVim already includes snacks
     config = true,
+    cmd = { "ClaudeCode", "ClaudeCodeStart", "ClaudeCodeStatus", "ClaudeCodeSend", "ClaudeCodeAdd", "ClaudeCodeFocus" },
     keys = {
       { "<leader>a", nil, desc = "AI/Claude Code" },
       { "<leader>ac", "<cmd>ClaudeCode<cr>", desc = "Toggle Claude" },

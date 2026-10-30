@@ -22,15 +22,17 @@ if [[ -x "$QUOTA_AXI_BIN" ]]; then
     export PATH="$QUOTA_AXI_DIR:$PATH"
 fi
 
-USED="?"
+REMAINING="?"
 if [[ -x "$QUOTA_AXI_BIN" ]]; then
     QUOTA_JSON="$($QUOTA_AXI_BIN --provider "$PROVIDER" --json 2>/dev/null)"
-    PARSED_USED="$(jq -r '
-        .providers[0].windows[]?
+    PARSED_REMAINING="$(jq -r '
+        .providers[0]
+        | select(.state.stale != true)
+        | .windows[]?
         | select(.kind == "weekly" or .id == "seven_day")
-        | .percentUsed
+        | (.percentUsed // (100 - .percentRemaining)) | round
     ' <<< "$QUOTA_JSON" 2>/dev/null | head -1)"
-    [[ "$PARSED_USED" == <-> ]] && USED="$PARSED_USED"
+    [[ "$PARSED_REMAINING" == <-> ]] && REMAINING="$PARSED_REMAINING"
 fi
 
-sketchybar --set "$NAME" label="${USED}%"
+sketchybar --set "$NAME" label="${REMAINING}%"

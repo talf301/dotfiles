@@ -1,0 +1,3 @@
+#!/bin/sh
+# Shell entry point for iar/ledger.py (the only code that calls br). See ledger.py for usage.
+exec python3 "$(dirname "$0")/ledger.py" "$@"

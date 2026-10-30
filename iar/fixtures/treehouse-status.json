@@ -1,0 +1,127 @@
+[
+  {
+    "name": "1",
+    "path": "/Users/tal/.treehouse/precog-28077b/1/precog",
+    "status": "leased",
+    "flavor": "git",
+    "lease_id": "6d95f4ae952fd4f0e7367760e25f167a",
+    "lease_holder": "agent:dispatch-bead:precog-ug28.1",
+    "leased_at": "2026-10-30T12:49:27.16258-07:00",
+    "processes": [
+      {
+        "pid": 30373,
+        "name": "2.1.314"
+      }
+    ]
+  },
+  {
+    "name": "2",
+    "path": "/Users/tal/.treehouse/precog-28077b/2/precog",
+    "status": "available",
+    "flavor": "git",
+    "lease_id": "",
+    "lease_holder": "",
+    "leased_at": null,
+    "processes": []
+  },
+  {
+    "name": "3",
+    "path": "/Users/tal/.treehouse/precog-28077b/3/precog",
+    "status": "available",
+    "flavor": "git",
+    "lease_id": "",
+    "lease_holder": "",
+    "leased_at": null,
+    "processes": []
+  },
+  {
+    "name": "4",
+    "path": "/Users/tal/.treehouse/precog-28077b/4/precog",
+    "status": "leased",
+    "flavor": "git",
+    "lease_id": "488413e4a44b0ed30c50b82df472962d",
+    "lease_holder": "agent:gnhf-refactor-run",
+    "leased_at": "2026-10-19T15:14:42.368519-07:00",
+    "processes": []
+  },
+  {
+    "name": "5",
+    "path": "/Users/tal/.treehouse/precog-28077b/5/precog",
+    "status": "available",
+    "flavor": "git",
+    "lease_id": "",
+    "lease_holder": "",
+    "leased_at": null,
+    "processes": []
+  },
+  {
+    "name": "6",
+    "path": "/Users/tal/.treehouse/precog-28077b/6/precog",
+    "status": "leased",
+    "flavor": "git",
+    "lease_id": "ff1124c5240dd078917e7640d45863cf",
+    "lease_holder": "agent:hydra-pyplan-stack",
+    "leased_at": "2026-10-27T21:29:53.127601-07:00",
+    "processes": []
+  },
+  {
+    "name": "7",
+    "path": "/Users/tal/.treehouse/precog-28077b/7/precog",
+    "status": "available",
+    "flavor": "git",
+    "lease_id": "",
+    "lease_holder": "",
+    "leased_at": null,
+    "processes": []
+  },
+  {
+    "name": "8",
+    "path": "/Users/tal/.treehouse/precog-28077b/8/precog",
+    "status": "leased",
+    "flavor": "git",
+    "lease_id": "6ac6ff0d2b178028a9fea5dddcbb3349",
+    "lease_holder": "agent:gnhf-benchmark-run",
+    "leased_at": "2026-10-19T22:17:48.091986-07:00",
+    "processes": []
+  },
+  {
+    "name": "9",
+    "path": "/Users/tal/.treehouse/precog-28077b/9/precog",
+    "status": "available",
+    "flavor": "git",
+    "lease_id": "",
+    "lease_holder": "",
+    "leased_at": null,
+    "processes": []
+  },
+  {
+    "name": "10",
+    "path": "/Users/tal/.treehouse/precog-28077b/10/precog",
+    "status": "available",
+    "flavor": "git",
+    "lease_id": "",
+    "lease_holder": "",
+    "leased_at": null,
+    "processes": []
+  },
+  {
+    "name": "11",
+    "path": "/Users/tal/.treehouse/precog-28077b/11/precog",
+    "status": "available",
+    "flavor": "git",
+    "lease_id": "",
+    "lease_holder": "",
+    "leased_at": null,
+    "processes": []
+  },
+  {
+    "name": "12",
+    "path": "/Users/tal/.treehouse/precog-28077b/12/precog",
+    "status": "leased",
+    "flavor": "git",
+    "lease_id": "86d5f7a1f250d5118ae0dd4ebe958446",
+    "lease_holder": "agent:dispatch-bead:precog-gywc",
+    "leased_at": "2026-10-19T22:19:28.511129-07:00",
+    "processes": []
+  }
+]

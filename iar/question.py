@@ -23,12 +23,16 @@ State labels on the question bead: `inbox:pending`, `answered`, `delivered` (set
 reconciler, W13), then the bead is closed (`moot` when the asking bead closed first).
 The tracker is reached only through ledger.py. The Inbox command is `plannotator inbox mcp`;
 IAR_INBOX_CMD overrides it (self-test). IAR_INBOX_PROJECT overrides the Inbox project.
+One lock file, $IAR_STATE_DIR/question.lock (default ~/.local/state/iar), serializes the
+find-or-create of `ask` and the read-and-write of `answer`.
 
   question.py --self-test   (scratch store and a fake Inbox)
 """
 
 import argparse
+import contextlib
 import datetime as dt
+import fcntl
 import json
 import os
 import re
@@ -36,6 +40,7 @@ import shlex
 import subprocess
 import sys
 import tempfile
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import ledger  # noqa: E402
@@ -57,6 +62,16 @@ def iso(t):
 
 def parse_time(s):
     return dt.datetime.fromisoformat(s.replace("Z", "+00:00")).astimezone(dt.timezone.utc)
+
+
+@contextlib.contextmanager
+def locked():
+    # ponytail: one global lock for all questions; per-question locks if it ever contends.
+    d = os.environ.get("IAR_STATE_DIR") or os.path.expanduser("~/.local/state/iar")
+    os.makedirs(d, exist_ok=True)
+    with open(os.path.join(d, "question.lock"), "a") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        yield
 
 
 def short(bead_id):
@@ -167,16 +182,17 @@ def ask(a):
 
     asking = ledger.show(a.asking)
     title = f"Q({short(a.asking)}): {a.question}"
-    q = find_open(a.asking, title)
-    if q is None:
-        f = {"question": a.question, "asking": a.asking, "session": a.session or "",
-             "blocks": a.blocks, "default": a.default, "reversible": a.reversible,
-             "gated": a.gated, "deadline": deadline, "inbox_thread": "pending"}
-        # inbox:pending from birth: a crash before the post still leaves the bead for the reconciler.
-        q = ledger.create(title, type="task", parent=a.asking,
-                          labels=["question", "no-swarm", "inbox:pending"],
-                          description=render_body(f, a.option, a.context or ""))
-        q["labels"] = ["question", "no-swarm", "inbox:pending"]
+    with locked():
+        q = find_open(a.asking, title)
+        if q is None:
+            f = {"question": a.question, "asking": a.asking, "session": a.session or "",
+                 "blocks": a.blocks, "default": a.default, "reversible": a.reversible,
+                 "gated": a.gated, "deadline": deadline, "inbox_thread": "pending"}
+            # inbox:pending from birth: a crash before the post leaves the bead for the reconciler.
+            q = ledger.create(title, type="task", parent=a.asking,
+                              labels=["question", "no-swarm", "inbox:pending"],
+                              description=render_body(f, a.option, a.context or ""))
+            q["labels"] = ["question", "no-swarm", "inbox:pending"]
     qid = q["id"]
     f = parse_body(q.get("description"))
     if f.get("blocks") == "yes":
@@ -198,19 +214,24 @@ def ask(a):
 
 # --- answer ---
 
+META = re.compile(r"\n-- at: (\S+) source: (\S+)\Z")  # last line of an answer comment
+
+
 def answers(q):
-    """`answer:` comments as dicts (text, at, source), oldest recorded time first."""
+    """`answer:` comments as dicts (text, at, source), oldest recorded time first.
+
+    Comment: `answer: <text, may span lines>` then a last line `-- at: <iso> source: <name>`."""
     out = []
     for c in q.get("comments") or []:
-        first, *rest = c["text"].splitlines()
-        if not first.startswith("answer: "):
+        body = c["text"]
+        if not body.startswith("answer: "):
             continue
-        meta = dict(line.split(": ", 1) for line in rest if ": " in line)
-        text = first[len("answer: "):]
-        if meta.get("source") == "timeout":
+        m = META.search(body)
+        text = body[len("answer: "):m.start() if m else None]
+        at, source = (m[1], m[2]) if m else (c["created_at"], "")
+        if source == "timeout":
             text = text.removesuffix(" (timeout)")
-        out.append({"text": text, "source": meta.get("source", ""),
-                    "at": parse_time(meta.get("at") or c["created_at"])})
+        out.append({"text": text, "source": source, "at": parse_time(at)})
     return sorted(out, key=lambda x: x["at"])
 
 
@@ -222,6 +243,13 @@ def effective_answer(q):
 
 def answer(qid, text, at=None, source="human", timeout=False):
     """Returns one of: answered, overrode-timeout, late, noop."""
+    if not re.fullmatch(r"\S+", source):
+        raise ValueError("--source is one word")
+    with locked():
+        return _answer(qid, text, at, source, timeout)
+
+
+def _answer(qid, text, at, source, timeout):
     q = ledger.show(qid)
     if "question" not in (q.get("labels") or []):
         raise ValueError(f"{qid} is not a question bead")
@@ -244,7 +272,7 @@ def answer(qid, text, at=None, source="human", timeout=False):
         at = parse_time(at) if at else t
     labels = set(q.get("labels") or [])
     choice = next((o for o in f["options"] if o.lower() == text.lower()), None)
-    meta = f"\nat: {iso(at)}\nsource: {source}"
+    meta = f"\n-- at: {iso(at)} source: {source}"
     if q["status"] == "closed" or "delivered" in labels:
         result = "late"
     elif not prior:
@@ -327,8 +355,9 @@ def self_test():
         return rc, out.getvalue().strip()
 
     with tempfile.TemporaryDirectory() as root:
-        saved = {k: os.environ.get(k) for k in ("BEADS_DIR", "IAR_INBOX_CMD")}
+        saved = {k: os.environ.get(k) for k in ("BEADS_DIR", "IAR_INBOX_CMD", "IAR_STATE_DIR")}
         os.environ["BEADS_DIR"] = os.path.join(root, ".beads")
+        os.environ["IAR_STATE_DIR"] = root
         log = os.path.join(root, "inbox.log")
         fake = os.path.join(root, "fake-inbox")
         with open(fake, "w") as fh:
@@ -372,8 +401,21 @@ def self_test():
             assert "answer-freetext" not in s["labels"]
             assert [c["text"].split("\n")[0] for c in s["comments"]] == \
                 ["answer: Drop", "late-answer: Keep"], s["comments"]
-            assert run(main_answer, [q2, "something else"]) == (0, "answered")
-            assert "answer-freetext" in ledger.show(q2)["labels"]
+            free = "something else\nsource: timeout\n-- not meta"
+            assert run(main_answer, [q2, free]) == (0, "answered")
+            s = ledger.show(q2)
+            assert "answer-freetext" in s["labels"]
+            assert effective_answer(s)["text"] == free and answers(s)[0]["source"] == "human", s
+
+            # The read-and-write of an answer waits for the lock, so two answers cannot both win.
+            rc, qc = run(main_ask, [a2, "Race?", "--blocks", "no", *base])
+            with locked():
+                p = subprocess.Popen([sys.executable, os.path.abspath(__file__), "answer", qc,
+                                      "Keep"], stdout=subprocess.PIPE, text=True)
+                time.sleep(2)
+                assert p.poll() is None and answers(ledger.show(qc)) == []
+            assert p.communicate(timeout=30)[0].strip() == "answered"
+            assert run(main_answer, [qc, "Drop"]) == (0, "late")
 
             # Timeout: refused before the deadline and when gated; applies the default once;
             # a human answer recorded before the timeout write wins over it.

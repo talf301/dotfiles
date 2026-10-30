@@ -21,8 +21,8 @@ IAR_STATE_DIR (lock dir, default ~/.local/state/iar).
 
 import argparse
 import datetime
+import decimal
 import fcntl
-import math
 import os
 import re
 import subprocess
@@ -54,13 +54,24 @@ def allowlist():
         raise BudgetError(f"cannot read compute allowlist: {e}")
 
 
-def _positive(name, value, kind):
+def _positive_int(name, value):
     try:
-        v = kind(value)
+        v = int(value)
     except ValueError:
         v = 0
-    if not (v > 0 and math.isfinite(v)):
-        raise BudgetError(f"{name}: must be a positive {kind.__name__}, got {value!r}")
+    if v <= 0:
+        raise BudgetError(f"{name}: must be a positive integer, got {value!r}")
+    return v
+
+
+def _hours(name, value):
+    """GPU-hours as an exact Decimal, so sums never round past a limit."""
+    try:
+        v = decimal.Decimal(str(value).strip())
+    except decimal.InvalidOperation:
+        v = None
+    if v is None or not v.is_finite() or v <= 0:
+        raise BudgetError(f"{name}: must be a positive finite number, got {value!r}")
     return v
 
 
@@ -93,8 +104,8 @@ def parse(description):
     if out["compute"] not in allowlist():
         raise BudgetError(f"compute {out['compute']!r} is not in the compute allowlist "
                           "(new compute needs a gated question)")
-    out["gpu_hours"] = _positive("gpu_hours", out["gpu_hours"], float)
-    out["max_runs"] = _positive("max_runs", out["max_runs"], int)
+    out["gpu_hours"] = _hours("gpu_hours", out["gpu_hours"])
+    out["max_runs"] = _positive_int("max_runs", out["max_runs"])
     try:  # Python 3.9 fromisoformat does not take "Z"
         until = datetime.datetime.fromisoformat(re.sub(r"Z$", "+00:00", out["until"]))
     except ValueError:
@@ -112,7 +123,7 @@ def runs(comments):
     for c in comments:
         m = RUN_RE.match(c.get("text", "").strip())
         if m:
-            out[m.group(1)] = (_positive(f"run {m.group(1)} gpu_hours", m.group(3), float),
+            out[m.group(1)] = (_hours(f"run {m.group(1)} gpu_hours", m.group(3)),
                                m.group(4))
     return out
 
@@ -125,23 +136,19 @@ def state(bead):
     return b, r, sum(h for h, _ in r.values())
 
 
-def _num(x):
-    return f"{x:g}"
-
-
 def check(bead, now=None):
     b, r, used = state(bead)
     now = now or datetime.datetime.now(datetime.timezone.utc)
     running = sum(1 for _, s in r.values() if s == "started")
     hours_left, runs_left = b["gpu_hours"] - used, b["max_runs"] - len(r)
     print(f"compute: {b['compute']}\n"
-          f"gpu_hours: {_num(hours_left)} left ({_num(used)} of {_num(b['gpu_hours'])} used)\n"
+          f"gpu_hours: {hours_left} left ({used} of {b['gpu_hours']} used)\n"
           f"runs: {runs_left} left ({len(r)} of {b['max_runs']} used, {running} running)\n"
           f"until: {b['until'].isoformat()}\n"
           f"kill_if: {b['kill_if']}")
     if now >= b["until"]:
         raise BudgetError("budget expired", EXIT_USED_UP)
-    if hours_left <= 1e-9 or runs_left <= 0:
+    if hours_left <= 0 or runs_left <= 0:
         raise BudgetError("budget used up", EXIT_USED_UP)
     return 0
 
@@ -156,7 +163,7 @@ def record(bead, run_id, status, gpu_hours=None):
     if (gpu_hours is None) != (status != "started"):
         raise BudgetError("give --gpu-hours (the estimate to reserve) only with --status started")
     if gpu_hours is not None:
-        gpu_hours = _positive("gpu_hours", gpu_hours, float)
+        gpu_hours = _hours("gpu_hours", gpu_hours)
     lock_dir = os.environ.get("IAR_STATE_DIR") or os.path.expanduser("~/.local/state/iar")
     os.makedirs(lock_dir, exist_ok=True)
     with open(os.path.join(lock_dir, f"budget-{bead}.lock"), "w") as lock:
@@ -169,14 +176,14 @@ def record(bead, run_id, status, gpu_hours=None):
                 raise BudgetError("budget expired", EXIT_USED_UP)
             if len(r) + 1 > b["max_runs"]:
                 raise BudgetError(f"max_runs {b['max_runs']} reached", EXIT_USED_UP)
-            if used + gpu_hours > b["gpu_hours"] + 1e-9:  # float sums, e.g. 0.1 + 0.2
-                raise BudgetError(f"{_num(gpu_hours)} GPU-hours do not fit: "
-                                  f"{_num(b['gpu_hours'] - used)} left", EXIT_USED_UP)
+            if used + gpu_hours > b["gpu_hours"]:
+                raise BudgetError(f"{gpu_hours} GPU-hours do not fit: "
+                                  f"{b['gpu_hours'] - used} left", EXIT_USED_UP)
         else:
             if r.get(run_id, (0, ""))[1] != "started":
                 raise BudgetError(f"run {run_id} is not running")
             gpu_hours = r[run_id][0]  # the estimate counts, not the actual hours
-        text = f"run: {run_id} compute: {b['compute']} gpu_hours: {gpu_hours!r} status: {status}"
+        text = f"run: {run_id} compute: {b['compute']} gpu_hours: {gpu_hours} status: {status}"
         ledger.comment(bead, text)
     print(text)
     return 0
@@ -230,6 +237,8 @@ def self_test():
             for bad in ("inf", "nan", "0", "-1"):
                 c, msg = code(check, bead(**dict(ok, gpu_hours=bad)))
                 assert c == EXIT_INVALID and "positive" in msg, (bad, msg)
+            c, msg = code(check, bead(**dict(ok, max_runs="2.5")))
+            assert c == EXIT_INVALID and "positive integer" in msg, msg
             assert code(record, b, "rx", "started", "inf")[0] == EXIT_INVALID
             assert code(record, b, "rx", "started")[0] == EXIT_INVALID  # no estimate
             c, msg = code(check, bead(**dict(ok, until="2099-01-01T00:00")))
@@ -257,7 +266,11 @@ def self_test():
             b4 = bead(**dict(ok, gpu_hours=0.00002))
             assert record(b4, "t1", "started", 0.00001) == 0
             assert code(record, b4, "t2", "started", 0.000011)[0] == EXIT_USED_UP
-            assert runs(ledger.show(b4)["comments"]) == {"t1": (0.00001, "started")}
+            assert runs(ledger.show(b4)["comments"]) == {"t1": (decimal.Decimal("0.00001"),
+                                                                "started")}
+            b6 = bead(**dict(ok, gpu_hours=1))  # no tolerance: 1e-10 over the limit is refused
+            assert record(b6, "e1", "started", 1) == 0
+            assert code(record, b6, "e2", "started", "1e-10")[0] == EXIT_USED_UP
 
             # concurrent reservations: 5 starts of 3 h on a 10 h budget -> exactly 3 fit
             b3 = bead(**dict(ok, max_runs=6))

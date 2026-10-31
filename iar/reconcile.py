@@ -64,12 +64,17 @@ def need(ok, what):
         raise SourceError(f"schema: {what}")
 
 
+def left():
+    """Seconds left before the running source's deadline."""
+    remaining = min(TIMEOUT_S, _deadline[0] - time.monotonic())
+    if remaining <= 0:
+        raise SourceError(f"no time left of the {TIMEOUT_S}s source limit")
+    return remaining
+
+
 def sh(cmd, cwd=None, check=True):
     try:
-        left = min(TIMEOUT_S, _deadline[0] - time.monotonic())
-        if left <= 0:
-            raise subprocess.TimeoutExpired(cmd, 0)
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=left, cwd=cwd)
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=left(), cwd=cwd)
     except (OSError, subprocess.TimeoutExpired) as e:
         raise SourceError(f"{os.path.basename(cmd[0])}: {e}")
     if check and p.returncode != 0:
@@ -238,6 +243,7 @@ def src_plannotator(snap):
 
 def src_br(snap):
     try:
+        ledger.TIMEOUT_S = left()  # each tracker call gets what is left of the source's deadline
         issues = ledger.list_issues(status="all")
         need(all(isinstance(i, dict) and "id" in i and "status" in i for i in issues), "tracker list: issues with id and status")
         known = {i["id"] for i in issues}
@@ -250,11 +256,14 @@ def src_br(snap):
         # A thread with another subject still belongs to the bead its author session is named after.
         names = {s["sessionId"]: s.get("name") or "" for s in snap["sessions"]}
         want |= {m[1] for t in snap["inbox"] if (m := BEAD_RE.match(names.get(t.get("session"), "")))}
+        ledger.TIMEOUT_S = left()
         shown = ledger.show_many(sorted(want & known))
         need(all(isinstance(i, dict) and isinstance(i.get("comments", []), list) for i in shown), "tracker show: issues")
         snap["issues"] = {i["id"]: i for i in shown}
     except ledger.LedgerError as e:
         raise SourceError(str(e))
+    finally:
+        ledger.TIMEOUT_S = TIMEOUT_S
 
 
 def attempts(issue):
@@ -334,6 +343,8 @@ def classify_bead(bid, b, snap, now, stall_after, sessions, leases, threads):
     att = attempts(b)
     n = max(att, default=None)
     owned = n is not None and b.get("assignee") == f"agent:{bid}#{n}"
+    if b.get("assignee") and not owned and not re.match(rf"^agent:{re.escape(bid)}#\d+$", b["assignee"]):
+        return "external", []  # claimed by anything other than bin/bg: no action at all, leases included
     stale = [lease for lease in leases.get(bid, [])
              if not (b["status"] == "in_progress" and b.get("assignee") == lease["holder"])]
     if not owned and not stale:
@@ -468,7 +479,7 @@ def self_test():
             bead("precog-ap"), bead("precog-dl"), bead("precog-dl2"), bead("precog-mq"), bead("precog-st"),
             bead("precog-zm"), bead("precog-zp"), bead("precog-sl", status="open", assignee=""),
             bead("precog-ct", status="closed"), bead("precog-wk"), bead("precog-wt"), bead("precog-id"),
-            bead("precog-ex", n=0, assignee="factory-wf"), bead("precog-ex2", assignee="factory-wf"),
+            bead("precog-ex", n=0, assignee="factory-wf"), bead("precog-ex2", assignee="factory-wf"),  # old bg lease, foreign claim
             # precedence conflicts
             bead("precog-c1"),                                   # stalled + answer-pending
             bead("precog-c2", n=2),                              # zombie + stale-lease (lease of attempt 1)
@@ -504,7 +515,7 @@ def self_test():
         "precog-ap": "answer-pending", "precog-dl": "question-deadline", "precog-dl2": "question-deadline",
         "precog-mq": "malformed-question", "precog-st": "stalled", "precog-zm": "zombie", "precog-zp": "zombie",
         "precog-sl": "stale-lease", "precog-ct": "closed-bead-thread", "precog-wk": "working",
-        "precog-wt": "waiting", "precog-id": "idle", "precog-ex": "external", "precog-ex2": "stale-lease",
+        "precog-wt": "waiting", "precog-id": "idle", "precog-ex": "external", "precog-ex2": "external",
         "precog-c1": "answer-pending", "precog-c2": "zombie", "precog-c3": "stale-lease", "precog-rp": "idle",
         "precog-ag": "stalled",
     }
@@ -516,7 +527,7 @@ def self_test():
         ("precog-dl2", "reping q=precog-q3"), ("precog-mq", "flag-malformed attempt=1"),
         ("precog-st", "nudge attempt=1 count=1"), ("precog-zm", "flag-zombie attempt=1"),
         ("precog-zp", "release attempt=1"), ("precog-sl", "return-lease slot=4 holder=agent:precog-sl#1"),
-        ("precog-ct", "resolve-thread thread=m-ct"), ("precog-ex2", "return-lease slot=7 holder=agent:precog-ex2#1"),
+        ("precog-ct", "resolve-thread thread=m-ct"),
         ("precog-c1", "deliver-answer q=precog-q6 attempt=1"), ("precog-c2", "flag-zombie attempt=2"),
         ("precog-c3", "return-lease slot=6 holder=agent:precog-c3#1"),
     }, acts

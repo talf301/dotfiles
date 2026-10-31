@@ -86,7 +86,8 @@ def self_test():
     # W9: the approved path with a PR group integrates and asks nothing; without a group it asks.
     ok, ask = template.split("   - **Approved, PR group is not `none`**", 1)[1].split("\n   - **", 2)[:2]
     assert ":::question" not in ok and "?" not in ok and "READY: integrated <sha>" in template, ok
-    assert "push origin HEAD:refs/heads/{{pr_group}}" in ok and ok.index("push origin") < ok.index("br close"), ok
+    # W9b: integrate.sh (group lock, merge the group in, done-when, push) runs before the close.
+    assert "iar/integrate.sh {{bead}} {{slot}} {{pr_group}}" in ok and ok.index("integrate.sh") < ok.index("br close"), ok
     assert "without a `pr:` label still asks" in ask and ":::question" in ask, ask
     out = render(FIXTURE)
     with open(GOLDEN) as f:

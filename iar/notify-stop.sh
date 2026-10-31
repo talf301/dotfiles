@@ -1,5 +1,5 @@
 #!/usr/bin/env zsh
-# Stop hook for /dispatch-bead sessions (loaded with `claude --bg --settings ~/dotfiles/iar/dispatch-settings.json`).
+# Stop hook for /dispatch-bead sessions (bin/bg starts them with `--settings ~/dotfiles/iar/dispatch-settings.json`).
 # When a dispatched session ends its turn: post a macOS notification titled with the session name whose body is
 # the first line of its last message (QUESTION: … or READY: …), and refresh the sketchybar agents_waiting item.
 #

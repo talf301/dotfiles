@@ -17,7 +17,7 @@ gnhf-run intent-boilerplate ~/prompts/intent-boilerplate.md \
 - When gnhf exits (done, failures, Ctrl+C), it starts the background session `gnhf walkthrough: <name>` with the `gnhf-walkthrough` skill. The walkthrough arrives in the Inbox and asks what to keep.
 - It never pushes, and the slot stays leased. Return it with `treehouse return <slot>` after you decide; returning resets the slot.
 
-To stop: one Ctrl+C stops after the current iteration; two Ctrl+C roll back the current iteration. To rerun only the walkthrough, start the same `claude --bg` command `gnhf-run` prints at its end from the slot.
+To stop: one Ctrl+C stops after the current iteration; two Ctrl+C roll back the current iteration. To rerun only the walkthrough, run the same `~/dotfiles/bin/bg --new` command `gnhf-run` prints at its end. `bin/bg` creates a bead (label `adhoc`) for each walkthrough.
 
 `--max-tokens` counts cache reads: one iteration is about 1.1–1.9M tokens. Use it as a backstop above `--max-iterations`; the watchdog is the real cap.
 

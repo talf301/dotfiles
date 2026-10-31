@@ -2,7 +2,14 @@
 """bg: the single launch path for a background bead session (one attempt).
 
   bg <bead> --done-when CMD [--name "<bead>: <2-4 words>"]
+  bg <bead> --cwd SLOT --prompt TEXT [--name ...]  session in a Precog slot the caller leases
+  bg --new TITLE (--done-when CMD | --cwd SLOT --prompt TEXT) [--name ...]
   bg --self-test
+
+--new is for non-bead work: it creates a task bead (label adhoc) first, then runs as above.
+With --cwd there is no new lease and no brief: SLOT must be a leased treehouse slot of REPO
+(bin/bg stays Precog-only). The session starts in SLOT with TEXT (plus its bead id) as its
+prompt, and the attempt comment has `brief: none`.
 
 Steps, in order. If a step fails, bg undoes the earlier steps in reverse order and
 writes the bead comment `attempt-failed: <step> attempt=<n> <error>`:
@@ -92,7 +99,35 @@ def render(values):
         raise StepError(str(e))
 
 
-def dispatch(bead, done_when, name=None):
+def write_brief(bead, issue, name, n, a, done_when, undo):
+    """Render the brief for a leased slot; returns the session prompt."""
+    base, a["branch"], action, pr_group = base_and_branch(issue, a["slot"])
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    brief, base_file = LOG_DIR / f"dispatch-{bead}-{n}.md", LOG_DIR / f"base-{bead}"
+    a["brief"] = str(brief)
+    old_base = base_file.read_text() if base_file.exists() else None
+
+    def unbrief():
+        brief.unlink(missing_ok=True)
+        if old_base is None:
+            base_file.unlink(missing_ok=True)
+        else:
+            base_file.write_text(old_base)
+    undo.append(("brief", unbrief))
+    brief.write_text(render({"bead": bead, "title": issue["title"], "name": name, "attempt": n,
+                             "slot": a["slot"], "base_sha": base, "branch": a["branch"],
+                             "branch_action": action, "pr_group": pr_group,
+                             "done_when": done_when}))
+    base_file.write_text(base + "\n")
+    return f"Read and follow {brief}"
+
+
+def new_bead(title, prompt=None):
+    """Non-bead work gets a bead first, so bin/bg and the reconciler can track it."""
+    return ledger.create(title, type="task", labels=["adhoc"], description=prompt or title)["id"]
+
+
+def dispatch(bead, done_when, name=None, cwd=None, prompt=None):
     issue = ledger.show(bead)
     if issue["status"] != "open" or issue.get("assignee"):
         print(f"bg: {bead} is {issue['status']}, assignee {issue.get('assignee')}: not dispatchable",
@@ -105,17 +140,24 @@ def dispatch(bead, done_when, name=None):
     undo, a = [], {"attempt": n}  # undo: (label, fn) pairs, run in reverse
     step = "lease"
     try:
-        def unlease():  # finds the lease by holder, so it works when get's output is lost
-            for s in held_by(holder):
-                sh(["treehouse", "return", s["path"], "--force", "--if-lease-id", s["lease_id"]], cwd=REPO)
-            if held_by(holder):
-                raise StepError(f"lease {holder} still held after return")
-        undo.append(("lease", unlease))
-        out = sh(["treehouse", "get", "--lease", "--json", "--lease-holder", holder], cwd=REPO,
-                 timeout=LEASE_TIMEOUT_S)
-        a["slot"] = json.loads(out[out.index("{"):])["path"]
-        if fault == step:
-            raise StepError("injected fault")
+        if cwd:  # the caller leases this slot: no lease to take or undo
+            a["slot"] = str(Path(cwd).resolve())
+            leased = [s["path"] for s in json.loads(sh(["treehouse", "status", "--json"], cwd=REPO))
+                      if s.get("lease_holder")]
+            if a["slot"] not in {str(Path(p).resolve()) for p in leased}:
+                raise StepError(f"--cwd {a['slot']} is not a leased treehouse slot of {REPO}")
+        else:
+            def unlease():  # finds the lease by holder, so it works when get's output is lost
+                for s in held_by(holder):
+                    sh(["treehouse", "return", s["path"], "--force", "--if-lease-id", s["lease_id"]], cwd=REPO)
+                if held_by(holder):
+                    raise StepError(f"lease {holder} still held after return")
+            undo.append(("lease", unlease))
+            out = sh(["treehouse", "get", "--lease", "--json", "--lease-holder", holder], cwd=REPO,
+                     timeout=LEASE_TIMEOUT_S)
+            a["slot"] = json.loads(out[out.index("{"):])["path"]
+            if fault == step:
+                raise StepError("injected fault")
 
         step = "claim"
         def unclaim():  # registered first: the update can land even when its answer is lost
@@ -129,35 +171,23 @@ def dispatch(bead, done_when, name=None):
             raise StepError("injected fault")
 
         step = "brief"
-        base, a["branch"], action, pr_group = base_and_branch(issue, a["slot"])
-        LOG_DIR.mkdir(parents=True, exist_ok=True)
-        brief, base_file = LOG_DIR / f"dispatch-{bead}-{n}.md", LOG_DIR / f"base-{bead}"
-        a["brief"] = str(brief)
-        old_base = base_file.read_text() if base_file.exists() else None
-
-        def unbrief():
-            brief.unlink(missing_ok=True)
-            if old_base is None:
-                base_file.unlink(missing_ok=True)
-            else:
-                base_file.write_text(old_base)
-        undo.append(("brief", unbrief))
-        brief.write_text(render({"bead": bead, "title": issue["title"], "name": name, "attempt": n,
-                                 "slot": a["slot"], "base_sha": base, "branch": a["branch"],
-                                 "branch_action": action, "pr_group": pr_group,
-                                 "done_when": done_when}))
-        base_file.write_text(base + "\n")
+        if prompt:
+            prompt += f"\n\nYour bead: {bead} (Beads store {os.environ['BEADS_DIR']})."
+            a["branch"] = sh(["git", "-C", a["slot"], "rev-parse", "--abbrev-ref", "HEAD"]).strip()
+            a["brief"] = "none"
+        else:
+            prompt = write_brief(bead, issue, name, n, a, done_when, undo)
         if fault == step:
             raise StepError("injected fault")
 
         step = "start"
 
-        def in_slot():  # sessions in our fresh slot that are not stopped
+        def in_slot():  # our sessions (by name) in the slot that are not stopped
             return [s for s in json.loads(sh(["claude", "agents", "--json"]))
                     if os.path.realpath(s.get("cwd") or "/") == os.path.realpath(a["slot"])
-                    and s.get("state") != "stopped"]
+                    and s.get("name") == name and s.get("state") != "stopped"]
 
-        def unstart():  # by slot, not id, so it works when the id is lost
+        def unstart():  # by slot and name, not id, so it works when the id is lost
             for _ in range(AGENTS_WAIT_S):  # a new session can take a moment to be listed
                 if in_slot():
                     break
@@ -168,7 +198,7 @@ def dispatch(bead, done_when, name=None):
                 raise StepError("session still running in slot after claude stop")
         undo.append(("start", unstart))
         out = sh(["claude", "--bg", "--settings", str(SETTINGS), "--name", name,
-                  f"Read and follow {brief}"], cwd=a["slot"])
+                  prompt], cwd=a["slot"])
         m = re.search(r"backgrounded\W+(\w+)", out)
         if not m:
             raise StepError(f"claude --bg printed no session id: {out.strip()[:200]}")
@@ -395,6 +425,28 @@ def self_test():
             assert (LOG_DIR / f"base-{b}").read_text().strip() == main_sha
             # A claimed bead is refused before any side effect.
             assert quiet(b, "true") == 1 and len(leases()) == 1
+
+            # --cwd: a new adhoc bead runs in a slot the caller leases; no new lease, no brief.
+            b = new_bead("adhoc ok", "do x")
+            assert quiet(b, None, "a: no", str(r), "do x") == 1  # not a leased slot
+            s = ledger.show(b)
+            assert s["status"] == "open" and "not a leased treehouse slot" in s["comments"][-1]["text"], s
+            out = sh(["treehouse", "get", "--lease", "--json", "--lease-holder", "agent:gnhf:t"])
+            held = Path(json.loads(out)["path"])
+            sh(["claude", "--bg", "--name", "other", "x"], cwd=held)  # not ours: undo leaves it
+            os.environ["BG_FAULT_AFTER"] = "start"
+            assert quiet(b, None, "a: fail", str(held), "do x") == 1
+            assert [s["name"] for s in sessions() if s["cwd"] == str(held.resolve())] == ["other"]
+            assert ledger.show(b)["status"] == "open" and len(leases()) == 2
+            os.environ["BG_FAULT_AFTER"] = ""
+            assert quiet(b, None, "a: ok", str(held), "do x") == 0
+            s = ledger.show(b)
+            assert s["labels"] == ["adhoc"] and s["description"] == "do x", s
+            (sess,) = [x for x in sessions() if x["name"] == "a: ok"]
+            assert sess["argv"][-1].startswith(f"do x\n\nYour bead: {b} ") and sess["cwd"] == str(held.resolve()), sess
+            assert s["comments"][-1]["text"] == (f"attempt: 3 session: {sess['sessionId']} slot: "
+                                                 f"{held.resolve()} branch: main brief: none"), s
+            assert s["assignee"] == f"agent:{b}#3" and len(leases()) == 2
         finally:
             for k, v in old.items():
                 if v is None:
@@ -409,15 +461,21 @@ def main():
     p.add_argument("bead", nargs="?")
     p.add_argument("--done-when")
     p.add_argument("--name")
+    p.add_argument("--cwd")
+    p.add_argument("--prompt")
+    p.add_argument("--new", metavar="TITLE")
     p.add_argument("--self-test", action="store_true")
     a = p.parse_args()
     if a.self_test:
         self_test()
         return 0
-    if not a.bead or not a.done_when:
-        p.error("bead and --done-when are required")
+    if bool(a.bead) == bool(a.new):
+        p.error("give a bead or --new TITLE")
+    if bool(a.cwd) != bool(a.prompt) or bool(a.done_when) == bool(a.cwd):
+        p.error("give --done-when, or --cwd and --prompt")
     try:
-        return dispatch(a.bead, a.done_when, a.name)
+        bead = a.bead or new_bead(a.new, a.prompt)
+        return dispatch(bead, a.done_when, a.name, a.cwd, a.prompt)
     except ledger.LedgerError as e:  # the pre-check read failed: nothing was done
         print(f"bg: {e}", file=sys.stderr)
         return 1

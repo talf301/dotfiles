@@ -6,7 +6,7 @@
 
 WORKFLOW.md is `---`, the config, `---`, then the brief template. The config is JSON, which is
 valid YAML, so the stdlib reads it: PyYAML is not installed for every python3 (launchd, brew).
-The template has `{{var}}` (an unknown var fails the render) and `{{include <file in iar/>}}`.
+The template has `{{var}}` (an unknown var fails the render) and `{{include <file next to WORKFLOW.md>}}`.
 Env: IAR_WORKFLOW overrides the WORKFLOW.md path (tests).
 """
 
@@ -18,7 +18,6 @@ import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 GOLDEN = os.path.join(HERE, "fixtures", "brief-golden.md")
-TOKEN = re.compile(r"\{\{(?:include ([\w.-]+)|(\w+))\}\}")
 REQUIRED = ("tracker.kind", "tracker.beads_dir", "tracker.dispatch_label", "tracker.active_states",
             "tracker.terminal_states", "polling.interval_ms", "agent.max_concurrent",
             "agent.max_concurrent_by_state", "stall_after_min", "max_retry_backoff_ms",
@@ -58,21 +57,24 @@ def load(path=None):
 
 
 def render(values, path=None):
-    template = load(path)[1]
-    if "{{" in TOKEN.sub("", template):
-        raise WorkflowError("brief: malformed {{...}} in template")
+    """Expand includes (files next to WORKFLOW.md), then variables. Any token left fails."""
+    path = path or os.environ.get("IAR_WORKFLOW") or os.path.join(HERE, "WORKFLOW.md")
 
-    def sub(m):
-        if m.group(1):
-            try:
-                with open(os.path.join(HERE, m.group(1))) as f:
-                    return f.read().strip()
-            except OSError as e:
-                raise WorkflowError(f"brief: include {m.group(1)}: {e}")
-        if m.group(2) not in values:
-            raise WorkflowError(f"brief: unknown variable {{{{{m.group(2)}}}}}")
-        return str(values[m.group(2)])
-    return TOKEN.sub(sub, template)  # one pass: included text is not templated
+    def include(m):
+        try:
+            with open(os.path.join(os.path.dirname(path), m.group(1))) as f:
+                return f.read().strip()
+        except OSError as e:
+            raise WorkflowError(f"brief: include {m.group(1)}: {e}")
+
+    def var(m):
+        if m.group(1) not in values:
+            raise WorkflowError(f"brief: unknown variable {{{{{m.group(1)}}}}}")
+        return str(values[m.group(1)])
+    text = re.sub(r"\{\{include ([\w.-]+)\}\}", include, load(path)[1])
+    if "{{" in re.sub(r"\{\{\w+\}\}", "", text):
+        raise WorkflowError("brief: malformed {{...}} in template or include")
+    return re.sub(r"\{\{(\w+)\}\}", var, text)  # one pass: values are not templated
 
 
 def self_test():
@@ -100,6 +102,9 @@ def self_test():
         assert "unknown variable {{slot}}" in fails(head + "{{slot}}\n", {"bead": "x"})
         assert "malformed" in fails(head + "{{ bead }}\n")
         assert "include" in fails(head + "{{include no-such.md}}\n")
+        with open(os.path.join(d, "inc.md"), "w") as f:
+            f.write("included {{nope}}\n")
+        assert "unknown variable {{nope}}" in fails(head + "{{include inc.md}}\n")
         assert "no front matter" in fails("{{bead}}\n")
         bad = dict(config, actions=dict(config["actions"], zombie="yes"))
         assert "true or false" in fails("---\n" + json.dumps(bad) + "\n---\nx\n")

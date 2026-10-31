@@ -23,16 +23,14 @@ through iar/answer. The mirror keeps an answered question issue in Approved unti
 Gate (autonomy.md): writes to team TAL are not gated. Every write names its team, and any team other than
 TAL is refused.
 
-Auth: a Linear OAuth app, client_credentials grant (actor=app). Client id and secret come from the macOS
-Keychain (`security find-generic-password -s linear-iar-mirror -a client_id|client_secret -w`), never from a
-file. The token is cached in $IAR_STATE_DIR/linear-token.json (default ~/.local/state/iar) with its expiry and
-fetched again on a 401.
+Auth: Tal's personal Linear API key, read from $LINEAR_KEY_FILE (default ~/.linear_key, mode 600). Writes
+show as Tal, not as an app (an app install needs a workspace admin).
 
 Run by iar/reconcile.py: `reconcile.py --dry-run` lists the writes (with no credentials it plans from the
 `linear:` bead comments only); a live tick writes them when the WORKFLOW.md switch `linear-mirror` is on.
 
-  linear_mirror.py --check       read only: get a token, read team TAL, print its states, labels and issue count
-  linear_mirror.py --self-test   scratch br store and a fake Linear (token endpoint and GraphQL) on localhost
+  linear_mirror.py --check       read only: read team TAL, print its states, labels and issue count
+  linear_mirror.py --self-test   scratch br store and a fake Linear GraphQL on localhost
 """
 
 import hashlib
@@ -42,9 +40,7 @@ import re
 import subprocess
 import sys
 import tempfile
-import time
 import urllib.error
-import urllib.parse
 import urllib.request
 
 IAR = os.path.dirname(os.path.realpath(__file__))
@@ -54,8 +50,6 @@ import question  # noqa: E402
 
 TAL_TEAM = "c2a9d57a-f287-4779-a6d5-e75d9e079dab"  # Linear team TAL (private); the only team the mirror writes to
 API_URL = "https://api.linear.app/graphql"
-TOKEN_URL = "https://api.linear.app/oauth/token"
-KEYCHAIN_SERVICE = "linear-iar-mirror"
 TIMEOUT_S = 30
 MAX_WRITES = 50  # ponytail: a first run of about 100 beads takes two ticks; raise it if Tal wants it in one
 STATES = ("Backlog", "Todo", "In Progress", "In Review", "Done", "Canceled")
@@ -184,20 +178,15 @@ def tal_answer(issue):
 # --- Linear client ---
 
 def credentials():
-    out = []
-    for account in ("client_id", "client_secret"):
-        p = subprocess.run(["security", "find-generic-password", "-s", KEYCHAIN_SERVICE, "-a", account, "-w"],
-                           capture_output=True, text=True, timeout=TIMEOUT_S)
-        if p.returncode != 0 or not p.stdout.strip():
-            raise LinearError(f"no {account} in the Keychain (service {KEYCHAIN_SERVICE}): {p.stderr.strip()}")
-        out.append(p.stdout.strip())
-    return out
-
-
-def state_dir():
-    d = os.environ.get("IAR_STATE_DIR") or os.path.expanduser("~/.local/state/iar")
-    os.makedirs(d, exist_ok=True)
-    return d
+    path = os.environ.get("LINEAR_KEY_FILE") or os.path.expanduser("~/.linear_key")
+    try:
+        with open(path) as f:
+            key = f.read().strip()
+    except OSError:
+        key = ""
+    if not key:
+        raise LinearError(f"no Linear API key in {path}")
+    return key
 
 
 def _post(url, data, headers):
@@ -225,38 +214,9 @@ class Linear:
             raise LinearError(f"refused: team {team} is not TAL ({TAL_TEAM}); Linear writes outside TAL are gated")
         return team
 
-    def token(self, fresh=False):
-        path = os.path.join(state_dir(), "linear-token.json")
-        if not fresh:
-            try:
-                with open(path) as f:
-                    cached = json.load(f)
-                if cached["expires_at"] > time.time() + 60:
-                    return cached["access_token"]
-            except (OSError, ValueError, KeyError, TypeError):
-                pass
-        cid, secret = credentials()
-        code, out = _post(TOKEN_URL, urllib.parse.urlencode({
-            "grant_type": "client_credentials", "client_id": cid, "client_secret": secret, "scope": "read,write",
-        }).encode(), {"Content-Type": "application/x-www-form-urlencoded"})
-        if code != 200 or not isinstance(out, dict) or not out.get("access_token"):
-            raise LinearError(f"token endpoint: HTTP {code}: {json.dumps(out)[:300]}")
-        with tempfile.NamedTemporaryFile("w", dir=os.path.dirname(path), delete=False) as f:
-            json.dump({"access_token": out["access_token"],
-                       "expires_at": time.time() + float(out.get("expires_in") or 3600)}, f)
-        os.chmod(f.name, 0o600)
-        os.replace(f.name, path)
-        return out["access_token"]
-
     def gql(self, query, variables=None):
         body = json.dumps({"query": query, "variables": variables or {}}).encode()
-        for fresh in (False, True):
-            code, out = _post(API_URL, body, {"Content-Type": "application/json",
-                                              "Authorization": f"Bearer {self.token(fresh)}"})
-            auth = code == 401 or any((e.get("extensions") or {}).get("code") == "AUTHENTICATION_ERROR"
-                                      for e in (out or {}).get("errors") or [])
-            if not auth:
-                break
+        code, out = _post(API_URL, body, {"Content-Type": "application/json", "Authorization": credentials()})
         if code != 200 or (out or {}).get("errors"):
             raise LinearError(f"graphql: HTTP {code}: {json.dumps((out or {}).get('errors'))[:300]}")
         return out["data"]
@@ -442,7 +402,7 @@ def self_test():
     import http.server
     import threading
 
-    team_issues, calls, tokens = [], [], []
+    team_issues, calls = [], []
     states = {n: f"st-{n}" for n in STATES}
     labels = {}
 
@@ -459,13 +419,8 @@ def self_test():
 
         def do_POST(self):
             body = self.rfile.read(int(self.headers["Content-Length"])).decode()
-            if self.path == "/oauth/token":
-                form = urllib.parse.parse_qs(body)
-                assert form["grant_type"] == ["client_credentials"] and form["client_secret"] == ["sec"], form
-                tokens.append(f"tok{len(tokens) + 1}")
-                return self.reply(200, {"access_token": tokens[-1], "expires_in": 3600})
-            if self.headers["Authorization"] != f"Bearer {tokens[-1] if tokens else ''}":
-                return self.reply(401, {"errors": [{"message": "bad token"}]})
+            if self.headers["Authorization"] != "key":
+                return self.reply(401, {"errors": [{"message": "bad key"}]})
             req = json.loads(body)
             q, v = req["query"], req["variables"]
             calls.append(q.split("(")[0].split()[0] + (" " + q.split("{")[1].split("(")[0].strip() if "mutation" in q
@@ -514,15 +469,15 @@ def self_test():
                 i["labels"] = [by_label[x] for x in inp["labelIds"]]
             return self.reply(200, {"data": {"issueUpdate": {"success": True}}})
 
-    global API_URL, TOKEN_URL, credentials
-    saved = API_URL, TOKEN_URL, credentials, {k: os.environ.get(k) for k in ("BEADS_DIR", "IAR_STATE_DIR")}
+    global API_URL, credentials
+    saved = API_URL, credentials, {k: os.environ.get(k) for k in ("BEADS_DIR",)}
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Fake)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     with tempfile.TemporaryDirectory() as root:
         try:
             base = f"http://127.0.0.1:{server.server_address[1]}"
-            API_URL, TOKEN_URL = f"{base}/graphql", f"{base}/oauth/token"
-            os.environ.update(BEADS_DIR=os.path.join(root, ".beads"), IAR_STATE_DIR=os.path.join(root, "state"))
+            API_URL = f"{base}/graphql"
+            os.environ.update(BEADS_DIR=os.path.join(root, ".beads"))
             ledger.init("lm")
 
             # The team guard: any team but TAL is refused, for the client and for an update.
@@ -548,9 +503,9 @@ def self_test():
             mine = {epic["id"], a["id"], b["id"], sub["id"], c["id"], q["id"]}
 
             # Dry run with no credentials: plans from bead comments, writes nothing anywhere.
-            def no_keychain():
-                raise LinearError("no client_id in the Keychain")
-            credentials = no_keychain
+            def no_key():
+                raise LinearError("no Linear API key in /nowhere")
+            credentials = no_key
             r = run(True, inbox, "http://inbox/")
             assert r["error"].startswith("offline plan"), r
             assert sorted(r["writes"]) == sorted([f"label {epic['id']}"] + [
@@ -561,7 +516,7 @@ def self_test():
             assert not calls and not team_issues
 
             # Live run: one issue per bead, the label, a `linear:` comment on each bead.
-            credentials = lambda: ("cid", "sec")
+            credentials = lambda: "key"
             r = run(False, inbox, "http://inbox/")
             assert r["error"] is None and len(r["done"]) == 7, r
             assert len(team_issues) == 6 and labels == {epic["id"]: f"lb-{epic['id']}"}
@@ -611,12 +566,25 @@ def self_test():
                 assert r["done"] == [] and "issueUpdate: success=False" in r["error"], r
             ledger.update(d["id"], title="Crashed")
 
-            # A rejected cached token: one new token, then the call succeeds.
-            with open(os.path.join(root, "state", "linear-token.json"), "w") as f:
-                json.dump({"access_token": "stale", "expires_at": time.time() + 3600}, f)
-            before = len(tokens)
+            # A rejected key is an error, not a crash; the next tick with a good key is clean.
+            credentials = lambda: "bad"
+            assert "HTTP 401" in run(False, inbox, "http://inbox/")["error"]
+            credentials = lambda: "key"
             assert run(False, inbox, "http://inbox/") == {"writes": [], "error": None, "done": []}
-            assert len(tokens) == before + 1
+            # The key file: read and stripped; a missing or empty file is an error.
+            kf = os.path.join(root, "key")
+            os.environ["LINEAR_KEY_FILE"] = kf
+            for text, want in (("key\n", "key"), ("", None), (None, None)):
+                if text is None:
+                    os.remove(kf)
+                else:
+                    with open(kf, "w") as f:
+                        f.write(text)
+                try:
+                    assert saved[1]() == want
+                except LinearError as e:
+                    assert want is None and "no Linear API key" in str(e), e
+            os.environ.pop("LINEAR_KEY_FILE")
 
             # W25b: answers from Linear. Only Tal's `answer:` comments and moves to Approved count; the earliest wins.
             other, at = "u-someone-else", lambda s: f"2026-10-31T00:00:{s:02d}.000Z"
@@ -655,13 +623,12 @@ def self_test():
             n = len(calls)
             assert answers(qs())[0].keys() == {q3["id"]} and calls[n:] == ["query"] * 2
             # A Linear failure is reported, not raised.
-            os.remove(os.path.join(root, "state", "linear-token.json"))
-            credentials = no_keychain
-            assert answers(qs()) == ({}, "LinearError: no client_id in the Keychain")
+            credentials = no_key
+            assert answers(qs()) == ({}, "LinearError: no Linear API key in /nowhere")
         finally:
             server.shutdown()
-            API_URL, TOKEN_URL, credentials = saved[:3]
-            for k, v in saved[3].items():
+            API_URL, credentials = saved[:2]
+            for k, v in saved[2].items():
                 if v is None:
                     os.environ.pop(k, None)
                 else:

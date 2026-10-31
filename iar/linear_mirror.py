@@ -18,7 +18,7 @@ At most MAX_WRITES Linear writes per run; the rest go on the next run.
 
 Answers (W25b, answers()): on the issue of an open question bead, Tal's comment `answer: <text>` or his move to the
 Approved state ("approve") is an answer; anyone else's is ignored. Read only here: reconcile imports the earliest
-through iar/answer. The mirror does not move an Approved question issue back to In Review.
+through iar/answer. The mirror keeps an answered question issue in Approved until the bead closes.
 
 Gate (autonomy.md): writes to team TAL are not gated. Every write names its team, and any team other than
 TAL is refused.
@@ -124,7 +124,7 @@ def desired(beads, links, inbox_url="", epics=None):
         body = "\n".join(x for x in (texts[b["id"]], f"Inbox: {links[b['id']]}" if b["id"] in links else "") if x)
         fp = hashlib.sha1(f"{b['id']}\n{body}".encode()).hexdigest()[:8]
         out[b["id"]] = {"title": b["title"][:255], "state": state_of(b, asked), "fp": fp,
-                        "question": "question" in (b.get("labels") or []),
+                        "answered": {"question", "answered"} <= set(b.get("labels") or []),
                         "label": epics.get(b["id"]) or (b["id"] if b["id"] in roots else None),
                         "description": f"{body}\n\nBead: {b['id']} (v{fp})".lstrip()}
     return out
@@ -146,7 +146,9 @@ def plan(want, remote, comments):
         if have.get("state") is None:
             continue
         change = {k: w[k] for k in ("title", "state", "fp") if w[k] != have[k]}
-        if w["question"] and have["state"] == APPROVED and w["state"] == "In Review":  # his answer: kept until closed
+        # An answered question keeps Approved until it closes: the tick imported Tal's move before the mirror ran.
+        # A move nobody imported (not Tal's) goes back to In Review.
+        if w["answered"] and have["state"] == APPROVED and w["state"] == "In Review":
             change.pop("state", None)
         if w["label"] and w["label"] not in have["labels"]:
             change["label"] = w["label"]
@@ -380,13 +382,12 @@ def apply(writes, client, remote, done):
 
 
 def answers(questions, client=None):
-    """W25b: Tal's Linear answers to open, unanswered question beads (reconcile's snap["questions"]) whose issue the
+    """W25b: Tal's Linear answers to open, undelivered question beads (reconcile's snap["questions"]) whose issue the
     mirror made. Returns ({qid: {text, at, source: "linear"}}, error or None). Read only; reconcile imports them
     through iar/answer (import-answer), so the first recorded answer wins and the delivery happens once."""
-    # ponytail: an answered question is not read again. Each tick reads Linear before it imports, so an earlier Linear
-    # answer loses to an Inbox answer only when this read failed in that tick; iar/answer then keeps the first
-    # recorded human answer (W2 E2) anyway. Read answered questions too if Tal answers in both places in practice.
-    want = sorted(q["id"] for q in questions if "answered" not in (q.get("labels") or []))
+    # Answered questions are read too until delivered: Tal's Linear answer given before a timeout answer overrides it
+    # (iar/answer). A second human answer is late for iar/answer, as from the Inbox.
+    want = sorted(q["id"] for q in questions if "delivered" not in (q.get("labels") or []))
     out = {}
     try:
         issues = offline(ledger.show_many(want) if want else [])["issues"]
@@ -630,14 +631,16 @@ def self_test():
             assert err is None and got == {q2["id"]: {"text": "Keep", "at": at(3), "source": "linear"},
                                            q3["id"]: {"text": "approve", "at": at(6), "source": "linear"}}, got
             assert calls[n:] == ["query", "query"], calls[n:]
-            # The mirror leaves Tal's Approved alone; an answered question is not read again.
+            # The mirror keeps Approved on an answered question (the tick imported the move); a move on an unanswered
+            # question (nobody imported it) or on any other bead goes back to In Review.
+            ledger.label(q3["id"], add=["answered"])
+            iss[q2["id"]]["state"] = iss[c["id"]]["state"] = APPROVED
             r = run(False, inbox, "http://inbox/")
-            assert r["writes"] == [f"create {q4['id']} [In Review] Q4 new"], r
-            assert iss[q3["id"]]["state"] == APPROVED
-            iss[c["id"]]["state"] = APPROVED  # not a question bead: the mirror moves it back
-            assert run(False, inbox, "http://inbox/")["done"] == [f"update {c['id']} {iss[c['id']]['identifier']} state"]
-            assert iss[c["id"]]["state"] == "In Review"
-            ledger.label(q2["id"], add=["answered"])
+            assert sorted(r["done"]) == sorted([f"create {q4['id']} [In Review] Q4 new"] + [
+                f"update {x['id']} {iss[x['id']]['identifier']} state" for x in (q2, c)]), r
+            assert iss[q3["id"]]["state"] == APPROVED and iss[q2["id"]]["state"] == iss[c["id"]]["state"] == "In Review"
+            # An answered question is read until it is delivered (a timeout answer can still lose to Tal's).
+            ledger.label(q2["id"], add=["delivered"])
             n = len(calls)
             assert answers(qs())[0].keys() == {q3["id"]} and calls[n:] == ["query"]
             # A Linear failure is reported, not raised.

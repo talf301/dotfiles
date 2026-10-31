@@ -2177,9 +2177,8 @@ def w13_test():
             lp = asking("E4 via Linear")
             qlp = ask(lp, "Answer me in Linear?")[1]
             set_switches("linear-mirror", wf)
-            said = stamp(datetime.now(timezone.utc))
-            lin = lambda qs: ({q["id"]: {"text": "Drop", "at": said, "source": "linear"} for q in qs if q["id"] == qlp},
-                              None)
+            linear = {qlp: {"text": "Drop", "at": stamp(datetime.now(timezone.utc)), "source": "linear"}}
+            lin = lambda qs: ({q["id"]: linear[q["id"]] for q in qs if q["id"] in linear}, None)
             lrun = lambda: sorted((x["item"], x["action"].split()[0], x["outcome"]) for x in tick(
                 d, False, fakes, mirror=lambda *a: {"writes": [], "error": None}, linear_answers=lin)[1]["executed"]
                 if x["outcome"] != "off")
@@ -2190,6 +2189,16 @@ def w13_test():
             assert len(got) == 1 and got[0].startswith(f"ANSWER {qlp}: Drop\n") and "source: linear" in got[0], got
             assert lrun() == [] and lrun() == [] and ledger.show(qlp)["status"] == "closed"
             assert len([c for c in calls if c[0] == "resume" and c[1] == f"s-{lp}-1"]) == 1
+            # E2b via Linear: Tal's Linear answer, given before the timeout write but read after it, wins over it.
+            lt = asking("E2b via Linear")
+            qlt = ask(lt, "Time me out, then answer in Linear?", deadline=past)[1]
+            assert lrun() == [(lt, "timeout", "done")]
+            wrote = question.answers(ledger.show(qlt))[0]["at"]
+            linear[qlt] = {"text": "Drop", "at": stamp(wrote - timedelta(milliseconds=1)), "source": "linear"}
+            assert lrun() == [(lt, "deliver-answer", "done"), (lt, "import-answer", "done")]
+            got = [c[2] for c in calls if c[0] == "resume" and c[1] == f"s-{lt}-1"]
+            assert len(got) == 1 and got[0].startswith(f"ANSWER {qlt}: Drop\n"), got
+            assert question.effective_answer(ledger.show(qlt))["source"] == "linear" and lrun() == []
 
             # inbox_answers: drafts (no sent reply) and skips with no reply are not answers; a note rides along.
             q = lambda **kw: {"message_id": "m", "position": 0, "picked_at": "t", "sent_reply_id": "r", **kw}

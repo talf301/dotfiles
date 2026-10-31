@@ -6,7 +6,8 @@ is a second project of a repo that has a canonical one (precog -> "Precog agents
 Each unresolved thread in a stray project gets one action:
   question  an unanswered :::question whose thread subject names an open bead: `iar/ask` files a question
             bead under that bead (posted to the canonical project), then the stray thread is resolved
-  moot      anything else (no open question, no bead, or the bead is closed): the thread is resolved
+  keep      an unanswered :::question whose subject names no bead: left open and listed for Tal to answer
+  moot      no unanswered question, or the named bead is closed: the thread is resolved
 Threads stay readable in the Inbox as Archived. Nothing is moved or deleted.
 
   inbox-migrate.py             dry run: list stray threads, the planned actions, before/after counts
@@ -54,15 +55,14 @@ def is_stray(p):
 
 
 def bead_of(subject):
-    """The open bead a thread subject names (`precog-x: ...`, `x: ...`, `precog-x W12: ...`), else None."""
+    """The bead a thread subject names (`precog-x: ...`, `x: ...`, `precog-x W12: ...`), else None."""
     m = SUBJECT_BEAD.match(subject or "")
     if not m:
         return None
     try:
-        b = ledger.show(f"precog-{m[1]}")
+        return ledger.show(f"precog-{m[1]}")
     except ledger.LedgerError:
         return None
-    return b if b.get("status") != "closed" else None
 
 
 def options_of(q):
@@ -99,9 +99,15 @@ def plan():
         open_qs = [q for q in questions.values() if q["message_id"] in ids[t["id"]] and q.get("answer") is None
                    and not q.get("action_result") and not q.get("superseded_by")]
         bead = bead_of(t["subject"]) if open_qs else None
+        action = "moot" if not open_qs or (bead and bead["status"] == "closed") else "question" if bead else "keep"
         rows.append({"thread": t["id"], "project": p, "subject": t["subject"], "session": t["session"],
-                     "quiet": t["quiet"], "bead": bead and bead["id"], "questions": open_qs if bead else [],
-                     "action": "question" if bead else "moot"})
+                     "quiet": t["quiet"], "bead": bead and bead["id"], "action": action,
+                     "questions": open_qs if action == "question" else []})
+        if action == "keep":
+            after[p["root"]] = after.get(p["root"], 0) + 1
+        canon = os.environ.get("IAR_INBOX_PROJECT", question.PROJECT)
+        if action == "question":  # ponytail: one new thread per question; the Inbox may group them by thread name
+            after[canon] = after.get(canon, 0) + len(open_qs)
     return rows, before, after
 
 
@@ -134,7 +140,7 @@ def run(apply):
         print(f"{r['action']:8} {r['thread']} {r['project']['root']} | {r['subject'][:80]}{note}")
         for q in r["questions"]:
             print(f"         question -> bead under {r['bead']}: {(q.get('prompt') or '').strip()[:80]}")
-        if not apply:
+        if not apply or r["action"] == "keep":
             continue
         try:
             for q in r["questions"]:
@@ -143,13 +149,15 @@ def run(apply):
             print("         resolved")
         except (RuntimeError, ledger.LedgerError, OSError, subprocess.SubprocessError) as e:
             failed += 1
-            after[r["project"]["root"]] = after.get(r["project"]["root"], 0) + 1
             print(f"         FAILED: {e}")
+    if apply:  # the real after: the Inbox files once the actions ran
+        _, after, _ = plan()
     print(f"\nUnresolved threads per project (before -> after{'' if apply else ', planned'}):")
-    for root in sorted(before):
+    for root in sorted(set(before) | set(after)):
         print(f"  {before[root]:3} -> {after.get(root, 0):3}  {root}")
     print(f"  {sum(before.values()):3} -> {sum(after.values()):3}  total; stray threads: {len(rows)}, "
-          f"question: {sum(r['action'] == 'question' for r in rows)}, moot: {sum(r['action'] == 'moot' for r in rows)}"
+          f"question: {sum(r['action'] == 'question' for r in rows)}, moot: {sum(r['action'] == 'moot' for r in rows)}, "
+          f"keep: {sum(r['action'] == 'keep' for r in rows)}"
           f"{f', failed: {failed}' if failed else ''}")
     return 1 if failed else 0
 
@@ -159,7 +167,8 @@ def self_test():
         saved_env = {k: os.environ.get(k) for k in ("BEADS_DIR", "IAR_INBOX_CMD", "IAR_STATE_DIR", "IAR_INBOX_PROJECT")}
         saved_inbox = reconcile.INBOX
         try:
-            os.environ.update(BEADS_DIR=os.path.join(d, ".beads"), IAR_STATE_DIR=d, IAR_INBOX_PROJECT="/canon")
+            os.environ.pop("IAR_INBOX_PROJECT", None)
+            os.environ.update(BEADS_DIR=os.path.join(d, ".beads"), IAR_STATE_DIR=d)
             subprocess.run(["br", "init", "--prefix", "precog"], cwd=d, check=True, capture_output=True)
             open_bead = ledger.create("open work", type="task")["id"]
             closed_bead = ledger.create("done work", type="task")["id"]
@@ -203,6 +212,8 @@ def self_test():
             thread("slot", "m-gone", "gone", resolved=True)
             project("tmp", "tmp", "/private/tmp")
             thread("tmp", "m-probe", "probe")
+            thread("tmp", "m-ask", "Which port?")  # an open question with no bead: kept for Tal
+            ask_q("tmp", "m-ask", "Port?", [{"label": "80"}, {"label": "443"}])
             project("main", "precog", f"{HOME}/Documents/precog")
             thread("main", "m-main", "a note")
             project("other", "other-repo", f"{HOME}/src/other-repo")
@@ -210,17 +221,17 @@ def self_test():
 
             rows, before, after = plan()
             got = {r["thread"]: (r["action"], r["bead"]) for r in rows}
-            assert got == {"m-q": ("question", open_bead), "m-closed": ("moot", None), "m-probe": ("moot", None),
-                           "m-main": ("moot", None)}, got
-            assert before[f"{HOME}/.treehouse/precog-x/1/precog"] == 2 and sum(before.values()) == 6, before
-            assert after == {question.PROJECT: 1, f"{HOME}/src/other-repo": 1}, after
+            assert got == {"m-q": ("question", open_bead), "m-closed": ("moot", closed_bead), "m-probe": ("moot", None),
+                           "m-main": ("moot", None), "m-ask": ("keep", None)}, got
+            assert before[f"{HOME}/.treehouse/precog-x/1/precog"] == 2 and sum(before.values()) == 7, before
+            assert after == {question.PROJECT: 2, f"{HOME}/src/other-repo": 1, "/private/tmp": 1}, after
             q = next(r for r in rows if r["questions"])["questions"][0]
             assert options_of(q) == (["Left", "Right", "Up"], "Right"), options_of(q)
             assert options_of({"parsed": {"choices": []}}) == (["Yes", "No"], "Yes")
 
             with contextlib.redirect_stdout(io.StringIO()) as out:
                 assert run(apply=False) == 0
-            assert "6 ->   2  total" in out.getvalue() and not os.path.exists(log), out.getvalue()
+            assert "7 ->   4  total" in out.getvalue() and not os.path.exists(log), out.getvalue()
 
             with contextlib.redirect_stdout(io.StringIO()) as out:
                 assert run(apply=True) == 0, out.getvalue()
@@ -229,7 +240,7 @@ def self_test():
             resolved = sorted(c["arguments"]["message_id"] for c in calls if c["name"] == "resolve_message")
             assert resolved == ["m-closed", "m-main", "m-probe", "m-q"], resolved
             sends = [c["arguments"] for c in calls if c["name"] == "send_message"]
-            assert len(sends) == 1 and sends[0]["project_path"] == "/canon", sends
+            assert len(sends) == 1 and sends[0]["project_path"] == question.PROJECT, sends
             kids = [k for k in ledger.show(open_bead)["dependents"] if k["title"].startswith("Q(")]
             assert len(kids) == 1 and kids[0]["title"].endswith("Which way?"), kids
             body = question.parse_body(ledger.show(kids[0]["id"])["description"])

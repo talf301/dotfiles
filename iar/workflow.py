@@ -25,6 +25,7 @@ REQUIRED = ("tracker.kind", "tracker.beads_dir", "tracker.dispatch_label", "trac
 FIXTURE = {"bead": "precog-fix1", "title": "Fixture bead", "name": "precog-fix1: fixture bead",
            "attempt": 2, "slot": "/slots/precog/3", "base_sha": "0123456789abcdef0123456789abcdef01234567",
            "branch": "u/tfriedman/iar-precog-fix1", "branch_action": "create it at 0123456",
+           "pr_group": "u/tfriedman/pr/fix",
            "done_when": "iar-run-tests.sh /slots/precog/3 tests/test_fix.py"}
 
 
@@ -82,6 +83,11 @@ def self_test():
     assert config["actions"] and not any(config["actions"].values()), config["actions"]
     for var in ("bead", "attempt", "base_sha", "slot", "branch"):
         assert "{{%s}}" % var in template, var
+    # W9: the approved path with a PR group integrates and asks nothing; without a group it asks.
+    ok, ask = template.split("   - **Approved, PR group is not `none`**", 1)[1].split("\n   - **", 2)[:2]
+    assert ":::question" not in ok and "?" not in ok and "READY: integrated <sha>" in template, ok
+    assert "push origin HEAD:refs/heads/{{pr_group}}" in ok and ok.index("push origin") < ok.index("br close"), ok
+    assert "without a `pr:` label still asks" in ask and ":::question" in ask, ask
     out = render(FIXTURE)
     with open(GOLDEN) as f:
         assert out == f.read(), "render differs from fixtures/brief-golden.md (--write-golden if intended)"

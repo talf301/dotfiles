@@ -81,7 +81,8 @@ def base_and_branch(issue, slot):
     if not base:
         raise StepError("no base: origin/main not found in slot")
     action = f"resume origin/{branch}" if ref(f"origin/{branch}") else f"create it at {base}"
-    return base, branch, action
+    pr_group = f"u/tfriedman/pr/{slugs[0]}" if slugs else "none"
+    return base, branch, action, pr_group
 
 
 def render(values):
@@ -128,7 +129,7 @@ def dispatch(bead, done_when, name=None):
             raise StepError("injected fault")
 
         step = "brief"
-        base, a["branch"], action = base_and_branch(issue, a["slot"])
+        base, a["branch"], action, pr_group = base_and_branch(issue, a["slot"])
         LOG_DIR.mkdir(parents=True, exist_ok=True)
         brief, base_file = LOG_DIR / f"dispatch-{bead}-{n}.md", LOG_DIR / f"base-{bead}"
         a["brief"] = str(brief)
@@ -143,7 +144,8 @@ def dispatch(bead, done_when, name=None):
         undo.append(("brief", unbrief))
         brief.write_text(render({"bead": bead, "title": issue["title"], "name": name, "attempt": n,
                                  "slot": a["slot"], "base_sha": base, "branch": a["branch"],
-                                 "branch_action": action, "done_when": done_when}))
+                                 "branch_action": action, "pr_group": pr_group,
+                                 "done_when": done_when}))
         base_file.write_text(base + "\n")
         if fault == step:
             raise StepError("injected fault")
@@ -389,6 +391,7 @@ def self_test():
             assert argv[argv.index("--settings") + 1] == str(SETTINGS) and SETTINGS.exists(), argv
             brief = (LOG_DIR / f"dispatch-{b}-1.md").read_text()
             assert main_sha in brief and "make test" in brief and "Escalate only for" in brief
+            assert "PR group: `u/tfriedman/pr/none-such`" in brief, brief
             assert (LOG_DIR / f"base-{b}").read_text().strip() == main_sha
             # A claimed bead is refused before any side effect.
             assert quiet(b, "true") == 1 and len(leases()) == 1

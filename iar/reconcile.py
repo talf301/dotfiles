@@ -515,9 +515,10 @@ def src_git(snap):
 
 def stacked_groups(repo, slugs):
     """{slug: reason} for the PR groups the loop must not dispatch (W9b): listed in stack-owners.conf, or not based
-    on the default branch: another unmerged group branch is an ancestor of it (it is stacked on that group), or the
+    on the default branch: another unmerged group branch is an ancestor of it (it is stacked on that group), the
     two share commits not on the default branch and neither contains the other (a stack that needs a restack, and
-    git cannot tell which is the bottom one: both wait). Fetches the default branch and the group branches first."""
+    git cannot tell which is the bottom one: both wait), or the default branch head is not its ancestor.
+    A group branch that does not exist yet is based on the default branch. Fetches those branches first."""
     git = ["/usr/bin/git", "-C", repo]
     globs = []
     with contextlib.suppress(OSError), open(STACK_OWNERS) as f:
@@ -544,6 +545,9 @@ def stacked_groups(repo, slugs):
                 out[slug] = f"stacked group: use pr-stack (shares unmerged commits with {other[7:]}, needs a restack)"
             if slug in out:
                 break
+        # ponytail: as the spec says; a group the default branch moved past waits until main is merged into it
+        if slug not in out and g in groups and not ancestor(default, g):
+            out[slug] = f"stacked group: use pr-stack (not based on {default}: {default} is not its ancestor)"
     return out
 
 
@@ -1858,9 +1862,12 @@ def w9b_stack_test():
             ref("u/tfriedman/pr/a", commit("a2", a1))  # a moved on after b was made: no order, both wait
             diverged = stacked_groups(w, {"a", "b", "c"})
             assert sorted(diverged) == ["a", "b"] and "needs a restack" in diverged["a"], diverged
-            ref("master", commit("merge a", m, a1))  # a1 merged: b is now based on the default branch
-            ref("u/tfriedman/pr/a", a1)
-            assert stacked_groups(w, {"a", "b", "c"}) == {}, stacked_groups(w, {"a", "b", "c"})
+            m2 = commit("m2", m)
+            ref("master", m2)  # the default branch moved past c: c waits until it is merged in
+            moved = stacked_groups(w, {"c"})
+            assert moved["c"].endswith("(not based on origin/master: origin/master is not its ancestor)"), moved
+            ref("u/tfriedman/pr/c", commit("merge master", git(o, "rev-parse", "u/tfriedman/pr/c"), m2))
+            assert stacked_groups(w, {"c"}) == {}, stacked_groups(w, {"c"})
         finally:
             STACK_OWNERS = saved
     body = "Files:\n- iar/{f}.py\n\nDone when: `true`\n"

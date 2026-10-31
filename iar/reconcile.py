@@ -86,6 +86,14 @@ def json_lines(text):
     return [json.loads(line) for line in text.splitlines() if line.strip().startswith("{")]
 
 
+def strict_lines(text):
+    """Every non-blank line is one JSON object; anything else raises ValueError."""
+    rows = [json.loads(line) for line in text.splitlines() if line.strip()]
+    if not all(isinstance(row, dict) for row in rows):
+        raise ValueError("a line that is not a JSON object")
+    return rows
+
+
 def read_json(path):
     try:
         with open(path) as f:
@@ -145,10 +153,30 @@ def transcript_facts(sid):
     return facts
 
 
+def check_agents(rows):
+    """Every field classify reads: sessionId, kind; state for background; pid an int when present."""
+    need(isinstance(rows, list), "claude agents: a list")
+    for r in rows:
+        need(isinstance(r, dict) and isinstance(r.get("sessionId"), str), "claude agents: sessionId")
+        need(r.get("kind") in ("background", "interactive"), f"claude agents {r.get('sessionId')}: kind")
+        need(r["kind"] == "interactive" or isinstance(r.get("state"), str), f"claude agents {r['sessionId']}: state")
+        need(r.get("pid") is None or isinstance(r["pid"], int), f"claude agents {r['sessionId']}: pid")
+        need(r.get("status") is None or isinstance(r["status"], str), f"claude agents {r['sessionId']}: status")
+    return rows
+
+
+def check_slots(rows):
+    """name and status on every slot; a leased slot also has a string lease_holder and a processes list."""
+    need(isinstance(rows, list), "treehouse status: a list")
+    for r in rows:
+        need(isinstance(r, dict) and "name" in r and isinstance(r.get("status"), str), "treehouse status: name, status")
+        need(r["status"] != "leased" or (isinstance(r.get("lease_holder"), str) and isinstance(r.get("processes"), list)),
+             f"treehouse slot {r['name']}: lease_holder, processes")
+    return rows
+
+
 def src_agents(snap):
-    rows = json.loads(sh([f"{BIN}/claude", "agents", "--json", "--all"]))
-    need(isinstance(rows, list) and all(isinstance(r, dict) and isinstance(r.get("sessionId"), str) for r in rows),
-         "claude agents: a list of objects with sessionId")
+    rows = check_agents(json.loads(sh([f"{BIN}/claude", "agents", "--json", "--all"])))
     procs = processes()
     sessions = []
     for r in rows:
@@ -170,9 +198,7 @@ def src_agents(snap):
 
 
 def src_treehouse(snap):
-    rows = json.loads(sh([f"{BIN}/treehouse", "status", "--json"], cwd=PRECOG))
-    need(isinstance(rows, list) and all(isinstance(r, dict) and "name" in r and "status" in r for r in rows),
-         "treehouse status: a list of slots with name and status")
+    rows = check_slots(json.loads(sh([f"{BIN}/treehouse", "status", "--json"], cwd=PRECOG)))
     snap["slots"] = [{"slot": r["name"], "path": r.get("path"), "holder": r.get("lease_holder") or "",
                       "live": bool(r.get("processes"))} for r in rows if r["status"] == "leased"]
 
@@ -182,12 +208,12 @@ def inbox_threads():
     messages, questions, first_seq = {}, {}, {}
     for path in glob.glob(f"{INBOX}/projects/*/messages.jsonl"):
         with open(path) as f:
-            for row in json_lines(f.read()):
+            for row in strict_lines(f.read()):
                 messages[row["id"]] = row["record"]
                 first_seq.setdefault(row["id"], row["seq"])
     for path in glob.glob(f"{INBOX}/projects/*/questions.jsonl"):
         with open(path) as f:
-            for row in json_lines(f.read()):
+            for row in strict_lines(f.read()):
                 questions[row["id"]] = row["record"]
     threads = {}
     for m in sorted(messages.values(), key=lambda m: m["created_at"]):
@@ -346,8 +372,8 @@ def classify_bead(bid, b, snap, now, stall_after, sessions, leases, threads):
     owned = n is not None and b.get("assignee") == f"agent:{bid}#{n}"
     if b.get("assignee") and not owned and not re.match(rf"^agent:{re.escape(bid)}#\d+$", b["assignee"]):
         return "external", []  # claimed by anything other than bin/bg: no action at all, leases included
-    stale = [lease for lease in leases.get(bid, [])
-             if not (b["status"] == "in_progress" and b.get("assignee") == lease["holder"])]
+    stale = [lease for lease in leases.get(bid, []) if int(HOLDER_RE.match(lease["holder"])[2]) in att
+             and not (b["status"] == "in_progress" and b.get("assignee") == lease["holder"])]  # a lease of a recorded attempt
     if not owned and not stale:
         return "external", []
     s = sessions.get(att[n]["session"]) if owned else None
@@ -480,7 +506,7 @@ def self_test():
             bead("precog-ap"), bead("precog-dl"), bead("precog-dl2"), bead("precog-mq"), bead("precog-st"),
             bead("precog-zm"), bead("precog-zp"), bead("precog-sl", status="open", assignee=""),
             bead("precog-ct", status="closed"), bead("precog-wk"), bead("precog-wt"), bead("precog-id"),
-            bead("precog-ex", n=0, assignee="factory-wf"), bead("precog-ex2", assignee="factory-wf"),  # old bg lease, foreign claim
+            bead("precog-ex", n=0, assignee="factory-wf"), bead("precog-nl", n=0, status="open", assignee=""), bead("precog-ex2", assignee="factory-wf"),  # old bg lease, foreign claim
             # precedence conflicts
             bead("precog-c1"),                                   # stalled + answer-pending
             bead("precog-c2", n=2),                              # zombie + stale-lease (lease of attempt 1)
@@ -507,7 +533,7 @@ def self_test():
         ],
         "slots": [{"slot": "4", "holder": "agent:precog-sl#1"}, {"slot": "5", "holder": "agent:precog-c2#1"},
                   {"slot": "6", "holder": "agent:precog-c3#1"}, {"slot": "7", "holder": "agent:precog-ex2#1"},
-                  {"slot": "8", "holder": "agent:task-x"}, {"slot": "9", "holder": "agent:dispatch-bead:precog-ex"}],
+                  {"slot": "8", "holder": "agent:task-x"}, {"slot": "10", "holder": "agent:precog-nl#1"}, {"slot": "9", "holder": "agent:dispatch-bead:precog-ex"}],
         "inbox": [{"id": "m-ct", "subject": "precog-ct: integrate?", "session": "zz"},
                   {"id": "m-c3", "subject": "other", "session": "s-precog-c3-1"},
                   {"id": "m-ex", "subject": "precog-ex: hi", "session": "zz"}],
@@ -516,7 +542,7 @@ def self_test():
         "precog-ap": "answer-pending", "precog-dl": "question-deadline", "precog-dl2": "question-deadline",
         "precog-mq": "malformed-question", "precog-st": "stalled", "precog-zm": "zombie", "precog-zp": "zombie",
         "precog-sl": "stale-lease", "precog-ct": "closed-bead-thread", "precog-wk": "working",
-        "precog-wt": "waiting", "precog-id": "idle", "precog-ex": "external", "precog-ex2": "external",
+        "precog-wt": "waiting", "precog-id": "idle", "precog-ex": "external", "precog-ex2": "external", "precog-nl": "external",
         "precog-c1": "answer-pending", "precog-c2": "zombie", "precog-c3": "stale-lease", "precog-rp": "idle",
         "precog-ag": "stalled",
     }
@@ -555,6 +581,19 @@ def self_test():
     assert bad["errors"] == {"treehouse": "SourceError: treehouse status: no answer in 30s"}, bad["errors"]
     e8a = classify(bad, now)
     assert e8a["actions"] == [] and set(e8a["classes"].values()) == {"source-error"}, e8a
+
+    # Schema checks: a record missing a field classify reads fails its source.
+    for check, rows in [(check_agents, [{"sessionId": "a", "kind": "background"}]),
+                        (check_agents, [{"sessionId": "a", "kind": "interactive", "pid": "1"}]),
+                        (check_slots, [{"name": "1", "status": "leased", "processes": []}]),
+                        (strict_lines, "{}\nnot json\n"), (strict_lines, "[1]\n")]:
+        try:
+            check(rows)
+            raise AssertionError(f"{check.__name__} accepted {rows!r}")
+        except (SourceError, ValueError):
+            pass
+    assert check_agents([{"sessionId": "a", "kind": "interactive", "pid": 1, "status": "idle"}])
+    assert check_slots([{"name": "1", "status": "available"}]) and strict_lines("{}\n\n") == [{}]
 
     # src_br fetches a closed bead whose thread is linked only by its author session's name (session stopped).
     real = ledger.list_issues, ledger.show_many

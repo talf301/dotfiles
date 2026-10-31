@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 """reconcile: one snapshot of the factory, one class per item, the actions a tick would take.
 
-Spec: precog-am8w W10 (read-only core), with the live/zombie predicates of
-iar/research/factory-scan.md 1.4. The executor (W11) is not here: only --dry-run exists.
+Spec: precog-am8w W10 (read-only core) and W11 (executor), with the live/zombie predicates of
+iar/research/factory-scan.md 1.4.
 
-  reconcile.py --dry-run [--board]   take the lock, snapshot, classify, append one line to
-                                     $IAR_STATE_DIR/reconcile.jsonl (default ~/.local/state/iar);
+  reconcile.py [--board]             one tick: take the lock, snapshot, classify, execute the actions
+                                     of the classes switched on in WORKFLOW.md `actions`, append one
+                                     line to $IAR_STATE_DIR/reconcile.jsonl (default ~/.local/state/iar);
                                      --board also writes board.md from the same snapshot
+  reconcile.py --dry-run [--board]   the same, but execute nothing
+  reconcile.py --enable <class>      switch one action class on in WORKFLOW.md
+  reconcile.py --kill                switch every action class off in WORKFLOW.md
   reconcile.py --self-test           fixtures only; touches no store, session or lease
 
 Sources (30 s timeout and a schema check each): br (through ledger.py), `claude agents --json`
@@ -20,6 +24,12 @@ matches its assignee `agent:<bead>#<n>`. Leases count only when the holder is ex
 Classes, first match wins: source-error, external, answer-pending, question-deadline,
 malformed-question, stalled, zombie, stale-lease, closed-bead-thread, working, waiting, idle.
 An action is `reconcile: <action> <key>` on the bead; a key already in its comments is not proposed.
+
+Executor: for each proposed action, the tick reloads the switches (so --kill stops a running tick),
+re-reads the bead and skips a key already recorded. If the action's own effect is already visible
+(a crash after acting and before the comment), it writes the comment and does not act again.
+Else it acts, then writes the comment. An action fails alone: no comment, the next tick retries it.
+Actions are in EXECUTORS by verb (W12, W13); a verb with no executor is skipped.
 Exit 75: another tick holds $IAR_STATE_DIR/reconcile.lock.
 """
 
@@ -453,6 +463,77 @@ def classify(snap, now, stall_after_min=30):
     return {"classes": classes, "actions": actions}
 
 
+# --- execute ---
+
+# verb (first word of the action key) -> (visible(action, snap) -> bool, act(action, snap)).
+# visible: the action's own effect already shows (for example the lease is already returned).
+EXECUTORS = {}
+
+
+def execute(snap, actions, executors=None):
+    """Apply each action of a switched-on class once. Returns [{item, action, outcome}]."""
+    executors = EXECUTORS if executors is None else executors
+    out = []
+    if snap["errors"]:
+        return out  # E8b: a failing tick does nothing
+    for a in actions:
+        def note(outcome):
+            out.append({"item": a["item"], "action": a["action"], "outcome": outcome})
+        try:
+            if not workflow.load()[0]["actions"].get(a["class"]):
+                note("off")
+                continue
+        except workflow.WorkflowError as e:
+            note(f"error: {e}")
+            break  # no readable switches: act on nothing
+        ex = executors.get(a["action"].split()[0])
+        if not ex:
+            note("no-executor")
+            continue
+        try:
+            if a["action"] in done_keys(ledger.show(a["item"])):
+                note("recorded")
+                continue
+            visible, act = ex
+            recovered = visible(a, snap)
+            if not recovered:
+                act(a, snap)
+            ledger.comment(a["item"], f"reconcile: {a['action']}")
+            note("recovered" if recovered else "done")
+        except Exception as e:  # one failed action does not stop the others; no comment, so the next tick retries
+            note(f"error: {type(e).__name__}: {e}")
+    return out
+
+
+def set_switches(enable=None, path=None):
+    """--enable <class>: switch one class on. --kill (enable None): switch every class off.
+    Edits only the switch lines of WORKFLOW.md, checks the result loads, then replaces the file."""
+    path = os.path.realpath(path or os.environ.get("IAR_WORKFLOW") or os.path.join(IAR, "WORKFLOW.md"))
+    config, _ = workflow.load(path)
+    if enable is not None and enable not in config["actions"]:
+        raise workflow.WorkflowError(f"unknown class {enable!r}; classes: {', '.join(config['actions'])}")
+    with open(path) as f:
+        text = f.read()
+    m = re.search(r'"actions": \{[^}]*\}', text)
+    names = config["actions"] if enable is None else [enable]
+    block = m[0]
+    for name in names:
+        block = re.sub(rf'("{re.escape(name)}": )(true|false)', rf"\g<1>{'true' if enable else 'false'}", block)
+    text = text[:m.start()] + block + text[m.end():]
+    with tempfile.NamedTemporaryFile("w", dir=os.path.dirname(path), delete=False) as f:
+        f.write(text)
+    os.chmod(f.name, os.stat(path).st_mode & 0o7777)
+    try:
+        new = workflow.load(f.name)[0]["actions"]
+        if new != {k: (enable is not None if k in names else v) for k, v in config["actions"].items()}:
+            raise workflow.WorkflowError(f"{path}: switch edit did not apply: {new}")
+    except BaseException:
+        os.unlink(f.name)
+        raise
+    os.replace(f.name, path)
+    return new
+
+
 # --- tick ---
 
 def state_dir():
@@ -461,37 +542,59 @@ def state_dir():
     return d
 
 
-def main(argv):
-    if "--self-test" in argv:
-        self_test()
-        return 0
-    if "--dry-run" not in argv:
-        print("reconcile: only --dry-run exists until the executor (W11)", file=sys.stderr)
-        return 2
-    d = state_dir()
+def tick(d, dry_run, sources=None, executors=None, board=False):
+    """One tick under the lock. Returns (exit code, the line written to reconcile.jsonl or None)."""
     lock = open(os.path.join(d, "reconcile.lock"), "a")
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
-        print("reconcile: another tick holds the lock", file=sys.stderr)
-        return 75
-    os.environ["PATH"] = f"{BIN}:/opt/homebrew/bin:{os.environ.get('PATH', '/usr/bin:/bin')}"
-    now = datetime.now(timezone.utc)
+        lock.close()
+        return 75, None
     try:
-        config, _ = workflow.load()
-        os.environ.setdefault("BEADS_DIR", config["tracker"]["beads_dir"])
-        snap = snapshot(now, state_dir=d)
-        stall = config["stall_after_min"]
-    except workflow.WorkflowError as e:
-        snap, stall = {**json.loads(json.dumps(DEFAULTS)), "errors": {"workflow": str(e)}}, 30
-    result = classify(snap, now, stall)
-    line = {"at": now.isoformat(), "dry_run": True, "errors": snap["errors"], **result}
-    with open(os.path.join(d, "reconcile.jsonl"), "a") as f:
-        f.write(json.dumps(line) + "\n")
-    if "--board" in argv:
-        import board
-        board.write(board.render(board.classify(snap, now)), now)
-    print(json.dumps({"errors": snap["errors"], "actions": len(result["actions"])}))
+        now = datetime.now(timezone.utc)
+        try:
+            config, _ = workflow.load()
+            os.environ.setdefault("BEADS_DIR", config["tracker"]["beads_dir"])
+            snap = snapshot(now, sources, state_dir=d)
+            stall = config["stall_after_min"]
+        except workflow.WorkflowError as e:
+            snap, stall = {**json.loads(json.dumps(DEFAULTS)), "errors": {"workflow": str(e)}}, 30
+        result = classify(snap, now, stall)
+        line = {"at": now.isoformat(), "dry_run": dry_run, "errors": snap["errors"], **result}
+        if not dry_run:
+            line["executed"] = execute(snap, result["actions"], executors)
+        with open(os.path.join(d, "reconcile.jsonl"), "a") as f:
+            f.write(json.dumps(line) + "\n")
+        if board:
+            import board as board_mod
+            board_mod.write(board_mod.render(board_mod.classify(snap, now)), now)
+        return 0, line
+    finally:
+        lock.close()
+
+
+def main(argv):
+    if "--self-test" in argv:
+        self_test()
+        return 0
+    if "--kill" in argv or "--enable" in argv:
+        cls = argv[argv.index("--enable") + 1:][:1] if "--enable" in argv else [None]
+        if not cls:
+            print("reconcile: usage: --enable <class>", file=sys.stderr)
+            return 2
+        try:
+            print(json.dumps(set_switches(cls[0])))
+        except workflow.WorkflowError as e:
+            print(f"reconcile: {e}", file=sys.stderr)
+            return 2
+        return 0
+    os.environ["PATH"] = f"{BIN}:/opt/homebrew/bin:{os.environ.get('PATH', '/usr/bin:/bin')}"
+    code, line = tick(state_dir(), "--dry-run" in argv, board="--board" in argv)
+    if code == 75:
+        print("reconcile: another tick holds the lock", file=sys.stderr)
+        return code
+    print(json.dumps({"errors": line["errors"], "actions": len(line["actions"]),
+                      **({"executed": line["executed"]} if "executed" in line else {})}))
     return 0
 
 
@@ -665,7 +768,98 @@ def self_test():
     assert not inbox_quiet({"id": "r", "person_seen_seq": 3}, [agent("r"), agent("m2")], seqs, False)
     assert not inbox_quiet({"id": "r", "person_seen_seq": 9}, [agent("r")], seqs, True)
     assert inbox_quiet({"id": "r", "person_read_seq": 6}, [agent("r"), agent("m2")], seqs, True)
+    executor_self_test(bead)
     print("reconcile self-test: ok")
+
+
+def executor_self_test(bead):
+    """W11: switches, journal, E6, E8b, crash recovery. A fake tracker and fake sources; no real store."""
+    import threading
+    store = {b["id"]: b for b in [bead("precog-sl", status="open", assignee=""),  # stale-lease: return-lease
+                                  bead("precog-zm")]}                              # zombie: flag-zombie
+    slots = [{"slot": "4", "holder": "agent:precog-sl#1"}]
+    returned, flagged, fail = [], [], {"comment": 0, "source": False}
+
+    def show(bid):
+        return json.loads(json.dumps(store[bid]))
+
+    def comment(bid, text, author=None):
+        if fail["comment"]:
+            fail["comment"] -= 1
+            raise ledger.LedgerError("br comments failed (crash after the action)")
+        store[bid]["comments"].append({"text": text})
+
+    def treehouse(s):
+        if fail["source"]:
+            raise SourceError("treehouse status: no answer in 30s")
+        s["slots"] = [x for x in slots if x["slot"] not in returned]
+    fakes = {"agents": lambda s: None, "treehouse": treehouse, "inbox": lambda s: None,
+             "plannotator": lambda s: None, "git": lambda s: None,
+             "br": lambda s: s.update(issues={k: show(k) for k in store})}
+
+    def act_return(a, snap):
+        time.sleep(0.2)  # long enough for a concurrent tick to overlap
+        returned.append(a["action"].split()[1][len("slot="):])
+    executors = {"return-lease": (lambda a, snap: a["action"].split()[1][len("slot="):] in returned, act_return),
+                 "flag-zombie": (lambda a, snap: False, lambda a, snap: flagged.append(a["item"]))}
+
+    real = ledger.show, ledger.comment
+    saved_env = {k: os.environ.get(k) for k in ("IAR_WORKFLOW", "BEADS_DIR")}
+    with tempfile.TemporaryDirectory() as d:
+        wf = os.path.join(d, "WORKFLOW.md")
+        with open(os.path.join(IAR, "WORKFLOW.md")) as src, open(wf, "w") as dst:
+            dst.write(src.read())
+        os.environ.update(IAR_WORKFLOW=wf, BEADS_DIR=d)
+        ledger.show, ledger.comment = show, comment
+        try:
+            run = lambda: tick(d, False, fakes, executors)[1]["executed"]
+            # Switches: all off -> nothing acts. --enable turns one class on; an unknown class fails.
+            assert {x["outcome"] for x in run()} == {"off"} and not returned + flagged
+            assert set_switches("stale-lease")["stale-lease"] is True
+            try:
+                set_switches("no-such-class")
+                raise AssertionError("set_switches accepted an unknown class")
+            except workflow.WorkflowError:
+                pass
+            # E8b: a failing tick does nothing; the next healthy tick does each pending action once.
+            fail["source"] = True
+            assert run() == [] and not returned
+            fail["source"] = False
+            # E6: two ticks started at the same time do one action.
+            start, codes = threading.Barrier(2), []
+            def racer():
+                start.wait()
+                codes.append(tick(d, False, fakes, executors)[0])
+            threads = [threading.Thread(target=racer) for _ in range(2)]
+            for th in threads:
+                th.start()
+            for th in threads:
+                th.join()
+            assert returned == ["4"] and 0 in codes, (returned, codes)
+            assert [c["text"] for c in store["precog-sl"]["comments"]].count(
+                "reconcile: return-lease slot=4 holder=agent:precog-sl#1") == 1
+            assert run() == [{"item": "precog-zm", "action": "flag-zombie attempt=1", "outcome": "off"}]
+            # A stale snapshot still proposing a recorded key: the fresh check before acting skips it.
+            assert execute({"errors": {}}, [{"item": "precog-sl", "class": "stale-lease",
+                                              "action": "return-lease slot=4 holder=agent:precog-sl#1"}],
+                           executors)[0]["outcome"] == "recorded" and returned == ["4"]
+            # Crash between "action done" and "comment written": the next tick sees the effect, writes only the comment.
+            assert set_switches("zombie")["zombie"] is True
+            flag_visible = lambda a, snap: a["item"] in flagged
+            executors["flag-zombie"] = (flag_visible, executors["flag-zombie"][1])
+            fail["comment"] = 1
+            assert run()[0]["outcome"].startswith("error: LedgerError") and flagged == ["precog-zm"]
+            assert run() == [{"item": "precog-zm", "action": "flag-zombie attempt=1", "outcome": "recovered"}]
+            assert flagged == ["precog-zm"] and run() == []
+            # --kill switches every class off.
+            assert not any(set_switches().values())
+            assert workflow.load(wf)[0]["actions"] == workflow.load(os.path.join(IAR, "WORKFLOW.md"))[0]["actions"]
+            with open(os.path.join(d, "reconcile.jsonl")) as f:
+                assert all(json.loads(x)["dry_run"] is False for x in f)
+        finally:
+            ledger.show, ledger.comment = real
+            for k, v in saved_env.items():
+                os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
 
 
 if __name__ == "__main__":

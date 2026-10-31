@@ -80,7 +80,7 @@ def render(values, path=None):
 
 def self_test():
     config, template = load()
-    assert config["actions"] and not any(config["actions"].values()), config["actions"]
+    assert config["actions"], "no action switches"  # reconcile.py --enable/--kill set them; load checks booleans
     for var in ("bead", "attempt", "base_sha", "slot", "branch"):
         assert "{{%s}}" % var in template, var
     # W9: the approved path with a PR group integrates and asks nothing; without a group it asks.

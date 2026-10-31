@@ -242,6 +242,9 @@ def src_br(snap):
         want = {i["id"] for i in snap["beads"]}
         want |= {m[1] for s in snap["slots"] if (m := HOLDER_RE.match(s["holder"]))}
         want |= {m[1] for t in snap["inbox"] if (m := BEAD_RE.match(t["subject"]))}
+        # A thread with another subject still belongs to the bead its author session is named after.
+        names = {s["sessionId"]: s.get("name") or "" for s in snap["sessions"]}
+        want |= {m[1] for t in snap["inbox"] if (m := BEAD_RE.match(names.get(t.get("session"), "")))}
         shown = ledger.show_many(sorted(want & known))
         need(all(isinstance(i, dict) and isinstance(i.get("comments", []), list) for i in shown), "tracker show: issues")
         snap["issues"] = {i["id"]: i for i in shown}
@@ -303,7 +306,7 @@ def snapshot(now, sources=None, state_dir=None):
     for name, fn in {**SOURCES, **(sources or {})}.items():
         try:
             fn(snap)
-        except (SourceError, ValueError, TypeError, KeyError) as e:
+        except (SourceError, OSError, ValueError, TypeError, KeyError) as e:
             snap["errors"][name] = f"{type(e).__name__}: {e}"
     in_progress = {b["id"] for b in snap["beads"]}
     for s in snap["sessions"]:
@@ -526,6 +529,22 @@ def self_test():
     assert bad["errors"] == {"treehouse": "SourceError: treehouse status: no answer in 30s"}, bad["errors"]
     e8a = classify(bad, now)
     assert e8a["actions"] == [] and set(e8a["classes"].values()) == {"source-error"}, e8a
+
+    # src_br fetches a closed bead whose thread is linked only by its author session's name.
+    real = ledger.list_issues, ledger.show_many
+    asked = []
+    ledger.list_issues = lambda status=None, labels=(): [{"id": "precog-cs", "status": "closed"}]
+    ledger.show_many = lambda ids: asked.extend(ids) or [bead("precog-cs", status="closed")]
+    try:
+        s = {**json.loads(json.dumps(DEFAULTS)), "sessions": [sess("precog-cs", state="done")],
+             "inbox": [{"id": "m-cs", "subject": "landed", "session": "s-precog-cs-1"}]}
+        src_br(s)
+    finally:
+        ledger.list_issues, ledger.show_many = real
+    assert asked == ["precog-cs"], asked
+    s["errors"] = {}
+    assert classify(s, now)["actions"] == [{"item": "precog-cs", "class": "closed-bead-thread",
+                                            "action": "resolve-thread thread=m-cs"}]
 
     # cpu_active: unknown without a 5-min-old sample, then compares CPU time.
     with tempfile.TemporaryDirectory() as d:

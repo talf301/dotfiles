@@ -55,6 +55,20 @@ W13 (questions of loop-owned beads; question beads come from iar/ask):
                       or reping (not reversible: one reminder in the thread); a gated question has no deadline
   malformed-question  flag-malformed: a note; the board lists every one under Needs you (malformed()); no bead invented
   inbox-pending       post-question: post a question bead that ask could not post; last of the action classes
+W14 (dispatch, class `dispatch`, after the other actions of the tick):
+  preflight           WORKFLOW.md loads and every source answered. A WORKFLOW.md that does not load blocks dispatch
+                      only: the other actions run on the last good config ($IAR_STATE_DIR/workflow-good.json; --kill
+                      switches it off too), and the jsonl line and board show `config error: <msg>`
+  candidates          `ready` task beads with tracker.dispatch_label, open, unassigned, not no-swarm, quarantined or
+                      auto:blocked; sorted by priority, then creation time
+  reject-auto         the gate fails (no `Files:` list, no `Done when:` line with a `command`, a budget block that
+                      budget.py rejects), or limits.max_attempts attempts were made (also quarantined + needs-human):
+                      one note and the label auto:blocked
+  dispatch            `bin/bg <bead> --done-when <cmd> --auto` while loop-owned in_progress beads are fewer than
+                      agent.max_concurrent (and max_concurrent_by_state.in_progress), at most
+                      limits.max_starts_per_tick (default 2) per tick. Files that overlap an in_progress bead or a
+                      running session's bead: wait. After n `attempt-failed:` comments: wait 10 s * 2^(n-1), at most
+                      max_retry_backoff_ms. All state is in bead comments, so a lost $IAR_STATE_DIR repeats nothing (E12)
 A flag is a `reconcile-note: <key>` comment. Before a nudge that stops a running session, flag-stalled, quarantine
 or stop-session, the tick saves the
 last 40 lines of the session's final assistant text (`last-output: <key>`).
@@ -63,8 +77,10 @@ session is stopped first (verified); conversation, attempt, slot and branch stay
 Exit 75: another tick holds $IAR_STATE_DIR/reconcile.lock.
 """
 
+import contextlib
 import fcntl
 import glob
+import io
 import json
 import os
 import re
@@ -77,6 +93,7 @@ from datetime import datetime, timedelta, timezone
 
 IAR = os.path.dirname(os.path.realpath(__file__))
 sys.path.insert(0, IAR)
+import budget  # noqa: E402
 import ledger  # noqa: E402
 import question  # noqa: E402
 import workflow  # noqa: E402
@@ -93,8 +110,19 @@ HOLDER_RE = re.compile(r"^agent:([a-z0-9]+-[a-z0-9.]+)#(\d+)$")
 ATTEMPT_RE = re.compile(r"^attempt: (\d+) session: (\S+) slot: (\S+) branch: (\S+)")
 QID_RE = re.compile(r"^QUESTION:\s*(precog-[A-Za-z0-9]+(?:\.[A-Za-z0-9]+)*)\.?(?:\s|$)")  # as in notify-stop.sh
 DEFAULTS = {"sessions": [], "slots": [], "inbox": [], "inbox_url": "http://localhost/", "plannotator": [],
-            "beads": [], "questions": [], "inbox_answers": {}, "issues": {}, "git": {}, "slot_git": {}, "session_names": {}}
-LIMITS = {"max_attempts": 3, "max_attempt_hours": 4, "max_attempt_tokens": 3_000_000}  # WORKFLOW.md `limits` overrides
+            "beads": [], "questions": [], "inbox_answers": {}, "issues": {}, "git": {}, "slot_git": {}, "session_names": {},
+            "candidates": []}
+LIMITS = {"max_attempts": 3, "max_attempt_hours": 4, "max_attempt_tokens": 3_000_000,
+          "max_starts_per_tick": 2}  # WORKFLOW.md `limits` overrides
+DISPATCH_LABEL = ["auto"]  # WORKFLOW.md tracker.dispatch_label; tick sets it before the snapshot
+AUTO_BLOCKED = "auto:blocked"
+BG = os.path.join(os.path.dirname(IAR), "bin", "bg")  # IAR_BG overrides it (tests)
+BG_TIMEOUT_S = 1200  # bin/bg leases (up to 15 min) and waits for the session
+TRY_RE = re.compile(r"^attempt(?:: |-failed: \S+ attempt=)(\d+)\b")  # bin/bg next_attempt numbering
+# ponytail: keyword guess at "needs compute"; it errs toward a reject (Tal adds a budget block or dispatches by hand)
+COMPUTE_RE = re.compile(r"(?i)\b(gpu|cluster|flyte|sky (?:launch|exec|jobs)|skypilot|ray job|aws|baseten|training run|"
+                        r"eval run|sagemaker|ec2|s3://)")
+LAST_GOOD = [None]  # the last WORKFLOW.md config that loaded; actions run on it while the file is bad
 LIMIT_GRACE = timedelta(minutes=15)  # after a limit-nudge, still working this long: quarantine
 QUARANTINE = "quarantined"
 OUTPUT_LINES = 40
@@ -411,6 +439,11 @@ def src_br(snap):
         shown = ledger.show_many(sorted(want & known))
         check_issues(shown)
         snap["issues"] = {i["id"]: i for i in shown}
+        # W14 candidates: ready task beads with the dispatch label, with their comments (attempts, backoff).
+        ledger.TIMEOUT_S = left()
+        ready = [i["id"] for i in ledger.ready(labels=[DISPATCH_LABEL[0]], type="task")]
+        ledger.TIMEOUT_S = left()
+        snap["candidates"] = check_issues(ledger.show_many(sorted(ready)))
     except ledger.LedgerError as e:
         raise SourceError(str(e))
     finally:
@@ -678,6 +711,128 @@ def classify(snap, now, stall_after_min=30, limits=None):
     return {"classes": classes, "actions": actions}
 
 
+# --- W14 dispatch plan: pure (budget_check aside) ---
+
+def bead_files(issue):
+    """The paths of the bead's `Files:` list (`- <path> ...` lines, up to the first other line); `(none ...)` is no
+    path. A path under a known repo (dotfiles, Precog) becomes repo-relative, so `~/dotfiles/iar/x.py` and
+    `iar/x.py` are one file."""
+    m = re.search(r"(?im)^\W*files:[ \t]*\n((?:[ \t]*[-*] .*(?:\n|$))+)", issue.get("description") or "")
+    items = [line.strip()[2:].strip() for line in (m[1].splitlines() if m else [])]
+    return {repo_path(x.split()[0].strip("`")) for x in items if x and not x.startswith("(")}
+
+
+def repo_path(path):
+    # ponytail: two known repo roots; a bead in another repo compares by its paths as written
+    p = os.path.normpath(os.path.expanduser(path))
+    for root in (f"{HOME}/dotfiles", PRECOG):
+        if p.startswith(root + "/"):
+            return p[len(root) + 1:]
+    return p
+
+
+def done_when(issue):
+    """The command of the bead's `Done when:` line: its first `backticked` span."""
+    text = "\n".join(issue.get(k) or "" for k in ("description", "acceptance_criteria"))
+    m = re.search(r"(?im)^\W*done[- ]when:[^`\n]*`([^`\n]+)`", text)
+    return m[1].strip() if m else None
+
+
+def next_try(issue):
+    """bin/bg's next attempt number: one more than any `attempt:` or `attempt-failed:` comment."""
+    return max((int(m[1]) for c in issue.get("comments") or [] if (m := TRY_RE.match(c.get("text") or ""))),
+               default=0) + 1
+
+
+def backoff_until(issue, max_ms):
+    """Dispatch retry: n `attempt-failed:` comments since the last `attempt:` comment wait 10 s * 2^(n-1), capped
+    at max_ms, after the latest failure. None: nothing to wait for."""
+    fails = []
+    for c in issue.get("comments") or []:
+        text = c.get("text") or ""
+        if ATTEMPT_RE.match(text):
+            fails = []
+        elif text.startswith("attempt-failed: "):
+            fails.append(parse_time(c.get("created_at")))
+    if not fails or fails[-1] is None:
+        return None
+    return fails[-1] + timedelta(milliseconds=min(10_000 * 2 ** (len(fails) - 1), max_ms))
+
+
+def gate(issue, busy, budget_check):
+    """The automatable part of the dispatch-bead readiness gate. None: dispatch. "wait: ...": its files overlap
+    running work, try again next tick. Anything else: the reason to reject it."""
+    files = bead_files(issue)
+    if not files:
+        return "no `Files:` list"
+    if not done_when(issue):
+        return "no `Done when:` line with a `command`"
+    text = "\n".join(issue.get(k) or "" for k in ("title", "description", "acceptance_criteria"))
+    has_block = re.search(r"(?m)^```[^\n]*\n\s*budget", text)
+    if not has_block and (word := COMPUTE_RE.search(text)):
+        return f"mentions compute ({word[0]!r}) but has no `budget:` block"
+    if has_block:
+        try:
+            budget_check(issue["id"])
+        except budget.BudgetError as e:
+            return f"budget block not valid: {e}"
+        except Exception as e:  # the tracker failed: not a verdict on the bead, try again next tick
+            return f"wait: budget check failed: {type(e).__name__}: {e}"
+    if overlap := sorted(files & busy):
+        return f"wait: files in use by running work: {', '.join(overlap)}"
+    return None
+
+
+def budget_check(bid):
+    """iar/budget.py <bead> exits 0: raises budget.BudgetError otherwise. Its report is not printed."""
+    with contextlib.redirect_stdout(io.StringIO()):
+        budget.check(bid)
+
+
+def plan_dispatch(snap, now, config, budget_check):
+    """W14: this tick's dispatch and reject-auto actions. Candidates by priority, then creation time. Starts are
+    limited by the free slots (agent.max_concurrent and max_concurrent_by_state.in_progress, counted over the
+    loop-owned in_progress beads) and by limits.max_starts_per_tick."""
+    lim = {**LIMITS, **(config.get("limits") or {})}
+    agent = config["agent"]
+    # Running attempts: a bin/bg claim (agent:<bead>#<n>) on an in_progress bead, with or without its attempt comment
+    # (bin/bg writes it last, after the session starts, so a claim alone is a start in flight), plus any bead whose
+    # recorded attempt session still runs whatever the bead's status (closed, deferred: stopped later).
+    live_sids = {s.get("sessionId") for s in snap["sessions"] if running(s)}
+    owned = {bid for bid, b in snap["issues"].items()
+             if (b["status"] == "in_progress" and re.match(rf"^agent:{re.escape(bid)}#\d+$", b.get("assignee") or ""))
+             or any(x["session"] in live_sids for x in attempts(b).values())}
+    cap = min(agent["max_concurrent"], agent["max_concurrent_by_state"].get("in_progress", agent["max_concurrent"]))
+    starts = max(0, min(cap - len(owned), lim["max_starts_per_tick"]))
+    live = {s["bead"] for s in snap["sessions"] if s.get("bead") and running(s)}
+    busy = set()
+    for bid, b in snap["issues"].items():
+        if b["status"] == "in_progress" or bid in live:
+            busy |= bead_files(b)
+    out = []
+    for c in sorted(snap["candidates"], key=lambda c: (c.get("priority", 9), c.get("created_at") or "")):
+        if c["status"] != "open" or c.get("assignee") or set(c.get("labels") or []) & {"no-swarm", QUARANTINE, AUTO_BLOCKED}:
+            continue
+        n = sum(1 for k in done_keys(c) if k.startswith("reject-auto "))
+        reject = {"item": c["id"], "class": "dispatch", "action": f"reject-auto count={n + 1}"}
+        if (made := next_try(c) - 1) >= lim["max_attempts"]:  # started and failed attempts both count
+            out.append(dict(reject, over_limit=True, detail=f"over-limit: {made} attempts (started or failed) "
+                                                            f"reached limits.max_attempts {lim['max_attempts']}"))
+            continue
+        if (until := backoff_until(c, config["max_retry_backoff_ms"])) and now < until:
+            continue
+        why = gate(c, busy, budget_check)
+        if why and not why.startswith("wait: "):
+            out.append(dict(reject, detail=why))
+        if why or starts <= 0:
+            continue
+        starts -= 1
+        busy |= bead_files(c)
+        out.append({"item": c["id"], "class": "dispatch", "action": f"dispatch attempt={next_try(c)}",
+                    "done_when": done_when(c)})
+    return out
+
+
 # --- execute ---
 
 # verb (first word of the action key) -> (visible(action, snap) -> bool, act(action, snap)).
@@ -709,6 +864,17 @@ def finish(bid, text):
         ledger.label(bid, remove=[PENDING])
 
 
+def switches():
+    """WORKFLOW.md `actions`, read again for each action (so --kill stops a running tick). While the file does not
+    load, the last good switches with dispatch off (W14: a bad WORKFLOW.md blocks dispatch only)."""
+    try:
+        return workflow.load()[0]["actions"]
+    except workflow.WorkflowError:
+        if LAST_GOOD[0] is None:
+            raise
+        return {**LAST_GOOD[0]["actions"], "dispatch": False}
+
+
 def execute(snap, actions, executors=None):
     """Apply each action of a switched-on class once, and finish the open intents a crash left.
     Returns [{item, action, outcome}]."""
@@ -717,7 +883,7 @@ def execute(snap, actions, executors=None):
     if snap["errors"]:
         return out  # E8b: a failing tick does nothing
     try:
-        any_on = any(workflow.load()[0]["actions"].values())
+        any_on = any(switches().values())
     except workflow.WorkflowError as e:
         return [{"item": "-", "action": "-", "outcome": f"error: {e}"}]  # no readable switches: act on nothing
     work = [dict(a, proposed=True) for a in actions]
@@ -736,7 +902,7 @@ def execute(snap, actions, executors=None):
         def note(outcome):
             out.append({"item": a["item"], "action": a["action"], "outcome": outcome})
         try:
-            if not workflow.load()[0]["actions"].get(a["class"]):
+            if not switches().get(a["class"]):
                 note("off")
                 continue
         except workflow.WorkflowError as e:
@@ -1160,6 +1326,36 @@ EXECUTORS.update({
 })
 
 
+# --- W14 actions: dispatch, reject-auto ---
+
+def tried(a, snap):
+    """bin/bg wrote the attempt (`attempt: <n>`) or its failure (`attempt-failed: <step> attempt=<n>`)."""
+    n = key_field(a, "attempt")
+    return any((m := TRY_RE.match(c.get("text") or "")) and m[1] == n for c in ledger.show(a["item"]).get("comments") or [])
+
+
+def act_dispatch(a, snap):
+    """bin/bg, marked `dispatch: auto`. A failed start is recorded by bg (`attempt-failed:`) and retried with backoff."""
+    p = subprocess.run([os.environ.get("IAR_BG", BG), a["item"], "--done-when", a["done_when"], "--auto"],
+                       capture_output=True, text=True, timeout=BG_TIMEOUT_S)
+    if not tried(a, snap):
+        raise RuntimeError(f"bin/bg exit {p.returncode} wrote no attempt {key_field(a, 'attempt')}: "
+                           f"{(p.stderr or p.stdout).strip()[-300:]}")
+
+
+def act_reject(a, snap):
+    extra = [QUARANTINE, "needs-human"] if a.get("over_limit") else []
+    note(a, f"Not dispatched automatically: {a['detail']}. Fix the bead, then remove the label"
+            f"{'s' if extra else ''} `{'`, `'.join([AUTO_BLOCKED, *extra[:1]])}`.")
+    ledger.label(a["item"], add=[AUTO_BLOCKED, *extra])
+
+
+EXECUTORS.update({
+    "dispatch": (tried, act_dispatch),
+    "reject-auto": (lambda a, snap: AUTO_BLOCKED in (ledger.show(a["item"]).get("labels") or []), act_reject),
+})
+
+
 # --- tick ---
 
 def state_dir():
@@ -1178,16 +1374,29 @@ def tick(d, dry_run, sources=None, executors=None, board=False):
         return 75, None
     try:
         now = datetime.now(timezone.utc)
+        good, config_error = os.path.join(d, "workflow-good.json"), None
         try:
             config, _ = workflow.load()
+            with tempfile.NamedTemporaryFile("w", dir=d, delete=False) as f:
+                json.dump(config, f)
+            os.replace(f.name, good)
+        except workflow.WorkflowError as e:  # W14: blocks dispatch only; the rest runs on the last good config
+            config, config_error = read_json(good) or None, f"config error: {e}"
+        LAST_GOOD[0] = config
+        if config:
+            DISPATCH_LABEL[0] = config["tracker"]["dispatch_label"]
             os.environ.setdefault("BEADS_DIR", config["tracker"]["beads_dir"])
             snap = snapshot(now, sources, state_dir=d)
             stall, limits = config["stall_after_min"], config.get("limits")
-        except workflow.WorkflowError as e:
-            snap, stall = {**json.loads(json.dumps(DEFAULTS)), "errors": {"workflow": str(e)}}, 30
+        else:
+            snap, stall = {**json.loads(json.dumps(DEFAULTS)), "errors": {"workflow": config_error}}, 30
             limits = None
+        snap["config_error"] = config_error
         result = classify(snap, now, stall, limits)
-        line = {"at": now.isoformat(), "dry_run": dry_run, "errors": snap["errors"], **result}
+        if not snap["errors"] and not config_error:  # dispatch preflight: WORKFLOW.md loads, every source answered
+            result["actions"] += plan_dispatch(snap, now, config, budget_check)
+        line = {"at": now.isoformat(), "dry_run": dry_run, "errors": snap["errors"], "config_error": config_error,
+                **result}
         if not dry_run:
             line["executed"] = execute(snap, result["actions"], executors)
         with open(os.path.join(d, "reconcile.jsonl"), "a") as f:
@@ -1209,6 +1418,12 @@ def main(argv):
         if not cls:
             print("reconcile: usage: --enable <class>", file=sys.stderr)
             return 2
+        good = os.path.join(state_dir(), "workflow-good.json")
+        if cls[0] is None and (cached := read_json(good)):  # --kill also stops actions run on the last good config
+            cached["actions"] = {k: False for k in cached["actions"]}
+            with tempfile.NamedTemporaryFile("w", dir=os.path.dirname(good), delete=False) as f:
+                json.dump(cached, f)
+            os.replace(f.name, good)
         try:
             print(json.dumps(set_switches(cls[0])))
         except workflow.WorkflowError as e:
@@ -1401,7 +1616,261 @@ def self_test():
     w12_classify_test()
     w12_executor_test()
     w13_test()
+    w14_plan_test()
+    w14_tick_test()
     print("reconcile self-test: ok")
+
+
+def w14_plan_test():
+    """W14 plan: sort, slot limits, starts per tick, gate rejection, over-limit, backoff, attempt numbering."""
+    now = datetime(2026, 10, 30, 12, tzinfo=timezone.utc)
+    ago = lambda s: (now - timedelta(seconds=s)).isoformat()
+    body = "Files:\n- iar/{f}.py\n- `bin/{f}` (new)\n\nDone when: `iar-run-tests.sh x tests/{f}`\n"
+
+    def cand(bid, p=2, created="2026-10-01", files=None, comments=(), labels=("auto",), **kw):
+        return {"id": bid, "status": "open", "priority": p, "created_at": created, "labels": list(labels),
+                "description": body.format(f=files or bid), "comments": [{"text": t, "created_at": at} for t, at in comments],
+                **kw}
+    config = {"agent": {"max_concurrent": 4, "max_concurrent_by_state": {"in_progress": 4}},
+              "limits": {"max_attempts": 3}, "max_retry_backoff_ms": 300000}
+    plan = lambda cands, issues=None, sessions=(), cfg=config, check=lambda bid: None: plan_dispatch(
+        {"candidates": cands, "issues": issues or {}, "sessions": list(sessions)}, now, cfg, check)
+    keys = lambda out: [(a["item"], a["action"]) for a in out]
+
+    assert bead_files(cand("a")) == {"iar/a.py", "bin/a"} and done_when(cand("a")) == "iar-run-tests.sh x tests/a"
+    assert bead_files({"description": "Files:\n- (none: branch-only chore)\n"}) == set()
+    assert bead_files({"description": "Files:\n- ~/dotfiles/iar/x.py\n- ./bin/y\n"}) == {"iar/x.py", "bin/y"}
+    assert bead_files({"description": f"Files:\n- {PRECOG}/hydra/z.py\n- /elsewhere/w\n"}) == {"hydra/z.py", "/elsewhere/w"}
+    # Sort by priority, then creation time; 5 ready, 4 free slots: 2 starts per tick (limits.max_starts_per_tick).
+    five = [cand("e", 3), cand("d", 1, "2026-10-03"), cand("c", 1, "2026-10-02"), cand("b", 2), cand("a", 0)]
+    assert keys(plan(five)) == [("a", "dispatch attempt=1"), ("c", "dispatch attempt=1")], keys(plan(five))
+    assert [a["done_when"] for a in plan(five)] == ["iar-run-tests.sh x tests/a", "iar-run-tests.sh x tests/c"]
+    assert len(plan(five, cfg=dict(config, limits={"max_starts_per_tick": 5}))) == 4  # 4 free slots
+    # Slot limits: loop-owned in_progress beads take slots (by_state counts too); external claims do not.
+    mine = lambda bid: {"id": bid, "status": "in_progress", "assignee": f"agent:{bid}#1", "description": ""}
+    issues = {x: mine(x) for x in ("r1", "r2", "r3")}
+    issues["ext"] = dict(mine("ext"), assignee="factory-wf")
+    assert keys(plan(five, issues)) == [("a", "dispatch attempt=1")]
+    assert plan(five, dict(issues, r4=mine("r4"))) == []
+    by_state = dict(config, agent={"max_concurrent": 9, "max_concurrent_by_state": {"in_progress": 3}})
+    assert plan(five, issues, cfg=by_state) == []
+    # A closed bead whose attempt session still runs holds its slot until the session stops.
+    gone = {"id": "cl", "status": "closed", "assignee": None, "description": "",
+            "comments": [{"text": "attempt: 1 session: s-cl slot: /s branch: b brief: /b dispatch: auto"}]}
+    assert keys(plan(five, dict(issues, cl=gone), [{"sessionId": "s-cl", "alive": True}])) == []
+    assert keys(plan(five, dict(issues, cl=gone), [{"sessionId": "s-cl", "state": "stopped"}])) == [("a", "dispatch attempt=1")]
+    # Not candidates: no-swarm, quarantined, auto:blocked, claimed or not open.
+    skip = [cand("n", labels=("auto", "no-swarm")), cand("q", labels=("auto", QUARANTINE)),
+            cand("k", labels=("auto", AUTO_BLOCKED)), cand("m", assignee="someone"), cand("o", status="in_progress")]
+    assert plan(skip) == []
+    # Gate rejection: one reject-auto each (no start used); the count goes up after Tal clears the label.
+    nofiles = cand("nf", description="Done when: `true`\n")
+    nodone = cand("nd", description="Files:\n- iar/x.py\n")
+    budgeted = cand("bu", description=body.format(f="bu") + "\n```\nbudget:\n  compute: nope\n```\n")
+    again = cand("ag", description="no gate at all", comments=[("reconcile: reject-auto count=1", ago(99))])
+
+    def bad_budget(bid):
+        raise budget.BudgetError("compute 'nope' is not in the compute allowlist")
+    out = plan([nofiles, nodone, budgeted, again, cand("ok")], check=bad_budget)
+    assert sorted(keys(out)) == [("ag", "reject-auto count=2"), ("bu", "reject-auto count=1"), ("nd", "reject-auto count=1"),
+                         ("nf", "reject-auto count=1"), ("ok", "dispatch attempt=1")], keys(out)
+    why = {a["item"]: a.get("detail") for a in out}
+    assert "Files" in why["nf"] and "Done when" in why["nd"] and "allowlist" in why["bu"], why
+    assert keys(plan([budgeted])) == [("bu", "dispatch attempt=1")]  # a valid budget passes
+
+    def tracker_down(bid):
+        raise ledger.LedgerError("br show: no answer in 30s")
+    assert plan([budgeted], check=tracker_down) == []  # not a verdict on the bead: wait, no reject
+    gpu = cand("gp", description=body.format(f="gp") + "Run the eval on the GPU cluster.\n")
+    out = plan([gpu])
+    assert keys(out) == [("gp", "reject-auto count=1")] and "no `budget:` block" in out[0]["detail"], out
+    # Files in use by an in_progress bead or a running session's bead: wait, no reject; and within one tick.
+    busy = {"w": dict(mine("w"), description=body.format(f="a"))}
+    assert plan([cand("a")], busy) == []
+    ended = {"w": dict(busy["w"], status="open", assignee=None)}
+    assert keys(plan([cand("a")], ended)) == [("a", "dispatch attempt=1")]
+    assert plan([cand("a")], ended, [{"bead": "w", "alive": True}]) == []
+    assert keys(plan([cand("x", files="same"), cand("y", files="same")])) == [("x", "dispatch attempt=1")]
+    mixed = {"w": dict(mine("w"), description="Files:\n- ~/dotfiles/iar/a.py\n")}  # same file, other spelling
+    assert plan([cand("a")], mixed) == []
+    # Over limits.max_attempts: rejected and quarantined, not dispatched.
+    att = lambda k: (f"attempt: {k} session: s{k} slot: /s branch: b brief: /b dispatch: auto", ago(9999))
+    out = plan([cand("ol", comments=[att(1), att(2), att(3)])])
+    assert keys(out) == [("ol", "reject-auto count=1")] and out[0]["over_limit"] and "max_attempts 3" in out[0]["detail"]
+    # Failed launches count too: three attempt-failed comments reach the limit.
+    fail = lambda k, s: (f"attempt-failed: lease attempt={k} boom", ago(s))
+    out = plan([cand("of", comments=[fail(1, 999), fail(2, 999), fail(3, 999)])])
+    assert keys(out) == [("of", "reject-auto count=1")] and out[0]["over_limit"], out
+    # Backoff 10 s * 2^(n-1) after n failures since the last attempt, capped at max_retry_backoff_ms.
+    many_ok = dict(config, limits={"max_attempts": 99})
+    go = lambda *c: keys(plan([cand("f", comments=c)], cfg=many_ok))
+    assert go(fail(1, 5)) == [] and go(fail(1, 11)) == [("f", "dispatch attempt=2")]
+    assert go(fail(1, 99), fail(2, 99), fail(3, 30)) == [] and go(fail(1, 99), fail(2, 99), fail(3, 41)) != []
+    many = [fail(k, 9999) for k in range(1, 10)]
+    assert go(*many, fail(10, 299)) == [] and go(*many, fail(10, 301)) == [("f", "dispatch attempt=11")]
+    assert go(att(1), fail(2, 11)) == [("f", "dispatch attempt=3")]  # the count restarts after a real attempt
+    assert go(fail(1, 99), att(2), fail(3, 15)) != []
+    print("w14 plan: ok")
+
+
+FAKE_BG = r'''#!/usr/bin/env python3
+import os, re, sys
+sys.path.insert(0, os.environ["IAR_DIR"])
+import ledger
+bead, args = sys.argv[1], sys.argv[2:]
+assert args[0] == "--done-when" and args[1] and args[2:] == ["--auto"], args
+n = 1 + max([int(m[1]) for c in ledger.show(bead).get("comments") or []
+             if (m := re.match(r"attempt(?:: |-failed: \S+ attempt=)(\d+)", c["text"]))], default=0)
+failed = bead in os.environ.get("FAKE_BG_FAIL", "").split()
+with open(os.environ["FAKE_BG_LOG"], "a") as f:
+    f.write(f"{bead} {n}{' failed' * failed}\n")
+if failed:
+    ledger.comment(bead, f"attempt-failed: lease attempt={n} no free slot")
+    sys.exit(1)
+ledger.update(bead, status="in_progress", assignee=f"agent:{bead}#{n}")
+ledger.comment(bead, f"attempt: {n} session: s-{bead}-{n} slot: /nonexistent/{bead} branch: u/x/{bead} brief: /b dispatch: auto")
+'''
+
+
+def w14_tick_test():
+    """W14 end to end: real tick, scratch br store, fake bin/bg (claim + attempt comment, or attempt-failed), fake
+    sessions that work for every dispatched attempt. Dispatch, reject, failure backoff, source-error preflight, E12
+    (fresh state dirs repeat nothing), a bad WORKFLOW.md (dispatch blocked, other actions on the last good config,
+    --kill still stops them)."""
+    saved_env = {k: os.environ.get(k) for k in ("IAR_WORKFLOW", "BEADS_DIR", "IAR_BG", "IAR_DIR", "FAKE_BG_LOG",
+                                                "FAKE_BG_FAIL", "IAR_STATE_DIR")}
+    with tempfile.TemporaryDirectory() as d:
+        log, wf = os.path.join(d, "bg.log"), os.path.join(d, "WORKFLOW.md")
+        with open(os.path.join(IAR, "WORKFLOW.md")) as src, open(wf, "w") as dst:
+            dst.write(src.read())
+        with open(os.path.join(d, "bg"), "w") as f:
+            f.write(FAKE_BG)
+        os.chmod(os.path.join(d, "bg"), 0o755)
+        os.environ.update(IAR_WORKFLOW=wf, BEADS_DIR=os.path.join(d, ".beads"), IAR_BG=os.path.join(d, "bg"),
+                          IAR_DIR=IAR, FAKE_BG_LOG=log, FAKE_BG_FAIL="")
+        fail_source, stopped = [False], set()
+
+        def agents(s):
+            with open(log) if os.path.exists(log) else io.StringIO() as f:
+                started = [line.split() for line in f if not line.strip().endswith(" failed")]
+            s["sessions"] = [{"sessionId": f"s-{b}-{n}", "id": b, "kind": "background", "name": f"{b}: x",
+                              "state": "stopped" if b in stopped else "working", "alive": b not in stopped}
+                             for b, n in started]
+
+        def treehouse(s):
+            if fail_source[0]:
+                raise SourceError("treehouse status: no answer in 30s")
+        fakes = {"agents": agents, "treehouse": treehouse, "inbox": lambda s: None, "plannotator": lambda s: None,
+                 "git": lambda s: None}
+        executors = {**EXECUTORS, "flag-zombie": (noted, lambda a, snap: note(a, "zombie"))}
+        n_dir = [0]
+
+        def run(new=True):  # a tick, by default with a new, empty state dir: E12 (state lost) repeats no action
+            n_dir[0] += new
+            sd = os.path.join(d, f"state{n_dir[0]}")
+            os.makedirs(sd, exist_ok=True)
+            line = tick(sd, False, fakes, executors)[1]
+            return line, [(x["item"], x["action"], x["outcome"]) for x in line["executed"] if x["outcome"] != "off"]
+        texts = lambda bid: [c["text"] for c in ledger.show(bid).get("comments") or []]
+        labels = lambda bid: ledger.show(bid).get("labels") or []
+        tries = lambda: open(log).read().split("\n")[:-1] if os.path.exists(log) else []
+        spec = "Files:\n- iar/{0}.py\n\nDone when: `true {0}`\n"
+
+        def auto(title, p, desc=None):
+            return ledger.create(title, type="task", priority=p, labels=["auto"],
+                                 description=desc if desc is not None else spec.format(title))["id"]
+
+        def zombie(title):
+            bid = ledger.create(title, type="task")["id"]
+            ledger.comment(bid, f"attempt: 1 session: s-gone-{bid} slot: /nonexistent/{bid} branch: u/x/{bid} brief: /b")
+            ledger.update(bid, status="in_progress", assignee=f"agent:{bid}#1")
+            return bid
+        try:
+            ledger.init("wt")
+            set_switches(None, wf)
+            set_switches("dispatch", wf)
+            set_switches("zombie", wf)
+            with open(wf) as f:  # fl fails 4 times below; the attempt limit is not under test here
+                text = f.read()
+            with open(wf, "w") as f:
+                f.write(text.replace('"max_attempts": 3', '"max_attempts": 9'))
+            fl, a, r, b = auto("fails", 0), auto("first", 1), auto("rejected", 1, "no files\n"), auto("second", 2)
+            ledger.create("not auto", type="task", priority=0, description=spec.format("na"))
+            z = zombie("zombie one")
+            os.environ["FAKE_BG_FAIL"] = fl
+            # Tick 1: 2 starts per tick (fl fails, a starts), r rejected once, b waits; the zombie is flagged too.
+            line, done = run()
+            assert sorted(done) == sorted([(fl, "dispatch attempt=1", "done"), (a, "dispatch attempt=1", "done"),
+                                           (r, "reject-auto count=1", "done"), (z, "flag-zombie attempt=1", "done")]), done
+            assert tries() == [f"{fl} 1 failed", f"{a} 1"] and line["config_error"] is None
+            s = ledger.show(a)
+            assert s["status"] == "in_progress" and s["assignee"] == f"agent:{a}#1", s
+            assert [texts(a)[-3], texts(a)[-1]] == ["reconcile-start: dispatch dispatch attempt=1", "reconcile: dispatch attempt=1"]
+            assert attempts(s)[1]["auto"] and PENDING not in labels(a)
+            assert ledger.show(fl)["status"] == "open" and texts(fl)[-1] == "reconcile: dispatch attempt=1", texts(fl)
+            assert AUTO_BLOCKED in labels(r) and QUARANTINE not in labels(r)
+            assert [t for t in texts(r) if t.startswith("reconcile-note: ")] == [
+                "reconcile-note: reject-auto count=1\nNot dispatched automatically: no `Files:` list. Fix the bead, "
+                "then remove the label `auto:blocked`."], texts(r)
+            # Three more failures (as if from later ticks): fl now waits 80 s, so the next ticks surely skip it.
+            for k in (2, 3, 4):
+                ledger.comment(fl, f"attempt-failed: lease attempt={k} no free slot")
+            # Preflight: a source fails, nothing is dispatched (b would start now).
+            fail_source[0] = True
+            line, done = run()
+            assert done == [] and "treehouse" in line["errors"] and tries() == [f"{fl} 1 failed", f"{a} 1"]
+            fail_source[0] = False
+            # Tick 2 (state dir lost): a is working, 1 free slot of 3 (z and a hold 2): b starts; fl waits.
+            line, done = run()
+            assert done == [(b, "dispatch attempt=1", "done")], done
+            assert line["classes"][a] == "working", line["classes"]
+            # E12: again with a new state dir: the attempt -> session -> lease mapping comes from bead comments;
+            # no action repeats.
+            line, done = run()
+            assert done == [] and tries() == [f"{fl} 1 failed", f"{a} 1", f"{b} 1"], (done, tries())
+            assert [t for t in texts(z) if t.startswith("reconcile-note: ")] == ["reconcile-note: flag-zombie attempt=1\nzombie"]
+            # Backoff over (cap lowered to 1 s): fl is tried again as attempt 5, once the zombie's slot is free.
+            ledger.close(z, reason="test")
+            os.environ["FAKE_BG_FAIL"] = ""
+            with open(wf) as f:
+                good = f.read()
+            with open(wf, "w") as f:
+                f.write(good.replace('"max_retry_backoff_ms": 300000', '"max_retry_backoff_ms": 1000'))
+            time.sleep(1.1)
+            line, done = run()
+            assert done == [(fl, "dispatch attempt=5", "done")] and tries()[-1] == f"{fl} 5", done
+            # A WORKFLOW.md that does not load: no dispatch, the snapshot says why, other actions run on the last
+            # good config (from this state dir).
+            with open(wf, "w") as f:
+                f.write(good.replace('"tracker"', '"tracker', 1))
+            for bid in (a, b, fl):
+                ledger.close(bid, reason="test")
+                stopped.add(bid)  # their sessions end too: a running one would still hold its slot
+            c, z2 = auto("third", 1), zombie("zombie two")
+            line, done = run(new=False)
+            assert done == [(z2, "flag-zombie attempt=1", "done")], done
+            assert line["config_error"].startswith("config error: ") and "bad front matter" in line["config_error"]
+            assert not line["errors"] and ledger.show(c)["status"] == "open" and tries()[-1] == f"{fl} 5"
+            # --kill with the file still bad: it cannot edit WORKFLOW.md, but the last good config goes all off.
+            sd = os.path.join(d, f"state{n_dir[0]}")
+            os.environ["IAR_STATE_DIR"] = sd
+            with contextlib.redirect_stderr(io.StringIO()):
+                assert main(["--kill"]) == 2
+            z3 = zombie("zombie three")
+            line = tick(sd, False, fakes, executors)[1]
+            assert [x["outcome"] for x in line["executed"] if x["item"] == z3] == ["off"], line["executed"]
+            # Fixed file: dispatch resumes.
+            with open(wf, "w") as f:
+                f.write(good)
+            line, done = run()
+            assert (c, "dispatch attempt=1", "done") in done and line["config_error"] is None, done
+        finally:
+            for k, v in saved_env.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+    print("w14 tick: ok")
 
 
 def w13_test():

@@ -21,7 +21,7 @@ cat >/dev/null; echo "$2" >>"$(dirname "$0")/notified"' >$IAR_NOTIFY
   mkdir $tmp/slowbin; print -r '#!/bin/sh
 sleep 10' >$tmp/slowbin/br
   chmod +x $IAR_NOTIFY $tmp/slowbin/br
-  (cd $tmp && br init --prefix precog >/dev/null 2>&1) || { print "br init failed"; return 1 }
+  (cd $tmp && "$here/ledger" init precog >/dev/null 2>&1) || { print "ledger init failed"; return 1 }
   a=$("$here/ledger" create "asking bead" | /usr/bin/jq -r .id)
   q=$("$here/ledger" create "Q(x): ship it?" -l question,no-swarm | /usr/bin/jq -r .id)
   c=$("$here/ledger" create "Q(x): old" -l question | /usr/bin/jq -r .id)

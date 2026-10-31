@@ -52,7 +52,7 @@ HOLDER_RE = re.compile(r"^agent:([a-z0-9]+-[a-z0-9.]+)#(\d+)$")
 ATTEMPT_RE = re.compile(r"^attempt: (\d+) session: (\S+) slot: (\S+) branch: (\S+)")
 QID_RE = re.compile(r"^QUESTION:\s*precog-[A-Za-z0-9.]+")
 DEFAULTS = {"sessions": [], "slots": [], "inbox": [], "inbox_url": "http://localhost/", "plannotator": [],
-            "beads": [], "questions": [], "issues": {}, "git": {}}
+            "beads": [], "questions": [], "issues": {}, "git": {}, "session_names": {}}
 
 
 class SourceError(RuntimeError):
@@ -166,6 +166,7 @@ def src_agents(snap):
         s["children"] = kids
         sessions.append(s)
     snap["sessions"] = sessions
+    snap["session_names"] = {r["sessionId"]: r.get("name") or "" for r in rows}  # stopped ones too
 
 
 def src_treehouse(snap):
@@ -254,8 +255,8 @@ def src_br(snap):
         want |= {m[1] for s in snap["slots"] if (m := HOLDER_RE.match(s["holder"]))}
         want |= {m[1] for t in snap["inbox"] if (m := BEAD_RE.match(t["subject"]))}
         # A thread with another subject still belongs to the bead its author session is named after.
-        names = {s["sessionId"]: s.get("name") or "" for s in snap["sessions"]}
-        want |= {m[1] for t in snap["inbox"] if (m := BEAD_RE.match(names.get(t.get("session"), "")))}
+        names = snap["session_names"]
+        want |= {m[1] for t in snap["inbox"] if (m := BEAD_RE.match(names.get(t.get("session")) or ""))}
         ledger.TIMEOUT_S = left()
         shown = ledger.show_many(sorted(want & known))
         need(all(isinstance(i, dict) and isinstance(i.get("comments", []), list) for i in shown), "tracker show: issues")
@@ -555,13 +556,13 @@ def self_test():
     e8a = classify(bad, now)
     assert e8a["actions"] == [] and set(e8a["classes"].values()) == {"source-error"}, e8a
 
-    # src_br fetches a closed bead whose thread is linked only by its author session's name.
+    # src_br fetches a closed bead whose thread is linked only by its author session's name (session stopped).
     real = ledger.list_issues, ledger.show_many
     asked = []
     ledger.list_issues = lambda status=None, labels=(): [{"id": "precog-cs", "status": "closed"}]
     ledger.show_many = lambda ids: asked.extend(ids) or [bead("precog-cs", status="closed")]
     try:
-        s = {**json.loads(json.dumps(DEFAULTS)), "sessions": [sess("precog-cs", state="done")],
+        s = {**json.loads(json.dumps(DEFAULTS)), "session_names": {"s-precog-cs-1": "precog-cs: x"},  # stopped session
              "inbox": [{"id": "m-cs", "subject": "landed", "session": "s-precog-cs-1"}]}
         src_br(s)
     finally:

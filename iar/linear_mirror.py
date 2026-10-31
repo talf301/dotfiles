@@ -231,27 +231,29 @@ class Linear:
 
     def fetch(self):
         """{"states": {name: id}, "labels": {name: id}, "issues": {bead: issue}} of team TAL (issues by their mark)."""
-        q = """query($team: String!, $after: String) { team(id: $team) { id
-          states { nodes { id name } } labels(first: 250) { nodes { id name } }
-          issues(first: 250, after: $after, includeArchived: true) {
-            nodes { id identifier url title description state { name } labels { nodes { name } } }
-            pageInfo { hasNextPage endCursor } } } }"""
-        out, after = {"states": {}, "labels": {}, "issues": {}}, None
+        out = {"states": {s["name"]: s["id"] for s in self.pages("states", "id name")},
+               "labels": {x["name"]: x["id"] for x in self.pages("labels", "id name")}, "issues": {}}
+        for i in self.pages("issues", "id identifier url title description state { name } labels { nodes { name } }",
+                            ", includeArchived: true"):
+            if m := MARK_RE.search(i.get("description") or ""):
+                out["issues"][m[1]] = {"id": i["id"], "identifier": i["identifier"], "url": i["url"],
+                                       "title": i["title"], "state": i["state"]["name"], "fp": m[2],
+                                       "team": self.team, "labels": [x["name"] for x in i["labels"]["nodes"]]}
+        return out
+
+    def pages(self, field, nodes, args=""):
+        """Every node of team TAL's `field` connection, 250 per request."""
+        q = (f"query($team: String!, $after: String) {{ team(id: $team) {{ id {field}(first: 250, after: $after"
+             f"{args}) {{ nodes {{ {nodes} }} pageInfo {{ hasNextPage endCursor }} }} }} }}")
+        out, after = [], None
         while True:
             team = self.gql(q, {"team": self.team, "after": after})["team"]
             if not team or team["id"] != self.team:
                 raise LinearError("team TAL is not visible to the app: give the app access to the TAL team")
-            out["states"] = {s["name"]: s["id"] for s in team["states"]["nodes"]}
-            out["labels"] = {x["name"]: x["id"] for x in team["labels"]["nodes"]}
-            for i in team["issues"]["nodes"]:
-                if m := MARK_RE.search(i.get("description") or ""):
-                    out["issues"][m[1]] = {"id": i["id"], "identifier": i["identifier"], "url": i["url"],
-                                           "title": i["title"], "state": i["state"]["name"], "fp": m[2],
-                                           "team": team["id"], "labels": [x["name"] for x in i["labels"]["nodes"]]}
-            page = team["issues"]["pageInfo"]
-            if not page["hasNextPage"]:
+            out += team[field]["nodes"]
+            if not team[field]["pageInfo"]["hasNextPage"]:
                 return out
-            after = page["endCursor"]
+            after = team[field]["pageInfo"]["endCursor"]
 
     def label(self, name):
         r = self.gql("mutation($input: IssueLabelCreateInput!) { issueLabelCreate(input: $input) "
@@ -375,12 +377,16 @@ def self_test():
             calls.append(q.split("(")[0].split()[0] + (" " + q.split("{")[1].split("(")[0].strip() if "mutation" in q
                                                        else ""))
             if q.startswith("query"):
-                nodes = [{**i, "state": {"name": i["state"]},
-                          "labels": {"nodes": [{"name": n} for n in i["labels"]]}} for i in team_issues]
-                return self.reply(200, {"data": {"team": {
-                    "id": v["team"], "states": {"nodes": [{"id": i, "name": n} for n, i in states.items()]},
-                    "labels": {"nodes": [{"id": i, "name": n} for n, i in labels.items()]},
-                    "issues": {"nodes": nodes, "pageInfo": {"hasNextPage": False, "endCursor": None}}}}})
+                field = q.split("{ id ")[1].split("(")[0]
+                calls[-1] += f" {field}"
+                nodes = {"states": [{"id": i, "name": n} for n, i in states.items()],
+                         "labels": [{"id": i, "name": n} for n, i in labels.items()],
+                         "issues": [{**i, "state": {"name": i["state"]},
+                                     "labels": {"nodes": [{"name": n} for n in i["labels"]]}} for i in team_issues]}
+                start = int(v["after"] or 0)  # pages of 2, so the self-test covers paging
+                return self.reply(200, {"data": {"team": {"id": v["team"], field: {
+                    "nodes": nodes[field][start:start + 2],
+                    "pageInfo": {"hasNextPage": start + 2 < len(nodes[field]), "endCursor": str(start + 2)}}}}})
             inp = v["input"]
             if "issueLabelCreate" in q:
                 assert inp["teamId"] == TAL_TEAM
@@ -466,7 +472,8 @@ def self_test():
             n = len(calls)
             r = run(False, inbox, "http://inbox/")
             assert r == {"writes": [], "error": None, "done": []}, r
-            assert len(team_issues) == 5 and calls[n:] == ["query"], calls[n:]
+            assert len(team_issues) == 5 and set(calls[n:]) == {"query states", "query labels", "query issues"}
+            assert calls[n:].count("query issues") == 3, calls[n:]  # 5 issues, pages of 2
 
             # Closed bead -> Done; closed as superseded -> Canceled; the unblocked open bead -> Todo.
             ledger.close(a["id"], reason="integrated into u/tfriedman/pr/x at abc")

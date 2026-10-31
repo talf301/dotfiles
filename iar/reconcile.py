@@ -1444,7 +1444,8 @@ def main(argv):
         print("reconcile: another tick holds the lock", file=sys.stderr)
         return code
     print(json.dumps({"errors": line["errors"], "actions": len(line["actions"]),
-                      **({"executed": line["executed"]} if "executed" in line else {})}))
+                      **({"executed": line["executed"]} if "executed" in line else {}),
+                      **({"linear": line["linear"]} if "linear" in line else {})}))
     return 0
 
 

@@ -50,7 +50,7 @@ CPU_WINDOW = timedelta(minutes=5)
 BEAD_RE = re.compile(r"^([a-z0-9]+-[a-z0-9.]+): ")
 HOLDER_RE = re.compile(r"^agent:([a-z0-9]+-[a-z0-9.]+)#(\d+)$")
 ATTEMPT_RE = re.compile(r"^attempt: (\d+) session: (\S+) slot: (\S+) branch: (\S+)")
-QID_RE = re.compile(r"^QUESTION:\s*(precog-[A-Za-z0-9]+(?:\.[A-Za-z0-9]+)*)")
+QID_RE = re.compile(r"^QUESTION:\s*(precog-[A-Za-z0-9]+(?:\.[A-Za-z0-9]+)*)\.?(?:\s|$)")  # as in notify-stop.sh
 DEFAULTS = {"sessions": [], "slots": [], "inbox": [], "inbox_url": "http://localhost/", "plannotator": [],
             "beads": [], "questions": [], "issues": {}, "git": {}, "session_names": {}}
 
@@ -516,7 +516,7 @@ def self_test():
     snap = {
         "errors": {}, "git": {"precog-zp#1": {"pushed": True}},
         "issues": {b["id"]: b for b in [
-            bead("precog-ap"), bead("precog-dl"), bead("precog-dl2"), bead("precog-mq"), bead("precog-mq2"), bead("precog-st"),
+            bead("precog-ap"), bead("precog-dl"), bead("precog-dl2"), bead("precog-mq"), bead("precog-mq2"), bead("precog-mq3"), bead("precog-st"),
             bead("precog-zm"), bead("precog-zp"), bead("precog-sl", status="open", assignee=""),
             bead("precog-ct", status="closed"), bead("precog-wk"), bead("precog-wt"), bead("precog-id"),
             bead("precog-ex", n=0, assignee="factory-wf"), bead("precog-nl", n=0, status="open", assignee=""), bead("precog-ex2", assignee="factory-wf"),  # old bg lease, foreign claim
@@ -532,17 +532,18 @@ def self_test():
                       q("precog-q5", "precog-dl", gated="yes", deadline=t(1)), q("precog-q6", "precog-c1", ["answered"]),
                       q("precog-q4", "precog-rp", reversible="no", deadline=t(1)),
                       q("precog-q7", "precog-ex", ["answered"]), q("precog-q8", "precog-wk", deadline=t(-60)),
-                      q("precog-q9", "precog-wt", deadline=t(-60))],
+                      q("precog-q9", "precog-wt", deadline=t(-60)), q("precog-q10", "precog-mq3", deadline=t(-60))],
         "sessions": [
             sess("precog-ap", state="blocked"), sess("precog-dl", state="blocked"), sess("precog-dl2", state="blocked"),
             sess("precog-mq", state="blocked", last_message="QUESTION: should I ship?"),
             sess("precog-mq2", state="blocked", last_message="QUESTION: precog-q8 not mine?"),
+            sess("precog-mq3", state="blocked", last_message="QUESTION: precog-q10-junk ok?"),
             sess("precog-st", state="working", transcript_at=t(45), cpu_active=False, **live),
             sess("precog-c1", state="working", transcript_at=t(45), cpu_active=False, **live),
             sess("precog-ag", state="working", transcript_at=t(45), cpu_active=False, **live),
             sess("precog-zm", state="failed"), sess("precog-zp", state="done"),
             sess("precog-wk", status="busy", transcript_at=t(45), cpu_active=None, **live),
-            sess("precog-wt", state="blocked", last_message="QUESTION: precog-q9 ok?"),  # blocked, no pid: not zombie
+            sess("precog-wt", state="blocked", last_message="QUESTION: precog-q9. ok?"),  # blocked, no pid: not zombie
             sess("precog-id", state="done", status="idle", **live),
             sess("precog-rp", state="done", status="idle", **live),
         ],
@@ -555,7 +556,7 @@ def self_test():
     }
     want = {
         "precog-ap": "answer-pending", "precog-dl": "question-deadline", "precog-dl2": "question-deadline",
-        "precog-mq": "malformed-question", "precog-mq2": "malformed-question", "precog-st": "stalled", "precog-zm": "zombie", "precog-zp": "zombie",
+        "precog-mq": "malformed-question", "precog-mq2": "malformed-question", "precog-mq3": "malformed-question", "precog-st": "stalled", "precog-zm": "zombie", "precog-zp": "zombie",
         "precog-sl": "stale-lease", "precog-ct": "closed-bead-thread", "precog-wk": "working",
         "precog-wt": "waiting", "precog-id": "idle", "precog-ex": "external", "precog-ex2": "external", "precog-nl": "external",
         "precog-c1": "answer-pending", "precog-c2": "zombie", "precog-c3": "stale-lease", "precog-rp": "idle",
@@ -567,7 +568,7 @@ def self_test():
     assert acts == {
         ("precog-ap", "deliver-answer q=precog-q1 attempt=1"), ("precog-dl", "timeout q=precog-q2"),
         ("precog-dl2", "reping q=precog-q3"), ("precog-mq", "flag-malformed attempt=1"),
-        ("precog-mq2", "flag-malformed attempt=1"),
+        ("precog-mq2", "flag-malformed attempt=1"), ("precog-mq3", "flag-malformed attempt=1"),
         ("precog-st", "nudge attempt=1 count=1"), ("precog-zm", "flag-zombie attempt=1"),
         ("precog-zp", "release attempt=1"), ("precog-sl", "return-lease slot=4 holder=agent:precog-sl#1"),
         ("precog-ct", "resolve-thread thread=m-ct"),

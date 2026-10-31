@@ -22,7 +22,8 @@ matches its assignee `agent:<bead>#<n>`. Leases count only when the holder is ex
 `agent:<bead>#<n>`. Everything else is `external` and gets no action.
 
 Classes, first match wins: source-error, external, over-limit, ineligible-running, answer-pending,
-question-deadline, malformed-question, stalled, zombie, stale-lease, closed-bead-thread, working, waiting, idle.
+question-deadline, malformed-question, stalled, zombie, stale-lease, closed-bead-thread, inbox-pending, working,
+waiting, idle.
 An action is `reconcile: <action> <key>` on the bead; a key already in its comments is not proposed.
 
 Executor: for each proposed action, the tick reloads the switches (so --kill stops a running tick),
@@ -44,6 +45,16 @@ Actions are in EXECUTORS by verb; a verb with no executor is skipped. W12 (house
   ineligible-running  the bead was closed (its own W9 close: once the turn ends) or deferred, or lost `auto` (only
                       attempts marked `dispatch: auto`): stop-session, verified; the worktree stays and
                       stale-lease returns the slot after the preflight
+W13 (questions of loop-owned beads; question beads come from iar/ask):
+  answer-pending      import-answer: Tal's sent Inbox answer to the :::question whose subject starts with the
+                      question id goes through iar/answer (question.answer, --at = when he picked it), so the first
+                      recorded answer wins; deliver-answer: the recorded answer, verbatim, to the latest attempt's
+                      session (resumed if stopped; precog-v8xo), checked in its transcript, then the question is
+                      labelled `delivered` and closed
+  question-deadline   timeout (reversible, not gated: iar/answer --timeout writes the default, delivered next tick)
+                      or reping (not reversible: one reminder in the thread); a gated question has no deadline
+  malformed-question  flag-malformed: a note, and the board lists it under Needs you; no question bead is invented
+  inbox-pending       post-question: post a question bead that ask could not post; last of the action classes
 A flag is a `reconcile-note: <key>` comment. Before a nudge that stops a running session, flag-stalled, quarantine
 or stop-session, the tick saves the
 last 40 lines of the session's final assistant text (`last-output: <key>`).
@@ -82,7 +93,7 @@ HOLDER_RE = re.compile(r"^agent:([a-z0-9]+-[a-z0-9.]+)#(\d+)$")
 ATTEMPT_RE = re.compile(r"^attempt: (\d+) session: (\S+) slot: (\S+) branch: (\S+)")
 QID_RE = re.compile(r"^QUESTION:\s*(precog-[A-Za-z0-9]+(?:\.[A-Za-z0-9]+)*)\.?(?:\s|$)")  # as in notify-stop.sh
 DEFAULTS = {"sessions": [], "slots": [], "inbox": [], "inbox_url": "http://localhost/", "plannotator": [],
-            "beads": [], "questions": [], "issues": {}, "git": {}, "slot_git": {}, "session_names": {}}
+            "beads": [], "questions": [], "inbox_answers": {}, "issues": {}, "git": {}, "slot_git": {}, "session_names": {}}
 LIMITS = {"max_attempts": 3, "max_attempt_hours": 4, "max_attempt_tokens": 3_000_000}  # WORKFLOW.md `limits` overrides
 LIMIT_GRACE = timedelta(minutes=15)  # after a limit-nudge, still working this long: quarantine
 QUARANTINE = "quarantined"
@@ -271,8 +282,9 @@ def src_treehouse(snap):
                       "live": bool(r.get("processes"))} for r in rows if r["status"] == "leased"]
 
 
-def inbox_threads():
-    """Unresolved Inbox threads. Each jsonl file is an event log: the last record for an id wins."""
+def inbox_records():
+    """(messages, questions, first seq per message id) of every project. Each jsonl file is an event log: the
+    last record for an id wins."""
     messages, questions, first_seq = {}, {}, {}
     for path in glob.glob(f"{INBOX}/projects/*/messages.jsonl"):
         with open(path) as f:
@@ -283,6 +295,32 @@ def inbox_threads():
         with open(path) as f:
             for row in strict_lines(f.read()):
                 questions[row["id"]] = row["record"]
+    return messages, questions, first_seq
+
+
+def inbox_answers(messages, questions):
+    """{question bead id: {text, at}}: Tal's sent answers to the :::question that iar/ask posted (subject
+    `<qid>: ...`). A picked option (plus its note), or the reply text when he answered by reply. Drafts (no
+    sent reply) and skips are not answers."""
+    out = {}
+    for q in sorted(questions.values(), key=lambda q: q.get("position") or 0):
+        a = q.get("answer") or {}
+        m = BEAD_RE.match((messages.get(q["message_id"]) or {}).get("subject") or "")
+        if not (m and a and q.get("sent_reply_id") and q.get("picked_at")):
+            continue
+        if a.get("by_reply"):
+            text = (messages.get(q["sent_reply_id"]) or {}).get("body") or ""
+        else:
+            text = "; ".join(a.get("selected") or [])
+            note = (a.get("note") or "").strip()
+            text = f"{text} (note: {note})" if text and note else text or note
+        if text.strip():
+            out.setdefault(m[1], {"text": text.strip(), "at": q["picked_at"]})
+    return out
+
+
+def inbox_threads(messages, questions, first_seq):
+    """Unresolved Inbox threads."""
     threads = {}
     for m in sorted(messages.values(), key=lambda m: m["created_at"]):
         threads.setdefault(m["thread_id"], []).append(m)
@@ -322,7 +360,9 @@ def inbox_quiet(root, posts, first_seq, asking):
 
 def src_inbox(snap):
     try:
-        snap["inbox"] = inbox_threads()
+        records = inbox_records()
+        snap["inbox"] = inbox_threads(*records)
+        snap["inbox_answers"] = inbox_answers(*records[:2])
     except (OSError, ValueError, KeyError, TypeError) as e:
         raise SourceError(f"inbox files: {type(e).__name__}: {e}")
     snap["inbox_url"] = read_json(f"{INBOX}/inbox.json").get("url", DEFAULTS["inbox_url"])
@@ -556,9 +596,12 @@ def classify_bead(bid, b, snap, now, stall_after, sessions, leases, threads, lim
             return "ineligible-running", [f"stop-session {a}"]
     if owned:
         qs = [q for q in snap["questions"] if q.get("asking") == bid]
-        pending = [q for q in qs if "answered" in q["labels"] and "delivered" not in q["labels"]]
-        if pending:
-            return "answer-pending", [f"deliver-answer q={q['id']} {a}" for q in pending]
+        # W13: import Tal's Inbox answer through iar/answer, then deliver the recorded answer to the latest attempt.
+        keys = [f"import-answer q={q['id']}" for q in qs if q["id"] in snap.get("inbox_answers", {})]
+        keys += [f"deliver-answer q={q['id']} {a}" for q in qs
+                 if "answered" in q["labels"] and "delivered" not in q["labels"]]
+        if [k for k in keys if k not in done_keys(b)]:
+            return "answer-pending", keys
         due = [f"{'timeout' if q.get('reversible') == 'yes' else 'reping'} q={q['id']}" for q in qs
                if "answered" not in q["labels"] and q.get("gated") == "no" and q.get("deadline")
                and question.parse_time(q["deadline"]) <= now]
@@ -588,6 +631,11 @@ def classify_bead(bid, b, snap, now, stall_after, sessions, leases, threads, lim
     mine = threads.get(bid, [])
     if owned and b["status"] == "closed" and mine:
         return "closed-bead-thread", [f"resolve-thread thread={t['id']}" for t in mine]
+    # Last of the action classes, so a post that keeps failing (Inbox down) holds up no other action.
+    posts = [f"post-question q={q['id']}" for q in snap["questions"] if owned and q.get("asking") == bid
+             and "inbox:pending" in q["labels"]]
+    if posts:
+        return "inbox-pending", posts
     if working:
         return "working", []
     if s and s.get("state") == "blocked":
@@ -909,7 +957,7 @@ def nudge_text(a):
 
 def transcript_has(path, text, since):
     """A user turn in the transcript at or after `since` whose content holds `text`."""
-    needle = json.dumps(text)[1:-1]
+    needle = json.dumps(text, ensure_ascii=False)[1:-1]  # as the text sits in a JSON line (newlines escaped)
     try:
         with open(path, errors="replace") as f:
             for line in f:
@@ -920,7 +968,7 @@ def transcript_has(path, text, since):
                 except ValueError:
                     continue
                 at = parse_time(r.get("timestamp"))
-                if r.get("type") == "user" and at and at >= since and text in json.dumps((r.get("message") or {}).get("content"), ensure_ascii=False):
+                if r.get("type") == "user" and at and at >= since and needle in json.dumps((r.get("message") or {}).get("content"), ensure_ascii=False):
                     return True
     except OSError:
         pass
@@ -932,11 +980,21 @@ def delivered(a, snap):
     user turn with the nudge text after the action started. Keeps a nudge once per attempt."""
     if noted(a, snap):
         return True
+    att, _ = session_of(a, snap)
+    return got_since(att["session"], nudge_text(a), started_at(a))
+
+
+def started_at(a):
+    """When the action was first started: its earliest `reconcile-start:` comment, or None."""
     starts = [parse_time(c.get("created_at")) for c in ledger.show(a["item"]).get("comments") or []
               if (c.get("text") or "").startswith("reconcile-start: ") and c["text"].rstrip().endswith(f" {a['action']}")]
-    att, _ = session_of(a, snap)
-    path = transcript_facts(att["session"]).get("transcript")
-    return bool(starts and path and transcript_has(path, nudge_text(a), min(starts)))
+    return min(starts, default=None)
+
+
+def got_since(sid, text, since):
+    """The session's transcript has a user turn holding text at or after since."""
+    path = since and transcript_facts(sid).get("transcript")
+    return bool(path and transcript_has(path, text, since))
 
 
 def act_nudge(a, snap):
@@ -997,6 +1055,100 @@ EXECUTORS.update({
 })
 
 
+# --- W13 actions: questions (answer-pending, question-deadline, malformed-question, inbox-pending) ---
+
+def q_of(a):
+    return ledger.show(key_field(a, "q"))
+
+
+def answer_text(qid, q, ans):
+    """What a delivery sends: the answer verbatim on the first line, then what it answers."""
+    f = question.parse_body(q.get("description"))
+    how = "your declared default, applied at the deadline" if ans["source"] == "timeout" \
+        else f"Tal's answer (source: {ans['source'] or 'tracker'})"
+    return (f"ANSWER {qid}: {ans['text']}\n\nThis is {how} to your question: {f.get('question')}\n"
+            "Act on it now. Do not ask again with AskUserQuestion.")
+
+
+def act_import(a, snap):
+    """Tal's Inbox answer goes through iar/answer (question.answer), with the time he picked it."""
+    got = snap["inbox_answers"][key_field(a, "q")]
+    question.answer(key_field(a, "q"), got["text"], at=got["at"], source="inbox")
+
+
+def imported(a, snap):
+    return any(re.search(r"\n-- at: \S+ source: inbox\Z", c.get("text") or "") for c in q_of(a).get("comments") or [])
+
+
+def act_deliver(a, snap):
+    """Send the recorded answer to the attempt's session (resumed if stopped), check that its transcript has the new
+    turn, then label the question `delivered` and close it. A crash after the send: the turn is in the transcript, so
+    the retry does not send again."""
+    qid = key_field(a, "q")
+    q = ledger.show(qid)
+    ans = question.effective_answer(q)
+    if not ans:
+        raise RuntimeError(f"{qid} has no recorded answer")
+    text = answer_text(qid, q, ans)
+    att, s = session_of(a, snap)
+    since = started_at(a)
+    if not got_since(att["session"], text, since):
+        if running(s):
+            save_output(a, s)  # send() stops a running session first
+        send(s or {"sessionId": att["session"]}, att["slot"], text)
+        for _ in range(STOP_WAIT_S):
+            if got_since(att["session"], text, since):
+                break
+            time.sleep(1)
+        else:
+            raise RuntimeError(f"session {att['session']} shows no turn with the answer after {STOP_WAIT_S}s")
+    ledger.label(qid, add=["delivered"])
+    ledger.close(qid, reason=f"delivered to {a['item']}#{key_field(a, 'attempt')}")
+
+
+def act_timeout(a, snap):
+    """Reversible and not gated, deadline passed: iar/answer --timeout writes the default (it refuses otherwise)."""
+    question.answer(key_field(a, "q"), "", timeout=True)
+
+
+def act_reping(a, snap):
+    """Not reversible: one reminder in the question's thread at the deadline, then it waits."""
+    qid = key_field(a, "q")
+    f = question.parse_body(q_of(a).get("description"))
+    if f.get("inbox_thread") in (None, "", "pending"):
+        raise RuntimeError(f"{qid} is not posted to the Inbox yet")
+    inbox("send_message", {"body": f"Reminder: {qid} passed its deadline ({f.get('deadline')}) with no answer. It is "
+                                   f"not reversible, so no default applies and {f.get('asking')} waits for you.\n\n"
+                                   f"{f.get('question')}",
+                           "reply_to": f["inbox_thread"], "idempotency_key": f"reping-{qid}",
+                           "project_path": INBOX_PROJECT})
+
+
+def act_post(a, snap):
+    """E5: a question bead the Inbox did not take when it was asked (label inbox:pending) is posted now."""
+    q = q_of(a)
+    question.post(q["id"], question.parse_body(q.get("description")))
+
+
+def act_flag_malformed(a, snap):
+    att, s = session_of(a, snap)
+    note(a, f"Malformed question: session {att['session']} ended its turn with a `QUESTION:` line that names no open "
+            f"question bead of {a['item']}, so the loop cannot time it out or deliver its answer. The board lists it "
+            f"under Needs you. Answer in the session (claude attach {s.get('id') or att['session']}), or have it file "
+            f"the question with iar/ask. Its line:\n{s.get('last_message') or '(not in this tick)'}")
+
+
+EXECUTORS.update({
+    "import-answer": (imported, act_import),
+    "deliver-answer": (lambda a, snap: q_of(a)["status"] == "closed", act_deliver),
+    "timeout": (lambda a, snap: q_of(a)["status"] == "closed" or bool(question.effective_answer(q_of(a))),
+                act_timeout),
+    "reping": (lambda a, snap: False, act_reping),  # the Inbox idempotency key makes a repeat send a no-op
+    "post-question": (lambda a, snap: "inbox:pending" not in (q_of(a).get("labels") or []), act_post),
+    "flag-malformed": (noted, act_flag_malformed),
+})
+
+
 # --- tick ---
 
 def state_dir():
@@ -1031,7 +1183,7 @@ def tick(d, dry_run, sources=None, executors=None, board=False):
             f.write(json.dumps(line) + "\n")
         if board:
             import board as board_mod
-            board_mod.write(board_mod.render(board_mod.classify(snap, now)), now)
+            board_mod.write(board_mod.render(board_mod.classify({**snap, **result}, now)), now)
         return 0, line
     finally:
         lock.close()
@@ -1237,7 +1389,214 @@ def self_test():
     executor_self_test()
     w12_classify_test()
     w12_executor_test()
+    w13_test()
     print("reconcile self-test: ok")
+
+
+def w13_test():
+    """W13 end to end: question beads filed with the real iar/ask against a scratch br store, real Inbox files in a
+    temp dir, fake claude and Inbox MCP. E2b, E3b, E4 (with a stopped session: precog-v8xo), E5, malformed, external."""
+    import contextlib
+    import io
+    g = globals()
+    saved = {k: g[k] for k in ("sh", "transcript_facts", "INBOX")}
+    saved_env = {k: os.environ.get(k) for k in ("IAR_WORKFLOW", "BEADS_DIR", "IAR_INBOX_CMD", "IAR_STATE_DIR")}
+    agents, calls = [], []
+    stamp = lambda t: t.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+    with tempfile.TemporaryDirectory() as d:
+        tdir = os.path.join(d, "transcripts")
+        os.makedirs(tdir)
+
+        def fake_sh(cmd, cwd=None, check=True, input=None):
+            tool, args = os.path.basename(cmd[0]), cmd[1:]
+            if tool == "claude" and args[0] == "agents":
+                return json.dumps(agents)
+            if tool == "claude" and args[0] == "stop":
+                calls.append(("stop", args[1]))
+                next(r for r in agents if r["id"] == args[1]).update(state="stopped", pid=None)
+                return ""
+            if tool == "claude" and args[:2] == ["--bg", "--resume"]:
+                calls.append(("resume", args[2], args[3]))
+                row = next(r for r in agents if r["sessionId"] == args[2])
+                row.update(state="working", pid=None)
+                with open(os.path.join(tdir, f"{args[2]}.jsonl"), "a") as f:  # the new turn
+                    f.write(json.dumps({"type": "user", "timestamp": stamp(datetime.now(timezone.utc)),
+                                        "message": {"content": args[3]}}) + "\n")
+                return f"backgrounded · {row['id']}\n"
+            raise AssertionError(f"unexpected command {cmd}")
+
+        def transcript(sid):
+            path = os.path.join(tdir, f"{sid}.jsonl")
+            return {"transcript": path} if os.path.exists(path) else {}
+
+        # The Inbox: a fake MCP server (log of calls) and the files Tal's answers land in.
+        log, fake = os.path.join(d, "inbox.log"), os.path.join(d, "fake-inbox")
+        with open(fake, "w") as f:
+            f.write(f"#!/bin/sh\ncat >> '{log}'\necho '"
+                    '{"jsonrpc":"2.0","id":2,"result":{"structuredContent":{"thread_id":"msg_T1"}}}'
+                    "'\n")
+        os.chmod(fake, 0o755)
+        inbox_dir = os.path.join(d, "inbox", "projects", "p")
+        os.makedirs(inbox_dir)
+        rows = {"messages": [], "questions": []}
+
+        def tal_answers(qid, picked, choice=None, reply=None):
+            """Tal answers qid in the Inbox: a picked option, or a reply."""
+            mid, rid = f"msg_{qid}", f"msg_{qid}_r"
+            rows["messages"] += [{"id": mid, "thread_id": mid, "created_at": picked, "author": {"kind": "agent"},
+                                  "subject": f"{qid}: question"},
+                                 {"id": rid, "thread_id": mid, "reply_to": mid, "created_at": picked,
+                                  "author": {"kind": "person"}, "body": reply or f"Answer: {choice}"}]
+            rows["questions"].append({"id": f"{mid}/q-1", "message_id": mid, "position": 0, "prompt": "?",
+                                      "answer": {"selected": [choice] if choice else [], "by_reply": not choice,
+                                                 "skipped": not choice},
+                                      "sent_reply_id": rid, "picked_at": picked})
+            for kind in rows:
+                with open(os.path.join(inbox_dir, f"{kind}.jsonl"), "w") as f:
+                    f.writelines(json.dumps({"seq": i, "id": r["id"], "record": r}) + "\n"
+                                 for i, r in enumerate(rows[kind]))
+
+        def sent():
+            """send_message calls the fake Inbox got: (subject or reply_to, body)."""
+            try:
+                with open(log) as f:
+                    msgs = [json.loads(x) for x in f.read().splitlines()]
+            except OSError:
+                return []
+            return [(m["params"]["arguments"].get("subject") or m["params"]["arguments"].get("reply_to"),
+                     m["params"]["arguments"]["body"]) for m in msgs if m.get("method") == "tools/call"]
+
+        wf = os.path.join(d, "WORKFLOW.md")
+        with open(os.path.join(IAR, "WORKFLOW.md")) as src, open(wf, "w") as dst:
+            dst.write(src.read())
+        os.environ.update(IAR_WORKFLOW=wf, BEADS_DIR=os.path.join(d, ".beads"), IAR_STATE_DIR=d, IAR_INBOX_CMD=fake)
+        g.update(sh=fake_sh, transcript_facts=transcript, INBOX=os.path.join(d, "inbox"))
+        try:
+            subprocess.run(["br", "init", "--prefix", "qr"], cwd=d, check=True, capture_output=True, timeout=30)
+            set_switches(None, wf)
+            for cls in ("answer-pending", "question-deadline", "malformed-question", "inbox-pending"):
+                set_switches(cls, wf)
+
+            def asking(title, n=1, assignee=None, last=None):
+                """A loop-owned bead with n attempts; the last attempt's session ended its turn (blocked)."""
+                bid = ledger.create(title)["id"]
+                for k in range(1, n + 1):
+                    ledger.comment(bid, f"attempt: {k} session: s-{bid}-{k} slot: {d} branch: b-{bid} brief: /b")
+                    agents.append({"sessionId": f"s-{bid}-{k}", "id": f"s-{bid}-{k}", "kind": "background",
+                                   "name": f"{bid}: x", "state": "blocked" if k == n else "stopped", "pid": None,
+                                   **({"last_message": last} if last else {})})
+                ledger.update(bid, status="in_progress", assignee=assignee or f"agent:{bid}#{n}")
+                return bid
+
+            def ask(bid, text, deadline=None, reversible="yes"):
+                argv = [bid, text, "-o", "Keep", "-o", "Drop", "--default", "Keep", "--reversible", reversible,
+                        "--gated", "no", "--blocks", "no", "--session", f"s-{bid}-1"]
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+                    rc = question.main_ask(argv + (["--deadline", deadline] if deadline else []))
+                return rc, out.getvalue().strip()
+
+            fakes = {"agents": lambda s: s.update(sessions=[dict(r, alive=bool(r["pid"])) for r in agents
+                                                            if r["state"] != "stopped"],
+                                                  session_names={r["sessionId"]: r["name"] for r in agents}),
+                     "treehouse": lambda s: None, "plannotator": lambda s: None, "git": lambda s: None}
+            run = lambda: sorted((x["item"], x["action"].split()[0], x["outcome"])
+                                 for x in tick(d, False, fakes)[1]["executed"] if x["outcome"] != "off")
+            past = question.iso(question.now() - timedelta(minutes=1))
+            texts = lambda bid: [c["text"] for c in ledger.show(bid).get("comments") or []]
+
+            # E5, part 1: the Inbox is down when the question is asked and at the next tick.
+            ip = asking("inbox down")
+            os.environ["IAR_INBOX_CMD"] = "false"
+            rc, qip = ask(ip, "Post me later?")
+            assert rc == 3 and "inbox:pending" in ledger.show(qip)["labels"], rc
+            assert run() == [(ip, "post-question", "error: RuntimeError: Inbox gave no answer (exit 1): ")], run
+            os.environ["IAR_INBOX_CMD"] = fake
+
+            ap = asking("E4: answer from the Inbox, two attempts, the asking session stopped", n=2)
+            agents[-1].update(state="stopped")  # precog-v8xo: Tal answers while the session is stopped
+            qap = ask(ap, "Keep the cache?")[1]
+            tal_answers(qap, stamp(datetime.now(timezone.utc)), choice="Keep")
+            hw = asking("E2b: a human answer before the deadline wins")
+            qhw = ask(hw, "Rename it?", deadline=past)[1]
+            tal_answers(qhw, past, reply="Drop it, and say why in the bead")
+            to = asking("E2b: timeout, then an earlier human answer")
+            qto = ask(to, "Port it?", deadline=past)[1]
+            td = asking("E2b: timeout applies the default")
+            qtd = ask(td, "Split it?", deadline=past)[1]
+            rv = asking("not reversible: one reping")
+            qrv = ask(rv, "Delete the table?", deadline=past, reversible="no")[1]
+            gt = asking("E3b: gated never times out")
+            f = {"question": "Launch?", "asking": gt, "session": f"s-{gt}-1", "blocks": "no", "default": "Keep",
+                 "reversible": "yes", "gated": "yes", "deadline": past, "inbox_thread": "msg_T1"}  # a deadline anyway
+            qgt = ledger.create("Q(x): Launch?", type="task", parent=gt, labels=["question", "no-swarm"],
+                                description=question.render_body(f, ["Keep", "Drop"], ""))["id"]
+            mq = asking("malformed", last="QUESTION: should I ship?")
+            ex = asking("external: a workflow claim", assignee="factory-wf")
+            qex = ask(ex, "Mine?")[1]
+            tal_answers(qex, past, choice="Drop")
+            posted = len(sent())
+
+            t0 = datetime.now(timezone.utc)
+            assert run() == sorted([
+                (ip, "post-question", "done"), (ap, "import-answer", "done"), (hw, "import-answer", "done"),
+                (to, "timeout", "done"), (td, "timeout", "done"), (rv, "reping", "done"),
+                (mq, "flag-malformed", "done")])
+            # E5: posted once, later; the thread id is written back.
+            assert [s for s in sent()[posted:] if s[0].startswith(qip)] and "inbox:pending" not in ledger.show(qip)["labels"]
+            assert question.parse_body(ledger.show(qip)["description"])["inbox_thread"] == "msg_T1"
+            assert [s for s in sent()[posted:] if s[0] == "msg_T1" and qrv in s[1]]  # the reping, in the thread
+            assert any(x.startswith("reconcile-note: flag-malformed attempt=1\n") and "should I ship?" in x
+                       for x in texts(mq))
+            assert "decision:auto" in ledger.show(td)["labels"]
+            # E2b: Tal's Inbox answer, picked before the timeout was written, wins over it.
+            tal_answers(qto, stamp(t0 - timedelta(seconds=1)), choice="Drop")
+
+            assert run() == sorted([
+                (ap, "deliver-answer", "done"), (hw, "deliver-answer", "done"), (to, "import-answer", "done"),
+                (to, "deliver-answer", "done"), (td, "deliver-answer", "done")])
+            resumes = {c[1]: c[2] for c in calls if c[0] == "resume"}
+            assert sorted(resumes) == sorted([f"s-{ap}-2", f"s-{hw}-1", f"s-{to}-1", f"s-{td}-1"]), resumes  # E4: attempt 2
+            assert resumes[f"s-{ap}-2"].startswith(f"ANSWER {qap}: Keep\n"), resumes
+            assert resumes[f"s-{hw}-1"].startswith(f"ANSWER {qhw}: Drop it, and say why in the bead\n")
+            assert resumes[f"s-{to}-1"].startswith(f"ANSWER {qto}: Drop\n"), resumes  # the human answer, not Keep
+            assert resumes[f"s-{td}-1"].startswith(f"ANSWER {qtd}: Keep\n") and "declared default" in resumes[f"s-{td}-1"]
+            assert not [c for c in calls if c[0] == "stop"]  # every asking session had ended its turn
+            for q in (qap, qhw, qto, qtd):
+                s = ledger.show(q)
+                assert s["status"] == "closed" and "delivered" in s["labels"], s
+            assert sum("(timeout)" in x for x in texts(qto)) == 1 and not any("(timeout)" in x for x in texts(qhw))
+            assert question.effective_answer(ledger.show(qto))["text"] == "Drop"
+
+            # Nothing left: each action ran once. E3b: the gated question never timed out; the external bead got no
+            # import or delivery.
+            n_sent = len(sent())
+            assert run() == [] and run() == [] and len(sent()) == n_sent
+            assert len([c for c in calls if c[0] == "resume"]) == 4
+            assert ledger.show(qgt)["status"] == "open" and not question.answers(ledger.show(qgt))
+            try:
+                question.answer(qgt, "", timeout=True)
+                raise AssertionError("a gated question timed out")
+            except ValueError:
+                pass
+            assert not question.answers(ledger.show(qex)) and texts(ex) == [texts(ex)[0]]
+
+            # inbox_answers: drafts (no sent reply) and skips with no reply are not answers; a note rides along.
+            q = lambda **kw: {"message_id": "m", "position": 0, "picked_at": "t", "sent_reply_id": "r", **kw}
+            msgs = {"m": {"subject": "precog-a1: x?"}, "r": {"body": "free text"}}
+            assert inbox_answers(msgs, {"1": q(answer={"selected": ["A"]}, sent_reply_id=None)}) == {}
+            assert inbox_answers(msgs, {"1": q(answer={"selected": [], "skipped": True})}) == {}
+            assert inbox_answers(msgs, {"1": q(answer={"selected": ["A"], "note": "why "})}) == \
+                {"precog-a1": {"text": "A (note: why)", "at": "t"}}
+            assert inbox_answers(msgs, {"1": q(answer={"selected": [], "by_reply": True})})["precog-a1"]["text"] == \
+                "free text"
+        finally:
+            g.update(saved)
+            for k, v in saved_env.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
 
 
 def w12_classify_test():

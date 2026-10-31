@@ -19,8 +19,8 @@ Spec: precog-am8w (Concepts: Question bead; State machines: Question bead).
     --timeout writes `answer: <default> (timeout)` only when reversible: yes, gated: no and the
     deadline has passed; it labels the asking bead `decision:auto`.
 
-State labels on the question bead: `inbox:pending`, `answered`, `delivered` (set by the
-reconciler, W13), then the bead is closed (`moot` when the asking bead closed first).
+State labels on the question bead: `inbox:pending`, `answered`, `delivered` (the reconciler,
+W13, sets it and closes the bead after delivery; `moot` when the asking bead closed first).
 The tracker is reached only through ledger.py. The Inbox command is `plannotator inbox mcp`;
 IAR_INBOX_CMD overrides it (self-test). IAR_INBOX_PROJECT overrides the Inbox project.
 One lock file, $IAR_STATE_DIR/question.lock (default ~/.local/state/iar), serializes the
@@ -208,16 +208,22 @@ def ask(a):
     print(qid)
     if "inbox:pending" not in (q.get("labels") or []):
         return 0
-    thread = a.thread or f"{short(a.asking)}: {asking['title']}"
     try:
-        thread_id = inbox_post(qid, f, a.project, thread)
+        post(qid, f, a.project, a.thread or f"{short(a.asking)}: {asking['title']}")
     except RuntimeError as e:
         print(f"ask: {qid} filed with inbox:pending; {e}", file=sys.stderr)
         return 3
-    f["inbox_thread"] = thread_id
+    return 0
+
+
+def post(qid, f, project=PROJECT, thread=None):
+    """Post the Inbox :::question of question bead qid (body fields f), write the thread id back and drop
+    `inbox:pending`. `ask` and the reconciler's inbox-pending retry (W13) use it. Raises RuntimeError."""
+    if thread is None:
+        thread = f"{short(f['asking'])}: {ledger.show(f['asking'])['title']}"
+    f = dict(f, inbox_thread=inbox_post(qid, f, project, thread))
     ledger.update(qid, description=render_body(f, f["options"], f["context"]),
                   remove_labels=["inbox:pending"])
-    return 0
 
 
 # --- answer ---

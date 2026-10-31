@@ -15,6 +15,7 @@ import sys
 from datetime import datetime, timedelta, timezone
 
 from reconcile import BEAD_RE, parse_time, snapshot
+from reconcile import classify as reconcile_classify
 
 HOME = os.path.expanduser("~")
 VAULT = f"{HOME}/Library/Mobile Documents/com~apple~CloudDocs/vault"
@@ -61,6 +62,8 @@ def classify(data, now):
     gated = {p["session_id"]: p["url"] for p in sorted(data["plannotator"], key=lambda p: p.get("started") or "")
              if "--gate" in (p.get("target") or "")}
     link = lambda t: f"[{clip(t['subject'], 80)}]({data['inbox_url']}#thread={t['id']})"
+    # reconcile.py classes: a QUESTION: line with no question bead (W13) is flagged under Needs you.
+    malformed = {bid for bid, cls in (data.get("classes") or {}).items() if cls == "malformed-question"}
 
     def add(name, line, when):
         """Anything quiet longer than OLD folds into Old, except what needs Tal."""
@@ -109,7 +112,9 @@ def classify(data, now):
         elif s.get("state") == "working":
             add("Stalled" if quiet > WORKING_QUIET else "Working", line, now)
         elif said.startswith("QUESTION:"):
-            if not reported:
+            if s.get("bead") in malformed:
+                add("Needs you", f"Malformed question (no question bead, so no timeout or delivery): {line}", active)
+            elif not reported:
                 add("Needs you", line, active)
         elif said.startswith("READY:"):
             if not reported:
@@ -217,6 +222,13 @@ def self_test():
     assert any("precog-z3" in line for line in sec["Old"]), sec["Old"]
     data["issues"] = {"precog-q1": {"id": "precog-q1", "status": "in_progress", "title": "runaway", "labels": ["quarantined"]}}
     assert any("`precog-q1` quarantined" in line for line in classify(data, now)["Needs you"])
+    # A malformed question is flagged under Needs you even when its session posted to the Inbox.
+    data["inbox"][0]["session"] = "a"
+    data["sessions"][0]["bead"] = "precog-mq"
+    assert not any("QUESTION: which?" in line for line in classify(data, now)["Needs you"])
+    data["classes"] = {"precog-mq": "malformed-question"}
+    assert any(line.startswith("Malformed question") and "QUESTION: which?" in line
+               for line in classify(data, now)["Needs you"]), classify(data, now)["Needs you"]
     data["errors"] = {"br": "LedgerError: tracker list: no answer in 30s"}
     assert any("`br` failed" in line for line in classify(data, now)["Loose ends"])
     print("ok")
@@ -228,7 +240,8 @@ if __name__ == "__main__":
     else:
         os.environ.setdefault("BEADS_DIR", BEADS_DIR)
         now = datetime.now(timezone.utc)
-        body = render(classify(snapshot(now), now))
+        snap = snapshot(now)
+        body = render(classify({**snap, **reconcile_classify(snap, now)}, now))
         if "--stdout" in sys.argv:
             print(body, end="")
         else:

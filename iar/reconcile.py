@@ -88,6 +88,7 @@ LIMIT_GRACE = timedelta(minutes=15)  # after a limit-nudge, still working this l
 QUARANTINE = "quarantined"
 OUTPUT_LINES = 40
 STOP_WAIT_S = 30
+INBOX_PROJECT = "/Users/tal/.local/share/precog/Precog agents"  # inbox-etiquette.md: every send_message names it
 TRANSIENT = ("process running in the slot", "session running")  # preflight fails that end by themselves: no flag
 
 
@@ -833,8 +834,20 @@ def inbox(tool, args):
     raise RuntimeError(f"inbox {tool}: no answer (exit {p.returncode}): {p.stderr.strip()[-200:]}")
 
 
+def still_proposed(a, snap):
+    """Classify fresh sources again: the action is still what this bead needs (its session did not resume, its
+    branch did not change)."""
+    fresh = snap["refresh"]()
+    if fresh["errors"]:
+        raise RuntimeError(f"fresh sources failed: {fresh['errors']}")
+    return any(x["item"] == a["item"] and x["action"] == a["action"]
+               for x in classify(fresh, datetime.now(timezone.utc))["actions"])
+
+
 def act_release(a, snap):
     att, s = session_of(a, snap)
+    if not still_proposed(a, snap):
+        raise RuntimeError("no longer a zombie with a pushed branch on fresh sources")
     ledger.update(a["item"], status="open", assignee="")
     note(a, f"Released the claim: session {att['session']} is {s.get('state') or 'not listed'} with no process, "
             f"and branch {att['branch']} is pushed. The bead is open again.")
@@ -881,19 +894,57 @@ def act_flag_lease(a, snap):
 def act_resolve_thread(a, snap):
     tid, b = key_field(a, "thread"), snap["issues"][a["item"]]
     inbox("send_message", {"body": f"Landed: {a['item']} is closed ({b.get('close_reason') or 'no reason given'}).",
-                           "reply_to": tid, "idempotency_key": f"landed-{tid}"})
+                           "reply_to": tid, "idempotency_key": f"landed-{tid}", "project_path": INBOX_PROJECT})
     inbox("resolve_message", {"message_id": tid, "resolved": True})
 
 
-def act_nudge(text):
-    def act(a, snap):
-        att, s = session_of(a, snap)
-        msg = text.format(limit=key_field(a, "limit")) if "{limit}" in text else text
-        if running(s):
-            save_output(a, s)  # send() stops a running session first
-        send(s, att["slot"], msg)
-        note(a, f"Sent session {att['session']}: {msg}")
-    return act
+NUDGES = {"nudge": "status?",
+          "limit-nudge": "You reached the {limit} limit: commit, push your branch, write a status comment, then stop."}
+
+
+def nudge_text(a):
+    verb = a["action"].split()[0]
+    return NUDGES[verb].format(limit=key_field(a, "limit")) if verb == "limit-nudge" else NUDGES[verb]
+
+
+def transcript_has(path, text, since):
+    """A user turn in the transcript at or after `since` whose content holds `text`."""
+    needle = json.dumps(text)[1:-1]
+    try:
+        with open(path, errors="replace") as f:
+            for line in f:
+                if needle not in line or '"user"' not in line:
+                    continue
+                try:
+                    r = json.loads(line)
+                except ValueError:
+                    continue
+                at = parse_time(r.get("timestamp"))
+                if r.get("type") == "user" and at and at >= since and text in json.dumps((r.get("message") or {}).get("content"), ensure_ascii=False):
+                    return True
+    except OSError:
+        pass
+    return False
+
+
+def delivered(a, snap):
+    """A nudge's effect: its note, or (a crash after the resume, before the note) the session's transcript has a
+    user turn with the nudge text after the action started. Keeps a nudge once per attempt."""
+    if noted(a, snap):
+        return True
+    starts = [parse_time(c.get("created_at")) for c in ledger.show(a["item"]).get("comments") or []
+              if (c.get("text") or "").startswith("reconcile-start: ") and c["text"].rstrip().endswith(f" {a['action']}")]
+    att, _ = session_of(a, snap)
+    path = transcript_facts(att["session"]).get("transcript")
+    return bool(starts and path and transcript_has(path, nudge_text(a), min(starts)))
+
+
+def act_nudge(a, snap):
+    att, s = session_of(a, snap)
+    if running(s):
+        save_output(a, s)  # send() stops a running session first
+    send(s, att["slot"], nudge_text(a))
+    note(a, f"Sent session {att['session']}: {nudge_text(a)}")
 
 
 def act_flag_stalled(a, snap):
@@ -938,10 +989,9 @@ EXECUTORS.update({
     "flag-lease": (noted, act_flag_lease),
     "resolve-thread": (lambda a, snap: key_field(a, "thread") not in {t["id"] for t in snap["inbox"]},
                        act_resolve_thread),
-    "nudge": (noted, act_nudge("status?")),
+    "nudge": (delivered, act_nudge),
     "flag-stalled": (noted, act_flag_stalled),
-    "limit-nudge": (noted, act_nudge("You reached the {limit} limit: commit, push your branch, write a status "
-                                     "comment, then stop.")),
+    "limit-nudge": (delivered, act_nudge),
     "quarantine": (lambda a, snap: QUARANTINE in (ledger.show(a["item"]).get("labels") or []), act_quarantine),
     "stop-session": (lambda a, snap: not running(session_of(a, snap)[1]), act_stop_session),
 })
@@ -1287,13 +1337,17 @@ def w12_classify_test():
         out = read_transcript(p)["last_output"].splitlines()
         assert len(out) == OUTPUT_LINES and out[-1] == "end" and out[-2] == "l49", out
         assert transcript_tokens(p) == 2 * 115, transcript_tokens(p)
+        with open(p, "a") as f:
+            f.write(json.dumps({"type": "user", "timestamp": t(1), "message": {"content": "status?"}}) + "\n")
+        assert transcript_has(p, "status?", now - timedelta(minutes=2))
+        assert not transcript_has(p, "status?", now) and not transcript_has(p, "other", now - timedelta(minutes=2))
 
 
 def w12_executor_test():
     """W12 actions end to end against a scratch br store, real git repos for the release preflight (E10), and fake
     claude, treehouse and Inbox. Each action's happy path, then a second and third tick that do nothing (idempotency)."""
     agents, slots, threads, calls = [], [], [], []
-    race = {"slot": None}
+    race = {"slot": None, "resume": None}
     real_sh, real_inbox = sh, inbox
 
     def fake_sh(cmd, cwd=None, check=True, input=None):
@@ -1333,6 +1387,9 @@ def w12_executor_test():
         if race["slot"]:  # the slot gets dirty after the snapshot, before the action: act-time preflight refuses
             open(os.path.join(race["slot"], "late.txt"), "w").close()
             race["slot"] = None
+        if race["resume"]:  # the zombie's session comes back after the snapshot: the release must not happen
+            next(r for r in agents if r["sessionId"] == race["resume"]).update(state="working", pid=1)
+            race["resume"] = None
     fakes = {"agents": src_fake_agents, "treehouse": lambda s: s.update(slots=[dict(x) for x in slots]),
              "inbox": lambda s: s.update(inbox=[dict(x) for x in threads]), "plannotator": lambda s: None,
              "git": src_race_git}
@@ -1389,6 +1446,8 @@ def w12_executor_test():
             old = (now - timedelta(minutes=45)).isoformat()
             zp = bead("zombie pushed", slot=clone("zp", "b-zp"), branch="b-zp", session={"state": "failed"})
             zf = bead("zombie unpushed", session={"state": "failed"})
+            zr = bead("zombie resumes", slot=clone("zr", "b-zr"), branch="b-zr", session={"state": "failed"})
+            race["resume"] = f"s-{zr}"
             ok = bead("closed clean", status="closed", slot=clone("ok", "b-ok"), branch="b-ok", lease="1")
             threads.append({"id": "m-ok", "subject": f"{ok}: integrated", "session": "zz"})
             dirty = bead("closed dirty", status="closed", slot=clone("dirty", "b-x", dirty=True), lease="2")
@@ -1410,6 +1469,7 @@ def w12_executor_test():
             first = run()
             assert sorted(first) == sorted([
                 (zp, "release", "done"), (zf, "flag-zombie", "done"), (ok, "return-lease", "done"),
+                (zr, "release", "error: RuntimeError: no longer a zombie with a pushed branch on fresh sources"),
                 (dirty, "flag-lease", "done"), (unp, "flag-lease", "done"), (gone, "flag-lease", "done"),
                 (rc, "return-lease", "error: RuntimeError: release preflight failed: worktree not clean"),
                 (st, "nudge", "done"), (ol, "quarantine", "done"), (tk, "limit-nudge", "done"),
@@ -1435,7 +1495,9 @@ def w12_executor_test():
             # again; the returned lease lets the closed bead's thread resolve (lease first, then thread: E9).
             stops = sum(c[0] == "stop" for c in calls)
             second = run()
+            assert ledger.show(zr)["status"] == "in_progress" and ledger.show(zr)["assignee"] == f"agent:{zr}#1"
             assert sorted(second) == sorted([(rc, "flag-lease", "done"), (rc, "return-lease", "dropped"),
+                                             (zr, "release", "dropped"),
                                              (st, "flag-stalled", "done"), (ok, "resolve-thread", "done")]), second
             assert ("send_message", "m-ok", f"Landed: {ok} is closed (integrated into pr/x at abc).") in calls, calls
             assert ("resolve_message", "m-ok", None) in calls and not threads

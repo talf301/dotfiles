@@ -44,7 +44,10 @@ pickf="$LOG_DIR/review-$id.pick.txt"; lastf="$LOG_DIR/review-$id.last.txt"
 run_tests="$(cd "$(dirname "$0")" && pwd)/iar-run-tests.sh"
 cd "$wt"
 
-codex exec -m gpt-6-sol -s read-only -o "$pickf" "You are the independent REVIEWER for bead $id, picking the tests for its review. Do NOT run br and do NOT search CASS. Do NOT modify anything. Read the acceptance criteria with: cat $critf . Run git diff $base HEAD and read the changed files. Choose the pytest arguments (test files, directories or node ids, relative to $wt) that exercise every changed behavior, including existing tests of changed modules and their callers. The orchestrator runs them outside the sandbox with $run_tests $wt <args> and gives you the output. End with exactly one line that starts with TESTS: followed by the pytest arguments, or TESTS: none when the change has no Python code pytest can exercise." < /dev/null > "$rlog" 2>&1 || true
+codex exec -m gpt-6-sol -s read-only -o "$pickf" "You are the independent REVIEWER for bead $id, picking the tests for its review. Do NOT run br and do NOT search CASS. Do NOT modify anything. Read the acceptance criteria with: cat $critf . Run git diff $base HEAD and read the changed files. Choose the pytest arguments (test files, directories or node ids, relative to $wt) that exercise every changed behavior, including existing tests of changed modules and their callers. The orchestrator runs them outside the sandbox with $run_tests $wt <args> and gives you the output. End with exactly one line that starts with TESTS: followed by the pytest arguments, or TESTS: none when the change has no Python code pytest can exercise." < /dev/null > "$rlog" 2>&1 || pcc=$?
+if [ "${pcc:-0}" != 0 ]; then
+  echo "iar-review: no verdict (test-picker codex exit $pcc): $(tail -n 3 "$rlog" | tr '\n' ' ')— see $rlog" >&2; exit 3
+fi
 picked=$(grep -E '^TESTS: ' "$pickf" | tail -1 | sed -e 's/^TESTS: //' -e 's/`//g' || true)
 
 trc=""; tests=""; : > "$tlog"

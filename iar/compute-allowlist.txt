@@ -1,4 +1,0 @@
-# Compute that a bead `budget:` block may name (iar/budget.py). One name per line.
-# Only clusters or queues that already exist. Never a provisioning target: creating AWS or
-# Baseten resources (or `sky launch`) stays a per-time human ask (org rule).
-# Moves to WORKFLOW.md `compute_allowlist` when W8 lands. Empty means no budget is valid.

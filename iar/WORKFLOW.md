@@ -1,3 +1,33 @@
+---
+{
+  "tracker": {
+    "kind": "br",
+    "beads_dir": "/Users/tal/.local/share/beads/precog/.beads",
+    "dispatch_label": "auto",
+    "active_states": ["open", "in_progress"],
+    "terminal_states": ["closed"]
+  },
+  "polling": {"interval_ms": 60000},
+  "agent": {
+    "max_concurrent": 3,
+    "max_concurrent_by_state": {"in_progress": 3}
+  },
+  "stall_after_min": 30,
+  "max_retry_backoff_ms": 300000,
+  "compute_allowlist": [],
+  "actions": {
+    "answer-pending": false,
+    "question-deadline": false,
+    "malformed-question": false,
+    "inbox-pending": false,
+    "stalled": false,
+    "zombie": false,
+    "stale-lease": false,
+    "closed-bead-thread": false,
+    "dispatch": false
+  }
+}
+---
 # Bead {{bead}}: {{title}}
 
 You are a background session working alone on one bead. Tal sees you in agent view as `{{name}}`. Work only in this slot: {{slot}}. You are attempt {{attempt}} (`{{bead}}#{{attempt}}`).

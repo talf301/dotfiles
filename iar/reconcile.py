@@ -508,8 +508,15 @@ def execute(snap, actions, executors=None):
     work = [dict(a, proposed=True) for a in actions]
     seen = {(a["item"], a["action"]) for a in actions}
     for bid, b in sorted(snap["issues"].items()):
+        intents = open_intents(b)
         work += [{"item": bid, "class": cls, "action": key, "proposed": False}
-                 for key, cls in open_intents(b).items() if (bid, key) not in seen]
+                 for key, cls in intents.items() if (bid, key) not in seen]
+        if not intents and PENDING in (b.get("labels") or []):  # a crash after the comment, before the label drop
+            try:
+                ledger.label(bid, remove=[PENDING])
+                out.append({"item": bid, "action": f"unlabel {PENDING}", "outcome": "done"})
+            except Exception as e:
+                out.append({"item": bid, "action": f"unlabel {PENDING}", "outcome": f"error: {type(e).__name__}: {e}"})
     for a in work:
         def note(outcome):
             out.append({"item": a["item"], "action": a["action"], "outcome": outcome})
@@ -824,7 +831,7 @@ def executor_self_test(bead):
     store = {b["id"]: b for b in [bead("precog-sl", status="open", assignee=""),  # stale-lease: return-lease
                                   bead("precog-zm")]}                              # zombie: flag-zombie
     slots = [{"slot": "4", "holder": "agent:precog-sl#1"}]
-    returned, flagged, fail = [], [], {"comment": None, "source": False}
+    returned, flagged, fail = [], [], {"comment": None, "source": False, "unlabel": False}
 
     def show(bid):
         return json.loads(json.dumps(store[bid]))
@@ -836,6 +843,9 @@ def executor_self_test(bead):
         store[bid]["comments"].append({"text": text})
 
     def label(bid, add=(), remove=()):
+        if remove and fail["unlabel"]:
+            fail["unlabel"] = False
+            raise ledger.LedgerError("br label remove failed")
         labels = store[bid].setdefault("labels", [])
         labels[:] = [x for x in labels if x not in remove] + [x for x in add if x not in labels]
 
@@ -862,6 +872,7 @@ def executor_self_test(bead):
         with open(os.path.join(IAR, "WORKFLOW.md")) as src, open(wf, "w") as dst:
             dst.write(src.read())
         os.environ.update(IAR_WORKFLOW=wf, BEADS_DIR=d)
+        set_switches(None, wf)  # start all off, whatever the live switches are
         ledger.show, ledger.comment, ledger.label = show, comment, label
         try:
             run = lambda: tick(d, False, fakes, executors)[1]["executed"]
@@ -912,9 +923,16 @@ def executor_self_test(bead):
             store["precog-dr"]["labels"] = [PENDING]
             assert [x["outcome"] for x in run()] == ["dropped"] and returned == ["4"]
             assert store["precog-dr"]["labels"] == [] and run() == []
+            # A crash after the reconcile: comment, before the label drop: the next tick drops the stale label.
+            store["precog-lb"] = bead("precog-lb", status="open", assignee="")
+            slots.append({"slot": "6", "holder": "agent:precog-lb#1"})
+            fail["unlabel"] = True
+            assert [x["outcome"] for x in run()] == ["error: LedgerError: br label remove failed"]
+            assert returned == ["4", "6"] and store["precog-lb"]["labels"] == [PENDING]
+            assert run() == [{"item": "precog-lb", "action": f"unlabel {PENDING}", "outcome": "done"}]
+            assert store["precog-lb"]["labels"] == [] and run() == [] and returned == ["4", "6"]
             # --kill switches every class off.
-            assert not any(set_switches().values())
-            assert workflow.load(wf)[0]["actions"] == workflow.load(os.path.join(IAR, "WORKFLOW.md"))[0]["actions"]
+            assert not any(set_switches().values()) and not any(workflow.load(wf)[0]["actions"].values())
             with open(os.path.join(d, "reconcile.jsonl")) as f:
                 assert all(json.loads(x)["dry_run"] is False for x in f)
         finally:

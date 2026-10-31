@@ -58,6 +58,9 @@ W13 (questions of loop-owned beads; question beads come from iar/ask):
 W25 (Linear view, iar/linear_mirror.py, after the other actions of the tick; not per bead):
   linear-mirror       one-way mirror of the beads into Linear team TAL. A dry run lists the writes under `linear` in the
                       jsonl line; a live tick writes them (`linear.done`) only with the switch on
+  (W25b) Tal's `answer: <text>` comment, or his move to Approved ("approve"), on a mirrored question issue joins
+                      the Inbox answers before classify (read in a dry run, or live with the switch on); the earlier
+                      one goes through import-answer (source linear) and deliver-answer like an Inbox answer
 W14 (dispatch, class `dispatch`, after the other actions of the tick):
   preflight           WORKFLOW.md loads and every source answered. A WORKFLOW.md that does not load blocks dispatch
                       only: the other actions run on the last good config ($IAR_STATE_DIR/workflow-good.json; --kill
@@ -1247,13 +1250,13 @@ def answer_text(qid, q, ans):
 
 
 def act_import(a, snap):
-    """Tal's Inbox answer goes through iar/answer (question.answer), with the time he picked it."""
+    """Tal's Inbox (or Linear, W25b) answer goes through iar/answer (question.answer), with the time he gave it."""
     got = snap["inbox_answers"][key_field(a, "q")]
-    question.answer(key_field(a, "q"), got["text"], at=got["at"], source="inbox")
+    question.answer(key_field(a, "q"), got["text"], at=got["at"], source=got.get("source", "inbox"))
 
 
 def imported(a, snap):
-    return any(re.search(r"\n-- at: \S+ source: inbox\Z", c.get("text") or "") for c in q_of(a).get("comments") or [])
+    return any(re.search(r"\n-- at: \S+ source: (inbox|linear)\Z", c.get("text") or "") for c in q_of(a).get("comments") or [])
 
 
 def act_deliver(a, snap):
@@ -1368,7 +1371,7 @@ def state_dir():
     return d
 
 
-def tick(d, dry_run, sources=None, executors=None, board=False, mirror=None):
+def tick(d, dry_run, sources=None, executors=None, board=False, mirror=None, linear_answers=None):
     """One tick under the lock. Returns (exit code, the line written to reconcile.jsonl or None)."""
     lock = open(os.path.join(d, "reconcile.lock"), "a")
     try:
@@ -1396,15 +1399,23 @@ def tick(d, dry_run, sources=None, executors=None, board=False, mirror=None):
             snap, stall = {**json.loads(json.dumps(DEFAULTS)), "errors": {"workflow": config_error}}, 30
             limits = None
         snap["config_error"] = config_error
+        mirror_on = bool(config) and config["actions"].get("linear-mirror", False)
+        linear_error = None
+        if not snap["errors"] and (dry_run or mirror_on) and snap["questions"]:
+            # W25b: Tal's Linear answers join his Inbox answers; the earlier one is imported (first answer wins).
+            got, linear_error = (linear_answers or linear_mirror.answers)(snap["questions"])
+            for qid, ans in got.items():
+                have = snap["inbox_answers"].get(qid)
+                if not have or question.parse_time(ans["at"]) < question.parse_time(have["at"]):
+                    snap["inbox_answers"][qid] = ans
         result = classify(snap, now, stall, limits)
         if not snap["errors"] and not config_error:  # dispatch preflight: WORKFLOW.md loads, every source answered
             result["actions"] += plan_dispatch(snap, now, config, budget_check)
         line = {"at": now.isoformat(), "dry_run": dry_run, "errors": snap["errors"], "config_error": config_error,
-                **result}
+                **({"linear_answers_error": linear_error} if linear_error else {}), **result}
         if not dry_run:
             line["executed"] = execute(snap, result["actions"], executors)
         # W25: Linear mirror. A dry run lists its writes; a live tick writes them when the switch is on.
-        mirror_on = bool(config) and config["actions"].get("linear-mirror", False)
         if not snap["errors"] and (dry_run or mirror_on):
             line["linear"] = (mirror or linear_mirror.run)(dry_run, snap["inbox"], snap["inbox_url"])
         with open(os.path.join(d, "reconcile.jsonl"), "a") as f:
@@ -2160,6 +2171,25 @@ def w13_test():
             assert run() == [(rt, "deliver-answer", "done")]
             assert [c[2] for c in calls if c[0] == "resume" and c[1] == f"s-{rt}-1"][0].startswith(f"ANSWER {qrt}: Drop\n")
             assert question.effective_answer(ledger.show(qrt))["source"] == "inbox" and run() == []
+
+            # E4 via Linear (W25b): Tal's `answer:` comment on the question's Linear issue (which comments count:
+            # linear_mirror.py --self-test) is imported through iar/answer and delivered once to the asking session.
+            lp = asking("E4 via Linear")
+            qlp = ask(lp, "Answer me in Linear?")[1]
+            set_switches("linear-mirror", wf)
+            said = stamp(datetime.now(timezone.utc))
+            lin = lambda qs: ({q["id"]: {"text": "Drop", "at": said, "source": "linear"} for q in qs if q["id"] == qlp},
+                              None)
+            lrun = lambda: sorted((x["item"], x["action"].split()[0], x["outcome"]) for x in tick(
+                d, False, fakes, mirror=lambda *a: {"writes": [], "error": None}, linear_answers=lin)[1]["executed"]
+                if x["outcome"] != "off")
+            assert lrun() == [(lp, "import-answer", "done")]
+            assert question.effective_answer(ledger.show(qlp))["source"] == "linear"
+            assert lrun() == [(lp, "deliver-answer", "done")]
+            got = [c[2] for c in calls if c[0] == "resume" and c[1] == f"s-{lp}-1"]
+            assert len(got) == 1 and got[0].startswith(f"ANSWER {qlp}: Drop\n") and "source: linear" in got[0], got
+            assert lrun() == [] and lrun() == [] and ledger.show(qlp)["status"] == "closed"
+            assert len([c for c in calls if c[0] == "resume" and c[1] == f"s-{lp}-1"]) == 1
 
             # inbox_answers: drafts (no sent reply) and skips with no reply are not answers; a note rides along.
             q = lambda **kw: {"message_id": "m", "position": 0, "picked_at": "t", "sent_reply_id": "r", **kw}

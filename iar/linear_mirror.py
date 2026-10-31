@@ -16,6 +16,10 @@ description hash), so a rerun writes nothing. After a create, the bead gets a `l
 comment; a run that finds the issue but not the comment (a crash in between) writes the comment only.
 At most MAX_WRITES Linear writes per run; the rest go on the next run.
 
+Answers (W25b, answers()): on the issue of an open question bead, Tal's comment `answer: <text>` or his move to the
+Approved state ("approve") is an answer; anyone else's is ignored. Read only here: reconcile imports the earliest
+through iar/answer. The mirror does not move an Approved question issue back to In Review.
+
 Gate (autonomy.md): writes to team TAL are not gated. Every write names its team, and any team other than
 TAL is refused.
 
@@ -59,6 +63,9 @@ MARK_RE = re.compile(r"^Bead: (\S+) \(v([0-9a-f]{8})\)\s*$", re.M)
 COMMENT_RE = re.compile(r"^linear: (\S+) (\S+)")
 BEAD_RE = re.compile(r"^([a-z0-9]+-[a-z0-9.]+): ")  # as in reconcile.py: an Inbox subject that names a bead
 CANCELED_RE = re.compile(r"(?i)supersed|won'?t|wontfix|duplicate|obsolete|\bmoot\b|cancel")
+TAL_USER = "c5f408e0-0224-4cff-9fd0-97df724acd09"  # Tal's Linear user: the only author whose answers count
+APPROVED = "Approved"  # a TAL state; Tal moving a question issue to it is the answer "approve"
+ANSWER_RE = re.compile(r"(?is)\A\s*answer:\s*(.*?)\s*\Z")
 
 
 class LinearError(RuntimeError):
@@ -138,6 +145,8 @@ def plan(want, remote, comments):
         if have.get("state") is None:
             continue
         change = {k: w[k] for k in ("title", "state", "fp") if w[k] != have[k]}
+        if have["state"] == APPROVED and w["state"] == "In Review":  # Tal's approval stays until the bead closes
+            change.pop("state", None)
         if w["label"] and w["label"] not in have["labels"]:
             change["label"] = w["label"]
         if change:
@@ -157,6 +166,16 @@ def brief(w):
     if w["op"] == "comment":
         return f"comment {w['bead']} {w['text']}"
     return f"update {w['bead']} {w['identifier']} " + ",".join(k for k in ("title", "state", "fp", "label") if k in w)
+
+
+def tal_answer(issue):
+    """{text, at} of the earliest answer Tal gave on a question issue: a comment `answer: <text>`, or a move to the
+    Approved state ("approve"). Comments and moves by anyone else (the mirror app included) are ignored."""
+    got = [(c["createdAt"], m[1]) for c in issue["comments"]["nodes"]
+           if (c.get("user") or {}).get("id") == TAL_USER and (m := ANSWER_RE.match(c.get("body") or "")) and m[1]]
+    got += [(h["createdAt"], "approve") for h in issue["history"]["nodes"]
+            if (h.get("actor") or {}).get("id") == TAL_USER and (h.get("toState") or {}).get("name") == APPROVED]
+    return {"text": min(got)[1], "at": min(got)[0]} if got else None
 
 
 # --- Linear client ---
@@ -265,6 +284,15 @@ class Linear:
                 return out
             after = team[field]["pageInfo"]["endCursor"]
 
+    def question_issue(self, identifier):
+        """A mirrored question issue with its comments and state history (read only; team TAL only)."""
+        i = self.gql("query($id: String!) { issue(id: $id) { team { id } comments(first: 250) { nodes { body createdAt "
+                     "user { id } } } history(first: 250) { nodes { createdAt actor { id } toState { name } } } } }",
+                     {"id": identifier})["issue"]
+        if not i or i["team"]["id"] != self.team:
+            raise LinearError(f"{identifier} is not an issue of team TAL")
+        return i
+
     def mutate(self, name, query, variables):
         """One mutation; `success: false` is an error, so a failed write is never reported as done."""
         r = (self.gql(query, variables) or {}).get(name) or {}
@@ -350,6 +378,24 @@ def apply(writes, client, remote, done):
         done.append(brief(w))
 
 
+def answers(questions, client=None):
+    """W25b: Tal's Linear answers to open, unanswered question beads (reconcile's snap["questions"]) whose issue the
+    mirror made. Returns ({qid: {text, at, source: "linear"}}, error or None). Read only; reconcile imports them
+    through iar/answer (import-answer), so the first recorded answer wins and the delivery happens once."""
+    want = sorted(q["id"] for q in questions if "answered" not in (q.get("labels") or []))
+    out = {}
+    try:
+        issues = offline(ledger.show_many(want) if want else [])["issues"]
+        if issues:
+            client = client or Linear()
+        for qid, i in sorted(issues.items()):
+            if got := tal_answer(client.question_issue(i["identifier"])):
+                out[qid] = {**got, "source": "linear"}
+    except (LinearError, ledger.LedgerError, subprocess.TimeoutExpired) as e:
+        return out, f"{type(e).__name__}: {e}"
+    return out, None
+
+
 def run(dry_run, inbox=(), inbox_url="", client=None):
     """One mirror pass. Returns {"writes": [brief], "done": [brief] (live only), "error": str or None}."""
     out = {"writes": [], "error": None}
@@ -410,6 +456,11 @@ def self_test():
             q, v = req["query"], req["variables"]
             calls.append(q.split("(")[0].split()[0] + (" " + q.split("{")[1].split("(")[0].strip() if "mutation" in q
                                                        else ""))
+            if "issue(id:" in q:
+                i = next((i for i in team_issues if i["identifier"] == v["id"]), None)
+                return self.reply(200, {"data": {"issue": i and {
+                    "team": {"id": TAL_TEAM}, "comments": {"nodes": i.get("comments", [])},
+                    "history": {"nodes": i.get("history", [])}}}})
             if q.startswith("query"):
                 field = q.split("{ id ")[1].split("(")[0]
                 calls[-1] += f" {field}"
@@ -550,6 +601,42 @@ def self_test():
             before = len(tokens)
             assert run(False, inbox, "http://inbox/") == {"writes": [], "error": None, "done": []}
             assert len(tokens) == before + 1
+
+            # W25b: answers from Linear. Only Tal's `answer:` comments and moves to Approved count; the earliest wins.
+            other, at = "u-someone-else", lambda s: f"2026-10-31T00:00:{s:02d}.000Z"
+            q2 = ledger.create("Q2 about c", labels=["question"], description=f"question: cache?\nasking: {c['id']}")
+            q3 = ledger.create("Q3 about c", labels=["question"], description=f"question: ship?\nasking: {c['id']}")
+            assert run(False, inbox, "http://inbox/")["error"] is None
+            q4 = ledger.create("Q4 new", labels=["question"], description=f"question: x?\nasking: {c['id']}")
+            iss = {MARK_RE.search(i["description"])[1]: i for i in team_issues}
+            qs = lambda: [{"id": x["id"], "labels": ledger.show(x["id"])["labels"]} for x in (q2, q3)]
+            assert answers(qs()) == ({}, None)
+            iss[q2["id"]]["comments"] = [
+                {"body": "answer: Drop", "createdAt": at(1), "user": {"id": other}},  # not Tal: ignored
+                {"body": "looks fine", "createdAt": at(2), "user": {"id": TAL_USER}},  # not an answer
+                {"body": "Answer:  Keep \n", "createdAt": at(3), "user": {"id": TAL_USER}},
+                {"body": "answer: Drop", "createdAt": at(5), "user": {"id": TAL_USER}}]  # later: loses
+            iss[q2["id"]]["history"] = [{"createdAt": at(4), "actor": {"id": TAL_USER},
+                                         "toState": {"name": APPROVED}}]
+            iss[q3["id"]]["history"] = [{"createdAt": at(1), "actor": {"id": other}, "toState": {"name": APPROVED}},
+                                        {"createdAt": at(6), "actor": {"id": TAL_USER}, "toState": {"name": APPROVED}}]
+            iss[q3["id"]]["state"] = APPROVED
+            n = len(calls)
+            got, err = answers(qs() + [{"id": q4["id"], "labels": ["question"]}])
+            assert err is None and got == {q2["id"]: {"text": "Keep", "at": at(3), "source": "linear"},
+                                           q3["id"]: {"text": "approve", "at": at(6), "source": "linear"}}, got
+            assert calls[n:] == ["query", "query"], calls[n:]
+            # The mirror leaves Tal's Approved alone; an answered question is not read again.
+            r = run(False, inbox, "http://inbox/")
+            assert r["writes"] == [f"create {q4['id']} [In Review] Q4 new"], r
+            assert iss[q3["id"]]["state"] == APPROVED
+            ledger.label(q2["id"], add=["answered"])
+            n = len(calls)
+            assert answers(qs())[0].keys() == {q3["id"]} and calls[n:] == ["query"]
+            # A Linear failure is reported, not raised.
+            os.remove(os.path.join(root, "state", "linear-token.json"))
+            credentials = no_keychain
+            assert answers(qs()) == ({}, "LinearError: no client_id in the Keychain")
         finally:
             server.shutdown()
             API_URL, TOKEN_URL, credentials = saved[:3]

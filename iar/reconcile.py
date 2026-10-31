@@ -788,8 +788,13 @@ def plan_dispatch(snap, now, config, budget_check):
     loop-owned in_progress beads) and by limits.max_starts_per_tick."""
     lim = {**LIMITS, **(config.get("limits") or {})}
     agent = config["agent"]
-    owned = [bid for bid, b in snap["issues"].items()
-             if b["status"] == "in_progress" and re.match(rf"^agent:{re.escape(bid)}#\d+$", b.get("assignee") or "")]
+    # Running attempts: a bin/bg claim (agent:<bead>#<n>) on an in_progress bead, with or without its attempt comment
+    # (bin/bg writes it last, after the session starts, so a claim alone is a start in flight), plus any bead whose
+    # recorded attempt session still runs whatever the bead's status (closed, deferred: stopped later).
+    live_sids = {s.get("sessionId") for s in snap["sessions"] if running(s)}
+    owned = {bid for bid, b in snap["issues"].items()
+             if (b["status"] == "in_progress" and re.match(rf"^agent:{re.escape(bid)}#\d+$", b.get("assignee") or ""))
+             or any(x["session"] in live_sids for x in attempts(b).values())}
     cap = min(agent["max_concurrent"], agent["max_concurrent_by_state"].get("in_progress", agent["max_concurrent"]))
     starts = max(0, min(cap - len(owned), lim["max_starts_per_tick"]))
     live = {s["bead"] for s in snap["sessions"] if s.get("bead") and running(s)}
@@ -1642,6 +1647,11 @@ def w14_plan_test():
     assert plan(five, dict(issues, r4=mine("r4"))) == []
     by_state = dict(config, agent={"max_concurrent": 9, "max_concurrent_by_state": {"in_progress": 3}})
     assert plan(five, issues, cfg=by_state) == []
+    # A closed bead whose attempt session still runs holds its slot until the session stops.
+    gone = {"id": "cl", "status": "closed", "assignee": None, "description": "",
+            "comments": [{"text": "attempt: 1 session: s-cl slot: /s branch: b brief: /b dispatch: auto"}]}
+    assert keys(plan(five, dict(issues, cl=gone), [{"sessionId": "s-cl", "alive": True}])) == []
+    assert keys(plan(five, dict(issues, cl=gone), [{"sessionId": "s-cl", "state": "stopped"}])) == [("a", "dispatch attempt=1")]
     # Not candidates: no-swarm, quarantined, auto:blocked, claimed or not open.
     skip = [cand("n", labels=("auto", "no-swarm")), cand("q", labels=("auto", QUARANTINE)),
             cand("k", labels=("auto", AUTO_BLOCKED)), cand("m", assignee="someone"), cand("o", status="in_progress")]

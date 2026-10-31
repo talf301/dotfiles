@@ -89,10 +89,13 @@ self_test() {
   sleep 1; kill -TERM $pk; sleep 1; rc=0; kill -0 $pk 2> /dev/null || rc=1
   t [ $rc -eq 1 ]; rc=0; wait $pk 2> /dev/null || rc=$?; t [ $rc -eq 143 ]; t [ "$(grp)" = "$before" ]
   kill $holder; wait $holder 2> /dev/null || true; t free
-  # The conflicting bead x merges the group into its own branch, resolves, and then lands.
+  # The conflicting bead x merges the group into its own branch and resolves; meanwhile bead y lands. Then x
+  # integrates: the group merge changes its tree again, so done-when runs (it sees x's and y's lines), and x lands.
   $g -C "$d/wt-x" fetch -q origin; $g -C "$d/wt-x" merge -q origin/u/tfriedman/pr/grp > /dev/null 2>&1 || true
   sed -i '' '/^[<=>]\{7\}/d; /^7e$/d' "$d/wt-x/f"; $g -C "$d/wt-x" commit -qam "resolve"
-  t "$me" px "$d/wt-x" grp true > /dev/null; t lands b-x; t free
+  bead y 's/^3$/3y/'; t "$me" py "$d/wt-y" grp true > /dev/null
+  t "$me" px "$d/wt-x" grp "grep -q 3y f && grep -q 7x f && echo x >> $log" > /dev/null; t lands b-x; t free
+  t [ "$(tail -1 "$log")" = x ]
   t [ "$($g -C "$d/clone" show origin/u/tfriedman/pr/grp:f | sed -n 7p)" = 7x ]
   echo "integrate self-test: ok"
 }

@@ -69,10 +69,20 @@ self_test() {
   t [ $rc -eq 143 ]; t [ "$(grp)" = "$before" ]; t free
   t [ "$($g -C "$d/wt-c" branch --show-current)" = b-c ]; t [ "$($g -C "$d/wt-c" status --porcelain)" = "" ]
   sleep 0.2; t [ -z "$(pgrep -f 'sleep 31' || true)" ]
-  # A held lock: exit 5 after the wait.
-  rc=0; IAR_LOCK_WAIT_S=1 python3 -c 'import fcntl,subprocess,sys; f=open(sys.argv[1],"a"); fcntl.flock(f,fcntl.LOCK_EX); sys.exit(subprocess.call(sys.argv[2:]))' \
-    "$IAR_STATE_DIR/locks/pr-grp.lock" "$me" pc "$d/wt-c" grp true > /dev/null 2>&1 || rc=$?
-  t [ $rc -eq 5 ]; t free
+  # A held lock: exit 5 after the wait; SIGTERM during the wait ends it at once.
+  python3 -c 'import fcntl,sys,time; f=open(sys.argv[1],"a"); fcntl.flock(f,fcntl.LOCK_EX); time.sleep(20)' \
+    "$IAR_STATE_DIR/locks/pr-grp.lock" & local holder=$!
+  sleep 0.5; rc=0; IAR_LOCK_WAIT_S=1 "$me" pc "$d/wt-c" grp true > /dev/null 2>&1 || rc=$?
+  t [ $rc -eq 5 ]
+  "$me" pc "$d/wt-c" grp true > /dev/null 2>&1 & pk=$!
+  sleep 1; kill -TERM $pk; sleep 1; rc=0; kill -0 $pk 2> /dev/null || rc=1
+  t [ $rc -eq 1 ]; rc=0; wait $pk 2> /dev/null || rc=$?; t [ $rc -eq 143 ]; t [ "$(grp)" = "$before" ]
+  kill $holder; wait $holder 2> /dev/null || true; t free
+  # The conflicting bead x merges the group into its own branch, resolves, and then lands.
+  $g -C "$d/wt-x" fetch -q origin; $g -C "$d/wt-x" merge -q origin/u/tfriedman/pr/grp > /dev/null 2>&1 || true
+  sed -i '' '/^[<=>]\{7\}/d; /^7e$/d' "$d/wt-x/f"; $g -C "$d/wt-x" commit -qam "resolve"
+  t "$me" px "$d/wt-x" grp true > /dev/null; t lands b-x; t free
+  t [ "$($g -C "$d/clone" show origin/u/tfriedman/pr/grp:f | sed -n 7p)" = 7x ]
   echo "integrate self-test: ok"
 }
 
@@ -86,9 +96,13 @@ branch=$(git symbolic-ref -q --short HEAD) || { echo "integrate: $wt is not on a
 [ -z "$(git status --porcelain)" ] || { echo "integrate: $wt has uncommitted changes" >&2; exit 1; }
 orig=$(git rev-parse HEAD)
 
-dwpid=
+kid=
+waited() {  # run in the background and wait: a signal is handled at once, not when the child ends
+  "$@" & kid=$!
+  local rc=0; wait $kid || rc=$?; kid=; return $rc
+}
 cleanup() {
-  [ -n "$dwpid" ] && kill "$dwpid" 2> /dev/null
+  [ -n "$kid" ] && kill "$kid" 2> /dev/null  # ponytail: TERM reaches this pid only, not its children
   git rev-parse -q --verify MERGE_HEAD > /dev/null && git merge --abort
   git checkout -q -f "$branch" || true
 }
@@ -98,7 +112,7 @@ trap 'exit 143' TERM INT HUP
 locks="${IAR_STATE_DIR:-$HOME/.local/state/iar}/locks"
 mkdir -p "$locks"
 exec 9>> "$locks/pr-$slug.lock"
-python3 -c '
+waited python3 -c '
 import fcntl, sys, time
 end = time.monotonic() + float(sys.argv[1])
 while True:
@@ -127,9 +141,8 @@ fi
 merged=$(git rev-parse HEAD)
 # 3. A changed tree is tested again.
 if [ "$(git rev-parse "$orig^{tree}")" != "$(git rev-parse HEAD^{tree})" ]; then
-  (cd "$wt" && exec bash -c "$dw") 9>&- & dwpid=$!  # ponytail: TERM reaches this pid only, not its children
-  wait $dwpid || { dwpid=; echo "integrate: done-when failed after merging $base" >&2; exit 4; }
-  dwpid=
+  done_when() { cd "$wt" && exec bash -c "$dw"; } 9>&-
+  waited done_when || { echo "integrate: done-when failed after merging $base" >&2; exit 4; }
 fi
 # 4. One merge commit per bead in the group; both branches move together or not at all.
 git checkout -q --detach "origin/$base"

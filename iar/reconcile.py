@@ -514,27 +514,35 @@ def src_git(snap):
 
 
 def stacked_groups(repo, slugs):
-    """{slug: reason} for the PR groups the loop must not dispatch (W9b): listed in stack-owners.conf, or sharing
-    a commit that is not on the default branch with another group branch (a stack: Tal's pr-stack work).
-    ponytail: reads the remote-tracking refs (every lease fetches them), no fetch here; and a shared commit marks
-    the bottom group of a stack too, as git cannot tell which branch was made from which."""
+    """{slug: reason} for the PR groups the loop must not dispatch (W9b): listed in stack-owners.conf, or not based
+    on the default branch: another unmerged group branch is an ancestor of it (it is stacked on that group), or the
+    two share commits not on the default branch and neither contains the other (a stack that needs a restack, and
+    git cannot tell which is the bottom one: both wait). Fetches the default branch and the group branches first."""
     git = ["/usr/bin/git", "-C", repo]
     globs = []
     with contextlib.suppress(OSError), open(STACK_OWNERS) as f:
         globs = [g for line in f if not line.lstrip().startswith("#") for g in line.split()[1:]]
-    default = next((f"origin/{b}" for b in ("main", "master")
-                    if sh([*git, "rev-parse", "--verify", "--quiet", f"refs/remotes/origin/{b}"], check=False)), None)
-    groups = sh([*git, "for-each-ref", "--format=%(refname:strip=3)", "refs/remotes/origin/u/tfriedman/pr/"]).split()
+    head = re.search(r"(?m)^ref: refs/heads/(\S+)\tHEAD$", sh([*git, "ls-remote", "--symref", "origin", "HEAD"]))
+    need(head, "git ls-remote: origin HEAD names the default branch")
+    sh([*git, "fetch", "-q", "--prune", "origin", f"+refs/heads/{head[1]}:refs/remotes/origin/{head[1]}",
+        "+refs/heads/u/tfriedman/pr/*:refs/remotes/origin/u/tfriedman/pr/*"])
+    default = f"origin/{head[1]}"
+    ancestor = lambda a, b: sh([*git, "merge-base", "--is-ancestor", a, b], check=False) is not None
+    groups = sh([*git, "for-each-ref", "--format=%(refname:strip=2)", "refs/remotes/origin/u/tfriedman/pr/"]).split()
+    unmerged = [x for x in groups if not ancestor(x, default)]
     out = {}
     for slug in sorted(slugs):
-        g = f"u/tfriedman/pr/{slug}"
-        if any(fnmatch.fnmatchcase(g, x) for x in globs):
+        g = f"origin/u/tfriedman/pr/{slug}"
+        if any(fnmatch.fnmatchcase(g[7:], x) for x in globs):
             out[slug] = "stacked group: use pr-stack (listed in iar/stack-owners.conf)"
             continue
-        for other in (x for x in groups if x != g and g in groups and default):
-            base = sh([*git, "merge-base", f"origin/{g}", f"origin/{other}"], check=False)
-            if base and sh([*git, "merge-base", "--is-ancestor", base.strip(), default], check=False) is None:
-                out[slug] = f"stacked group: use pr-stack (shares unmerged commits with {other})"
+        for other in (x for x in unmerged if x != g and g in groups):
+            if ancestor(other, g):
+                out[slug] = f"stacked group: use pr-stack (based on {other[7:]})"
+            elif not ancestor(g, other) and (base := sh([*git, "merge-base", g, other], check=False)) \
+                    and not ancestor(base.strip(), default):
+                out[slug] = f"stacked group: use pr-stack (shares unmerged commits with {other[7:]}, needs a restack)"
+            if slug in out:
                 break
     return out
 
@@ -1819,28 +1827,40 @@ def w9b_stack_test():
     global STACK_OWNERS
     saved = STACK_OWNERS
     with tempfile.TemporaryDirectory() as d:
-        git = lambda *a: subprocess.run(["git", "-C", d, "-c", "user.name=t", "-c", "user.email=t@t", *a], check=True,
-                                        capture_output=True, text=True).stdout.strip()
-        git("init", "-q")
-        commit = lambda msg, parent=None: git("commit-tree", "-m", msg, *(["-p", parent] if parent else []),
-                                              git("write-tree"))
-        ref = lambda name, sha: git("update-ref", f"refs/remotes/origin/{name}", sha)
+        o, w = os.path.join(d, "origin.git"), os.path.join(d, "slot")
+        git = lambda repo, *a: subprocess.run(["git", "-C", repo, "-c", "user.name=t", "-c", "user.email=t@t", *a],
+                                              check=True, capture_output=True, text=True).stdout.strip()
+        os.mkdir(w)
+        git(d, "init", "-q", "--bare", o)
+        git(o, "symbolic-ref", "HEAD", "refs/heads/master")
+        git(w, "init", "-q")
+        git(w, "remote", "add", "origin", o)
+        tree = git(o, "hash-object", "-t", "tree", "-w", "/dev/null")
+        commit = lambda msg, *parents: git(o, "commit-tree", "-m", msg, *[x for p in parents for x in ("-p", p)], tree)
+        ref = lambda name, sha: git(o, "update-ref", f"refs/heads/{name}", sha)  # on the remote only: the check fetches
         m = commit("main")
-        a1, c1 = commit("a", m), commit("c", m)
-        ref("main", m)
+        a1 = commit("a", m)
+        ref("master", m)
         ref("u/tfriedman/pr/a", a1)
         ref("u/tfriedman/pr/b", commit("b", a1))  # stacked on a
-        ref("u/tfriedman/pr/c", c1)
+        ref("u/tfriedman/pr/c", commit("c", m))
         ref("u/tfriedman/pr/d", commit("d", m))
+        ref("u/tfriedman/pr/gone", commit("gone", a1))  # fetched, then deleted on the remote: pruned, not held
+        git(w, "fetch", "-q", "origin", "+refs/heads/u/tfriedman/pr/gone:refs/remotes/origin/u/tfriedman/pr/gone")
+        git(o, "update-ref", "-d", "refs/heads/u/tfriedman/pr/gone")
         STACK_OWNERS = os.path.join(d, "owners.conf")
         with open(STACK_OWNERS, "w") as f:
             f.write("# comment u/tfriedman/pr/c\nown  u/tfriedman/pr/d*  u/tfriedman/pr/zz\n")
         try:
-            got = stacked_groups(d, {"a", "b", "c", "d", "new"})
-            assert sorted(got) == ["a", "b", "d"] and "with u/tfriedman/pr/a" in got["b"], got
+            got = stacked_groups(w, {"a", "b", "c", "d", "new", "gone"})
+            assert sorted(got) == ["b", "d"] and got["b"].endswith("(based on u/tfriedman/pr/a)"), got
             assert all(r.startswith("stacked group: use pr-stack") for r in got.values()) and "stack-owners" in got["d"]
-            ref("main", a1)  # a merged: b is now based on the default branch
-            assert sorted(stacked_groups(d, {"a", "b", "c"})) == [], stacked_groups(d, {"a", "b", "c"})
+            ref("u/tfriedman/pr/a", commit("a2", a1))  # a moved on after b was made: no order, both wait
+            diverged = stacked_groups(w, {"a", "b", "c"})
+            assert sorted(diverged) == ["a", "b"] and "needs a restack" in diverged["a"], diverged
+            ref("master", commit("merge a", m, a1))  # a1 merged: b is now based on the default branch
+            ref("u/tfriedman/pr/a", a1)
+            assert stacked_groups(w, {"a", "b", "c"}) == {}, stacked_groups(w, {"a", "b", "c"})
         finally:
             STACK_OWNERS = saved
     body = "Files:\n- iar/{f}.py\n\nDone when: `true`\n"

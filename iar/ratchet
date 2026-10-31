@@ -83,7 +83,11 @@ def pattern(d):
     """(key, safe): the rule a denial points at, and whether it may be suggested.
 
     A Bash rule names a program and a subcommand (`Bash(npm test *)`); a one-word rule is too
-    broad. A command is unsafe when any of its segments is gated or risky."""
+    broad. A command is unsafe when any of its segments is gated or risky.
+
+    A suggested `Bash(git fetch *)` cannot approve `git fetch && git push origin main`: Claude Code
+    splits compound commands on &&, ||, ;, |, |&, & and newlines, and every subcommand must be
+    allowed on its own (code.claude.com/docs/en/permissions, "Compound commands")."""
     tool, inp = d.get("tool_name") or "?", d.get("tool_input") or {}
     if tool == "WebFetch":
         host = urlparse(inp.get("url", "")).hostname

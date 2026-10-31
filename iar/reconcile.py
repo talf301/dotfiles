@@ -11,7 +11,7 @@ iar/research/factory-scan.md 1.4.
   reconcile.py --dry-run [--board]   the same, but execute nothing
   reconcile.py --enable <class>      switch one action class on in WORKFLOW.md
   reconcile.py --kill                switch every action class off in WORKFLOW.md
-  reconcile.py --self-test           fixtures only; touches no store, session or lease
+  reconcile.py --self-test           fixtures and a scratch br store; touches no real store, session or lease
 
 Sources (30 s timeout and a schema check each): br (through ledger.py), `claude agents --json`
 with transcripts and `ps`, `treehouse status --json`, git (branch head vs `ls-remote`), and the
@@ -505,13 +505,17 @@ def execute(snap, actions, executors=None):
     out = []
     if snap["errors"]:
         return out  # E8b: a failing tick does nothing
+    try:
+        any_on = any(workflow.load()[0]["actions"].values())
+    except workflow.WorkflowError as e:
+        return [{"item": "-", "action": "-", "outcome": f"error: {e}"}]  # no readable switches: act on nothing
     work = [dict(a, proposed=True) for a in actions]
     seen = {(a["item"], a["action"]) for a in actions}
     for bid, b in sorted(snap["issues"].items()):
         intents = open_intents(b)
         work += [{"item": bid, "class": cls, "action": key, "proposed": False}
                  for key, cls in intents.items() if (bid, key) not in seen]
-        if not intents and PENDING in (b.get("labels") or []):  # a crash after the comment, before the label drop
+        if any_on and not intents and PENDING in (b.get("labels") or []):  # crash after the comment, before the unlabel
             try:
                 ledger.label(bid, remove=[PENDING])
                 out.append({"item": bid, "action": f"unlabel {PENDING}", "outcome": "done"})
@@ -821,41 +825,35 @@ def self_test():
     assert not inbox_quiet({"id": "r", "person_seen_seq": 3}, [agent("r"), agent("m2")], seqs, False)
     assert not inbox_quiet({"id": "r", "person_seen_seq": 9}, [agent("r")], seqs, True)
     assert inbox_quiet({"id": "r", "person_read_seq": 6}, [agent("r"), agent("m2")], seqs, True)
-    executor_self_test(bead)
+    executor_self_test()
     print("reconcile self-test: ok")
 
 
-def executor_self_test(bead):
-    """W11: switches, journal, E6, E8b, crash recovery. A fake tracker and fake sources; no real store."""
+def executor_self_test():
+    """W11: switches, journal, E6, E8b, crash recovery, end to end against a scratch br store (real br source,
+    real comments and labels). Fake sessions, leases and Inbox; fault injection wraps the tracker writes."""
     import threading
-    store = {b["id"]: b for b in [bead("precog-sl", status="open", assignee=""),  # stale-lease: return-lease
-                                  bead("precog-zm")]}                              # zombie: flag-zombie
-    slots = [{"slot": "4", "holder": "agent:precog-sl#1"}]
     returned, flagged, fail = [], [], {"comment": None, "source": False, "unlabel": False}
-
-    def show(bid):
-        return json.loads(json.dumps(store[bid]))
+    slots = []
+    real = ledger.comment, ledger.label
 
     def comment(bid, text, author=None):
         if fail["comment"] and text.startswith(fail["comment"]):
             fail["comment"] = None
             raise ledger.LedgerError("br comments failed (crash after the action)")
-        store[bid]["comments"].append({"text": text})
+        return real[0](bid, text, author)
 
     def label(bid, add=(), remove=()):
         if remove and fail["unlabel"]:
             fail["unlabel"] = False
             raise ledger.LedgerError("br label remove failed")
-        labels = store[bid].setdefault("labels", [])
-        labels[:] = [x for x in labels if x not in remove] + [x for x in add if x not in labels]
+        return real[1](bid, add, remove)
 
     def treehouse(s):
         if fail["source"]:
             raise SourceError("treehouse status: no answer in 30s")
         s["slots"] = [x for x in slots if x["slot"] not in returned]
-    fakes = {"agents": lambda s: None, "treehouse": treehouse, "inbox": lambda s: None,
-             "plannotator": lambda s: None, "git": lambda s: None,
-             "br": lambda s: s.update(issues={k: show(k) for k in store})}
+    fakes = {"agents": lambda s: None, "treehouse": treehouse, "inbox": lambda s: None, "plannotator": lambda s: None}
     slot_of = lambda a: a["action"].split()[1][len("slot="):]
 
     def act_flag(a, snap):
@@ -863,21 +861,32 @@ def executor_self_test(bead):
         flagged.append(a["item"])
     executors = {"return-lease": (lambda a, snap: slot_of(a) in returned, lambda a, snap: returned.append(slot_of(a))),
                  "flag-zombie": (lambda a, snap: False, act_flag)}
-    texts = lambda bid: [c["text"] for c in store[bid]["comments"]]
+    texts = lambda bid: [c["text"] for c in ledger.show(bid).get("comments") or []]
+    labels = lambda bid: ledger.show(bid).get("labels") or []
 
-    real = ledger.show, ledger.comment, ledger.label
+    def bead(title, slot=None, zombie=False):
+        bid = ledger.create(title)["id"]
+        real[0](bid, f"attempt: 1 session: s-{bid} slot: /nonexistent/{bid} branch: u/x/{bid} brief: /b")
+        if zombie:
+            ledger.update(bid, status="in_progress", assignee=f"agent:{bid}#1")
+        if slot:
+            slots.append({"slot": slot, "holder": f"agent:{bid}#1"})
+        return bid
+
     saved_env = {k: os.environ.get(k) for k in ("IAR_WORKFLOW", "BEADS_DIR")}
     with tempfile.TemporaryDirectory() as d:
         wf = os.path.join(d, "WORKFLOW.md")
         with open(os.path.join(IAR, "WORKFLOW.md")) as src, open(wf, "w") as dst:
             dst.write(src.read())
-        os.environ.update(IAR_WORKFLOW=wf, BEADS_DIR=d)
-        set_switches(None, wf)  # start all off, whatever the live switches are
-        ledger.show, ledger.comment, ledger.label = show, comment, label
+        os.environ.update(IAR_WORKFLOW=wf, BEADS_DIR=os.path.join(d, ".beads"))
+        ledger.comment, ledger.label = comment, label
         try:
-            run = lambda: tick(d, False, fakes, executors)[1]["executed"]
+            subprocess.run(["br", "init", "--prefix", "rt"], cwd=d, check=True, capture_output=True, timeout=30)
+            set_switches(None, wf)  # start all off, whatever the live switches are
+            sl, zm = bead("stale lease", slot="4"), bead("zombie", zombie=True)
+            run = lambda: [x for x in tick(d, False, fakes, executors)[1]["executed"] if x["outcome"] != "off"]
             # Switches: all off -> nothing acts. --enable turns one class on; an unknown class fails.
-            assert {x["outcome"] for x in run()} == {"off"} and not returned + flagged
+            assert run() == [] and not returned + flagged
             try:
                 set_switches("no-such-class")
                 raise AssertionError("set_switches accepted an unknown class")
@@ -899,44 +908,45 @@ def executor_self_test(bead):
                 th.start()
             for th in threads:
                 th.join()
-            assert flagged == ["precog-zm"] and 0 in codes, (flagged, codes)
-            assert texts("precog-zm")[-2:] == ["reconcile-start: zombie flag-zombie attempt=1",
-                                               "reconcile: flag-zombie attempt=1"], texts("precog-zm")
-            assert store["precog-zm"]["labels"] == []
+            assert flagged == [zm] and 0 in codes, (flagged, codes)
+            assert texts(zm)[-2:] == ["reconcile-start: zombie flag-zombie attempt=1",
+                                      "reconcile: flag-zombie attempt=1"], texts(zm)
+            assert PENDING not in labels(zm) and run() == [] and flagged == [zm]
             # A stale snapshot still proposing a recorded key: the fresh check before acting skips it.
-            assert execute({"errors": {}, "issues": {}}, [{"item": "precog-zm", "class": "zombie",
-                                                           "action": "flag-zombie attempt=1"}],
-                           executors)[0]["outcome"] == "recorded" and flagged == ["precog-zm"]
+            assert execute({"errors": {}, "issues": {}}, [{"item": zm, "class": "zombie", "action": "flag-zombie attempt=1"}],
+                           executors)[0]["outcome"] == "recorded" and flagged == [zm]
             # Crash between "action done" and "comment written". The effect (lease returned) removes the
             # candidate, so only the open intent (label + reconcile-start:) brings the next tick back to it.
             assert set_switches("stale-lease")["stale-lease"] is True
+            key = f"return-lease slot=4 holder=agent:{sl}#1"
             fail["comment"] = "reconcile: return-lease"
-            assert run() == [{"item": "precog-sl", "action": "return-lease slot=4 holder=agent:precog-sl#1",
+            assert run() == [{"item": sl, "action": key,
                               "outcome": "error: LedgerError: br comments failed (crash after the action)"}]
-            assert returned == ["4"] and store["precog-sl"]["labels"] == [PENDING]
-            assert run() == [{"item": "precog-sl", "action": "return-lease slot=4 holder=agent:precog-sl#1",
-                              "outcome": "recovered"}]
-            assert returned == ["4"] and store["precog-sl"]["labels"] == [] and run() == []
+            assert returned == ["4"] and PENDING in labels(sl)
+            assert run() == [{"item": sl, "action": key, "outcome": "recovered"}]
+            assert returned == ["4"] and PENDING not in labels(sl) and run() == []
+            assert texts(sl)[-2:] == [f"reconcile-start: stale-lease {key}", f"reconcile: {key}"], texts(sl)
             # An intent with no effect that is no longer proposed is dropped, not acted on.
-            store["precog-dr"] = bead("precog-dr", status="open", assignee="", extra=[
-                "reconcile-start: stale-lease return-lease slot=9 holder=agent:precog-dr#1"])
-            store["precog-dr"]["labels"] = [PENDING]
+            dr = bead("dropped intent")
+            real[0](dr, f"reconcile-start: stale-lease return-lease slot=9 holder=agent:{dr}#1")
+            real[1](dr, add=[PENDING])
             assert [x["outcome"] for x in run()] == ["dropped"] and returned == ["4"]
-            assert store["precog-dr"]["labels"] == [] and run() == []
-            # A crash after the reconcile: comment, before the label drop: the next tick drops the stale label.
-            store["precog-lb"] = bead("precog-lb", status="open", assignee="")
-            slots.append({"slot": "6", "holder": "agent:precog-lb#1"})
+            assert PENDING not in labels(dr) and run() == []
+            # A crash after the reconcile: comment, before the label drop: the next tick drops the stale label,
+            # but not after --kill.
+            lb = bead("label left", slot="6")
             fail["unlabel"] = True
             assert [x["outcome"] for x in run()] == ["error: LedgerError: br label remove failed"]
-            assert returned == ["4", "6"] and store["precog-lb"]["labels"] == [PENDING]
-            assert run() == [{"item": "precog-lb", "action": f"unlabel {PENDING}", "outcome": "done"}]
-            assert store["precog-lb"]["labels"] == [] and run() == [] and returned == ["4", "6"]
-            # --kill switches every class off.
+            assert returned == ["4", "6"] and PENDING in labels(lb)
             assert not any(set_switches().values()) and not any(workflow.load(wf)[0]["actions"].values())
+            assert run() == [] and PENDING in labels(lb)  # --kill: no tracker write at all
+            set_switches("stale-lease")
+            assert run() == [{"item": lb, "action": f"unlabel {PENDING}", "outcome": "done"}]
+            assert PENDING not in labels(lb) and run() == [] and returned == ["4", "6"]
             with open(os.path.join(d, "reconcile.jsonl")) as f:
                 assert all(json.loads(x)["dry_run"] is False for x in f)
         finally:
-            ledger.show, ledger.comment, ledger.label = real
+            ledger.comment, ledger.label = real
             for k, v in saved_env.items():
                 if v is None:
                     os.environ.pop(k, None)

@@ -1132,7 +1132,7 @@ def act_reping(a, snap):
                                    f"not reversible, so no default applies and {f.get('asking')} waits for you.\n\n"
                                    f"{f.get('question')}",
                            "reply_to": f["inbox_thread"], "idempotency_key": f"reping-{qid}",
-                           "project_path": INBOX_PROJECT})
+                           "project_path": f.get("inbox_project") or INBOX_PROJECT})
 
 
 def act_post(a, snap):
@@ -1571,7 +1571,9 @@ def w13_test():
             assert run() == sorted([
                 (ap, "deliver-answer", "done"), (hw, "deliver-answer", "done"), (to, "import-answer", "done"),
                 (to, "deliver-answer", "done"), (td, "deliver-answer", "done"), (ip, "reping", "done")])
-            assert [s for s in sent() if s[0] == "msg_T1" and qip in s[1]]
+            with open(log) as f:  # the reping goes to the project the question was posted to
+                call = [json.loads(x) for x in f.read().splitlines() if f"reping-{qip}" in x][0]["params"]["arguments"]
+            assert call["reply_to"] == "msg_T1" and call["project_path"] == "/inbox/other", call
             resumes = {c[1]: c[2] for c in calls if c[0] == "resume"}
             assert sorted(resumes) == sorted([f"s-{ap}-2", f"s-{hw}-1", f"s-{to}-1", f"s-{td}-1"]), resumes  # E4: attempt 2
             assert resumes[f"s-{ap}-2"].startswith(f"ANSWER {qap}: Keep\n"), resumes

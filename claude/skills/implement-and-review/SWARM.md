@@ -136,7 +136,7 @@ whether the poller is running. Act with one key — **no hand-typed `br`/`git`**
 |---|---|
 | `enter` | full detail + comments |
 | `a` | answer an escalation (type decision → records note + resumes) |
-| `f` | **Fable chat** — for hard/structural ones: opens a live `claude --model claude-fable-5` session on the bead in a **new `herdr` tab** (`herdr tab create` + `herdr agent start`; TUI keeps running). Talk it through, then hand back (`br update --remove-label needs-human`) or fix + set `iar:awaiting-review`. |
+| `f` | **Fable chat** — for hard/structural ones: opens a live `claude --model claude-fable-5` session on the bead in a **new Rex tab** named after the bead, in its worktree (`rex window new -s $REX_SESSION -c <wt> <bead-id> -- claude …`; TUI keeps running). Talk it through, then hand back (`br update --remove-label needs-human`) or fix + set `iar:awaiting-review`. |
 | `p` | open a **draft PR** for an approved bead (confirm → push → `gh pr create --draft --base main` → record URL on the bead). Never a local merge. |
 | `d` | **done** — after the PR merges, tidy up: close bead + remove worktree + delete local branch |
 | `c` / `r` | close / resume (drop `needs-human`) |

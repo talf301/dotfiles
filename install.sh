@@ -14,8 +14,8 @@ set -euo pipefail
 REPO="$(cd "$(dirname "$(realpath "$0")")" && pwd)"
 DRY=0; [ "${1:-}" = "--dry" ] && DRY=1
 
-link() {  # link <src-in-repo> <dest>
-  local src="$REPO/$1" dest="$2"
+link() {  # link <src-in-repo | /absolute/src> <dest>
+  local src="$1" dest="$2"; [[ "$src" = /* ]] || src="$REPO/$src"
   if [ ! -e "$src" ]; then echo "skip  $1 (not in repo)"; return; fi
   if [ "$(readlink "$dest" 2>/dev/null)" = "$src" ]; then echo "ok    $dest"; return; fi
   if [ $DRY = 1 ]; then echo "LINK  $dest -> $src${_bak:+  (would back up existing)}"; return; fi
@@ -29,6 +29,9 @@ link() {  # link <src-in-repo> <dest>
 
 # --- swarm tooling: every executable in bin/ → ~/.local/bin/ ---
 for f in "$REPO"/bin/*; do link "bin/$(basename "$f")" "$HOME/.local/bin/$(basename "$f")"; done
+
+# --- Rex CLI (ships inside the app bundle) → ~/.local/bin/rex ---
+link "/Applications/Rex Beta.app/Contents/Helpers/Rex Server.rex/Contents/MacOS/rex" "$HOME/.local/bin/rex"
 
 # --- IAR skill: cross-agent chain  ~/.claude → ~/.agents → this repo ---
 link "claude/skills/implement-and-review" "$HOME/.agents/skills/implement-and-review"

@@ -119,6 +119,9 @@ AUTO_BLOCKED = "auto:blocked"
 BG = os.path.join(os.path.dirname(IAR), "bin", "bg")  # IAR_BG overrides it (tests)
 BG_TIMEOUT_S = 1200  # bin/bg leases (up to 15 min) and waits for the session
 TRY_RE = re.compile(r"^attempt(?:: |-failed: \S+ attempt=)(\d+)\b")  # bin/bg next_attempt numbering
+# ponytail: keyword guess at "needs compute"; it errs toward a reject (Tal adds a budget block or dispatches by hand)
+COMPUTE_RE = re.compile(r"(?i)\b(gpu|cluster|flyte|sky (?:launch|exec|jobs)|skypilot|ray job|aws|baseten|training run|"
+                        r"eval run|sagemaker|ec2|s3://)")
 LAST_GOOD = [None]  # the last WORKFLOW.md config that loaded; actions run on it while the file is bad
 LIMIT_GRACE = timedelta(minutes=15)  # after a limit-nudge, still working this long: quarantine
 QUARANTINE = "quarantined"
@@ -764,7 +767,11 @@ def gate(issue, busy, budget_check):
         return "no `Files:` list"
     if not done_when(issue):
         return "no `Done when:` line with a `command`"
-    if re.search(r"(?m)^```[^\n]*\n\s*budget", issue.get("description") or ""):  # it needs compute
+    text = "\n".join(issue.get(k) or "" for k in ("title", "description", "acceptance_criteria"))
+    has_block = re.search(r"(?m)^```[^\n]*\n\s*budget", text)
+    if not has_block and (word := COMPUTE_RE.search(text)):
+        return f"mentions compute ({word[0]!r}) but has no `budget:` block"
+    if has_block:
         try:
             budget_check(issue["id"])
         except budget.BudgetError as e:
@@ -1674,6 +1681,9 @@ def w14_plan_test():
     def tracker_down(bid):
         raise ledger.LedgerError("br show: no answer in 30s")
     assert plan([budgeted], check=tracker_down) == []  # not a verdict on the bead: wait, no reject
+    gpu = cand("gp", description=body.format(f="gp") + "Run the eval on the GPU cluster.\n")
+    out = plan([gpu])
+    assert keys(out) == [("gp", "reject-auto count=1")] and "no `budget:` block" in out[0]["detail"], out
     # Files in use by an in_progress bead or a running session's bead: wait, no reject; and within one tick.
     busy = {"w": dict(mine("w"), description=body.format(f="a"))}
     assert plan([cand("a")], busy) == []

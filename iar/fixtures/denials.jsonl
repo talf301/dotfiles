@@ -27,3 +27,9 @@ not json: a torn line
 {"ts":"2026-10-25T06:00:00Z","session_id":"s9","cwd":"/w","tool_name":"Bash","tool_input":{"command":"gh pr merge 12 --squash"},"reason":"merge"}
 {"ts":"2026-10-25T06:10:00Z","session_id":"s9","cwd":"/w","tool_name":"Bash","tool_input":{"command":"gh pr merge 13 --squash"},"reason":"merge"}
 {"ts":"2026-10-25T06:20:00Z","session_id":"s9","cwd":"/w","tool_name":"Bash","tool_input":{"command":"gh pr merge 14 --squash"},"reason":"merge"}
+{"ts":"2026-10-24T06:00:00Z","session_id":"s10","cwd":"/w","tool_name":"Bash","tool_input":{"command":"make deploy"},"reason":"deploy"}
+{"ts":"2026-10-24T06:10:00Z","session_id":"s10","cwd":"/w","tool_name":"Bash","tool_input":{"command":"make deploy ENV=staging"},"reason":"deploy"}
+{"ts":"2026-10-24T06:20:00Z","session_id":"s10","cwd":"/w","tool_name":"Bash","tool_input":{"command":"make deploy"},"reason":"deploy"}
+{"ts":"2026-10-24T07:00:00Z","session_id":"s10","cwd":"/w","tool_name":"Bash","tool_input":{"command":"npm run publish:prod"},"reason":"publish"}
+{"ts":"2026-10-24T07:10:00Z","session_id":"s10","cwd":"/w","tool_name":"Bash","tool_input":{"command":"npm run publish:prod"},"reason":"publish"}
+{"ts":"2026-10-24T07:20:00Z","session_id":"s10","cwd":"/w","tool_name":"Bash","tool_input":{"command":"npm run publish:prod"},"reason":"publish"}

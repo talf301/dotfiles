@@ -13,8 +13,9 @@ SETTINGS defaults to ~/.claude/settings.json; --denials to $IAR_STATE_DIR/denial
 - Top denials: the 5 most denied rules in the window.
 - Suggested allow rules: every rule denied 3 or more times (whole log) that SETTINGS does not
   allow yet. Never suggested: a rule that could cover a gated, outward-facing or irreversible
-  action (gate-hook.py, NEVER, RISKY_SUB), a one-word Bash rule, MCP and write tools. Numbers follow the time a rule reached 3 denials, so new denials do not renumber
-  older suggestions; applying one removes it and the later numbers move up by one.
+  action (gate-hook.py, NEVER, RISKY_SUB, RISKY_WORDS), a one-word Bash rule, MCP and write
+  tools. Numbers follow the time a rule reached 3 denials, so new denials do not renumber older
+  suggestions; applying one removes it and the later numbers move up by one.
 --apply adds the rule to permissions.allow, or with --auto a prose entry to autoMode.allow
 (seeded with "$defaults" when the list is new). It writes through a symlink, never replaces it.
 """
@@ -76,6 +77,12 @@ NEVER = gate.SHELLS | set(gate.GATED) | {
 RISKY_SUB = {"git": {"push", "reset", "clean", "branch", "tag", "rebase", "filter-branch",
                      "filter-repo", "update-ref", "gc", "prune", "reflog", "stash", "checkout",
                      "switch", "restore", "rm", "worktree", "remote", "config", "send-email"}}
+# Any argument word (split on punctuation) that names outward-facing, provisioning or destructive
+# work: `make deploy`, `npm run publish:prod`, `just release`. Conservative on purpose; Tal's pick
+# of a suggestion stays the last control.
+RISKY_WORDS = {"deploy", "publish", "release", "push", "apply", "up", "launch", "provision",
+               "upload", "send", "post", "merge", "destroy", "delete", "drop", "prod",
+               "production", "migrate", "rollout", "promote", "ship"}
 SAFE_TOOLS = {"WebSearch", "Read", "Glob", "Grep"}  # read-only; no rule for MCP or write tools
 
 
@@ -102,7 +109,9 @@ def pattern(d):
             continue
         prog = os.path.basename(argv[0])
         sub = argv[1] if len(argv) > 1 and SUBCOMMAND.match(argv[1]) else None
-        if prog in NEVER or sub in RISKY_SUB.get(prog, ()) or (prog in RISKY_SUB and not sub):
+        words = {w for t in argv[1:] for w in re.split(r"[^a-z0-9]+", t.lower())}
+        if (prog in NEVER or sub in RISKY_SUB.get(prog, ()) or (prog in RISKY_SUB and not sub)
+                or words & RISKY_WORDS):
             safe = False
         if key is None:
             key = f"Bash({argv[0]} {sub} *)" if sub else f"Bash({argv[0]} *)"
@@ -311,7 +320,7 @@ def self_test():
             assert rc == 0 and "Q(y)" not in out and "unrelated" not in out
             sug = out.split("Suggested allow rules")[1]
             assert "4. " not in sug, "risky rule suggested: " + sug
-            for bad in ("push", "gh ", "aws", "Bash(git *)", "Bash(bash", "mcp__", "other.example"):
+            for bad in ("push", "deploy", "publish", "gh ", "aws", "Bash(git *)", "Bash(bash", "mcp__", "other.example"):
                 assert bad not in sug, f"suggested {bad!r}"
 
             assert run("--now", question.iso(now + 2 * WINDOW), "--denials", denials,

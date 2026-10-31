@@ -21,7 +21,7 @@ Read `br show <id>` and its parent spec. A bead passes only if all are true:
 1. **Done-when command.** A command proves the criteria (usually the bead's tests via `iar-run-tests.sh`). If the bead names none, propose one from the criteria.
 2. **Files listed, no overlap.** The bead lists the files it changes, and no running background bead lists the same files. Running background beads: `claude agents --json`, entries with `kind=="background"` whose `state` is not `done` and whose `name` starts with a bead id.
 3. **No open decision.** No product default or design choice the bead and spec leave open.
-4. **Local only.** No Flyte or cluster run, VPN, AWS or paid run.
+4. **Local, or budgeted.** The bead runs only locally (no Flyte or cluster run, VPN, AWS or paid run), or it has a valid `budget:` block: `~/dotfiles/iar/budget.py <id>` exits 0. Creating or provisioning compute (`sky launch`, AWS create/run, Baseten push) is never covered: `iar/gate-hook.py` asks Tal each time.
 5. **One session in size.** A few hours of focused work, not a multi-day change.
 6. **Clear base.** The base from step 3 contains the files the bead changes and the beads it depends on (`git ls-tree -r --name-only <base>`). A bead without a `pr:` label whose code lives only on a PR-group branch fails; ask Tal for the base or a `pr:` label.
 7. **Nobody else on it.** No live session works on the same files: check `treehouse status` lease holders and `claude agents --json` names for sibling beads of the same parent.

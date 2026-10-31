@@ -1738,13 +1738,14 @@ def w14_tick_test():
         os.chmod(os.path.join(d, "bg"), 0o755)
         os.environ.update(IAR_WORKFLOW=wf, BEADS_DIR=os.path.join(d, ".beads"), IAR_BG=os.path.join(d, "bg"),
                           IAR_DIR=IAR, FAKE_BG_LOG=log, FAKE_BG_FAIL="")
-        fail_source = [False]
+        fail_source, stopped = [False], set()
 
         def agents(s):
             with open(log) if os.path.exists(log) else io.StringIO() as f:
                 started = [line.split() for line in f if not line.strip().endswith(" failed")]
             s["sessions"] = [{"sessionId": f"s-{b}-{n}", "id": b, "kind": "background", "name": f"{b}: x",
-                              "state": "working", "alive": True} for b, n in started]
+                              "state": "stopped" if b in stopped else "working", "alive": b not in stopped}
+                             for b, n in started]
 
         def treehouse(s):
             if fail_source[0]:
@@ -1834,6 +1835,7 @@ def w14_tick_test():
                 f.write(good.replace('"tracker"', '"tracker', 1))
             for bid in (a, b, fl):
                 ledger.close(bid, reason="test")
+                stopped.add(bid)  # their sessions end too: a running one would still hold its slot
             c, z2 = auto("third", 1), zombie("zombie two")
             line, done = run(new=False)
             assert done == [(z2, "flag-zombie attempt=1", "done")], done

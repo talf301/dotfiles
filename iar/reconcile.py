@@ -791,9 +791,9 @@ def plan_dispatch(snap, now, config, budget_check):
             continue
         n = sum(1 for k in done_keys(c) if k.startswith("reject-auto "))
         reject = {"item": c["id"], "class": "dispatch", "action": f"reject-auto count={n + 1}"}
-        if len(attempts(c)) >= lim["max_attempts"]:
-            out.append(dict(reject, over_limit=True, detail=f"over-limit: {len(attempts(c))} attempts reached "
-                                                            f"limits.max_attempts {lim['max_attempts']}"))
+        if (made := next_try(c) - 1) >= lim["max_attempts"]:  # started and failed attempts both count
+            out.append(dict(reject, over_limit=True, detail=f"over-limit: {made} attempts (started or failed) "
+                                                            f"reached limits.max_attempts {lim['max_attempts']}"))
             continue
         if (until := backoff_until(c, config["max_retry_backoff_ms"])) and now < until:
             continue
@@ -1658,9 +1658,13 @@ def w14_plan_test():
     att = lambda k: (f"attempt: {k} session: s{k} slot: /s branch: b brief: /b dispatch: auto", ago(9999))
     out = plan([cand("ol", comments=[att(1), att(2), att(3)])])
     assert keys(out) == [("ol", "reject-auto count=1")] and out[0]["over_limit"] and "max_attempts 3" in out[0]["detail"]
-    # Backoff 10 s * 2^(n-1) after n failures since the last attempt, capped at max_retry_backoff_ms.
+    # Failed launches count too: three attempt-failed comments reach the limit.
     fail = lambda k, s: (f"attempt-failed: lease attempt={k} boom", ago(s))
-    go = lambda *c: keys(plan([cand("f", comments=c)]))
+    out = plan([cand("of", comments=[fail(1, 999), fail(2, 999), fail(3, 999)])])
+    assert keys(out) == [("of", "reject-auto count=1")] and out[0]["over_limit"], out
+    # Backoff 10 s * 2^(n-1) after n failures since the last attempt, capped at max_retry_backoff_ms.
+    many_ok = dict(config, limits={"max_attempts": 99})
+    go = lambda *c: keys(plan([cand("f", comments=c)], cfg=many_ok))
     assert go(fail(1, 5)) == [] and go(fail(1, 11)) == [("f", "dispatch attempt=2")]
     assert go(fail(1, 99), fail(2, 99), fail(3, 30)) == [] and go(fail(1, 99), fail(2, 99), fail(3, 41)) != []
     many = [fail(k, 9999) for k in range(1, 10)]
@@ -1746,6 +1750,10 @@ def w14_tick_test():
             set_switches(None, wf)
             set_switches("dispatch", wf)
             set_switches("zombie", wf)
+            with open(wf) as f:  # fl fails 4 times below; the attempt limit is not under test here
+                text = f.read()
+            with open(wf, "w") as f:
+                f.write(text.replace('"max_attempts": 3', '"max_attempts": 9'))
             fl, a, r, b = auto("fails", 0), auto("first", 1), auto("rejected", 1, "no files\n"), auto("second", 2)
             ledger.create("not auto", type="task", priority=0, description=spec.format("na"))
             z = zombie("zombie one")

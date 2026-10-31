@@ -18,7 +18,7 @@ term=$(grep -m1 . "$STATE" 2>/dev/null)
 if [[ -z $term ]] || ! windows com.github.wez.wezterm | grep -qx "$term"; then
   # Started from inside a Claude session, the window would inherit that session's identity (child session, no
   # transcript, Remote Control clash).
-  unset -m 'CLAUDE*' 'AI_AGENT*' 'HERDR*'
+  unset -m 'CLAUDE*' 'AI_AGENT*' 'REX_*'
   before=$(windows com.github.wez.wezterm)
   open -n -a WezTerm --args start --cwd "$VAULT" -- zsh -lic 'claude --continue || claude; exec zsh -l'
   term=""

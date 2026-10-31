@@ -1,6 +1,6 @@
 # gnhf runs in Precog
 
-One command per run. Write a prompt, start it in a herdr pane, read the walkthrough in the Plannotator Inbox later.
+One command per run. Write a prompt, start it in a Rex tab, read the walkthrough in the Plannotator Inbox later.
 
 ```bash
 gnhf-run <name> <prompt.md> [--base <ref>] [--quota-floor <percent>] [gnhf flags...]

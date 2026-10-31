@@ -60,8 +60,8 @@ spec already holds the useful patterns (stall threshold, escalation as a bead, r
 "Orchestration-builder SDK ... a controller/supervisor loop that reconciles desired state to
 running state", with health patrol, Beads-backed waits and mail (README). This is the same shape
 as W10–W14. Requirements (README table): tmux always; `bd` ≥ 1.3.0 with Dolt ≥ 2.6.0 and
-`flock`, or a file store (`GC_BEADS=file`). It has no `br` provider and no Rex provider (it has
-herdr, which W20–W22 remove). **Verdict: nothing now.** Adopting it means a tracker switch and
+`flock`, or a file store (`GC_BEADS=file`). It has no `br` provider and no Rex provider (its terminal
+provider is the multiplexer that W20–W22 replace with Rex). **Verdict: nothing now.** Adopting it means a tracker switch and
 tmux. If W23a recommends `bd`, check Gas City again before W10 starts.
 
 ### 1.3 MCP Agent Mail

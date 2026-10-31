@@ -1,10 +1,10 @@
 #!/usr/bin/env zsh
-# Put Tal in a Claude session: focus its herdr pane when one runs it, else open a herdr tab running
+# Put Tal in a Claude session: show its Rex tab when one runs it, else open a Rex tab running
 # `claude attach` (background sessions only). ClaudeGo.app calls this for claudego://s/<sessionId> links on board.md.
 # Usage: go.sh [--dry] <sessionId>
 
 export XDG_CONFIG_HOME="$HOME/nikud/xdg_config_home"
-JQ=/usr/bin/jq HERDR=/opt/homebrew/bin/herdr CLAUDE=$HOME/.local/bin/claude
+JQ=/usr/bin/jq REX=$HOME/.local/bin/rex CLAUDE=$HOME/.local/bin/claude
 dry=""; [[ $1 == --dry ]] && { dry=echo; shift }
 sid=$1
 print -r -- "$(date '+%F %T') go $*" >> "$HOME/Library/Logs/session-board-actions.log"
@@ -15,26 +15,33 @@ agent=$("$CLAUDE" agents --json --all 2>/dev/null | "$JQ" -c --arg s "$sid" 'fir
 name=$(print -r -- "$agent" | "$JQ" -r '.name // ""')
 id=$(print -r -- "$agent" | "$JQ" -r '.id // ""')
 kind=$(print -r -- "$agent" | "$JQ" -r '.kind')
-full=$(print -r -- "$agent" | "$JQ" -r '.sessionId')
 
-# herdr knows some panes by Claude session id and others only by terminal title (the session name).
-pane=$("$HERDR" agent list 2>/dev/null | "$JQ" -r --arg s "$full" --arg n "$name" '
-  [.result.agents[] | select(.agent_session.value == $s)] + [.result.agents[] | select($n != "" and .terminal_title_stripped == $n)]
-  | first(.[].pane_id) // empty')
+# Find the tab by name with `rex window ls --json`: a tab or pane label equal to the session name or its bead id
+# (bin/swarm names tabs after the bead), else a Rex session with that label (its active tab).
+# Each `window ls --json` result also carries its Rex session's `label`, so one call per session covers both.
+# Prints "<session_id> <window_id>".
+sessions=$("$REX" ls --json 2>/dev/null | "$JQ" -r '.sessions[].session_id')
+target=$(for s in ${(f)sessions}; do "$REX" window ls -s "$s" --json 2>/dev/null; done | "$JQ" -rs --arg n "$name" '
+  ($n | split(":")[0]) as $b
+  | [.[] | . as $s | .windows[]
+     | select($n != "" and (.label == $n or .label == $b or any(.layers[]?.blocks[]?; .label == $n)))
+     | "\($s.session_id) \(.window_id)"]
+  + [.[] | select($n != "" and .label == $n) | "\(.session_id) \(.active_window_id)"]
+  | first(.[]) // empty')
 
-if [[ -n $pane ]]; then
-  $dry "$HERDR" agent focus "$pane"
-elif [[ $kind == background && -n $id ]]; then
-  workspace=$("$HERDR" workspace list | "$JQ" -r 'first(.result.workspaces[] | select(.focused)).workspace_id // first(.result.workspaces[]).workspace_id')
+if [[ -n $target ]]; then
+  $dry "$REX" do session.select session_id="${target% *}" window_id="${target#* }"
+elif [[ $kind == background && -n $id && -n $sessions ]]; then
+  session=${${(f)sessions}[1]}
   if [[ -n $dry ]]; then
-    echo "$HERDR" tab create --workspace "$workspace" --label "$name" --focus
-    echo "$HERDR" pane run "<root_pane>" "claude attach $id"
+    echo "$REX" window new -s "$session" "$name" --json -- claude attach "$id"
+    echo "$REX" do session.select session_id="$session" window_id="<window_id>"
   else
-    root=$("$HERDR" tab create --workspace "$workspace" --label "$name" --focus | "$JQ" -r '.result.root_pane | if type == "object" then .pane_id else . end // empty')
-    "$HERDR" pane run "$root" "claude attach $id" >/dev/null
+    window=$("$REX" window new -s "$session" "$name" --json -- claude attach "$id" | "$JQ" -r '.window_id // empty')
+    "$REX" do session.select session_id="$session" ${window:+window_id="$window"} >/dev/null
   fi
 else
-  osascript -e "display notification \"$name is not in herdr (interactive, cwd elsewhere)\" with title \"ClaudeGo\""
+  osascript -e "display notification \"$name is not in a Rex tab (interactive, cwd elsewhere)\" with title \"ClaudeGo\""
   exit 1
 fi
-$dry open -a WezTerm
+$dry open -a "Rex Beta"

@@ -1,5 +1,5 @@
 #!/usr/bin/env zsh
-# Dispatched Claude sessions (background or herdr tab) waiting on Tal. An interactive session that is showing a
+# Dispatched Claude sessions (background or Rex tab) waiting on Tal. An interactive session that is showing a
 # question or permission prompt (`claude agents` status "waiting") always counts as a question. A session counts when its name starts with a bead id
 # (/dispatch-bead names them "<bead-id>: <description>"), its bead is still in progress, and it is not working.
 # Agent view marks every ended turn "blocked", so the session's own first line decides: "QUESTION:" counts as a

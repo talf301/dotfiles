@@ -31,6 +31,7 @@ link() {  # link <src-in-repo | /absolute/src> <dest>
 for f in "$REPO"/bin/*; do link "bin/$(basename "$f")" "$HOME/.local/bin/$(basename "$f")"; done
 
 # --- Rex CLI (ships inside the app bundle) → ~/.local/bin/rex ---
+# Migration note (W20–W22): Rex replaces herdr. Nothing here calls herdr; its binary stays installed until Tal removes it.
 link "/Applications/Rex Beta.app/Contents/Helpers/Rex Server.rex/Contents/MacOS/rex" "$HOME/.local/bin/rex"
 
 # --- IAR skill: cross-agent chain  ~/.claude → ~/.agents → this repo ---

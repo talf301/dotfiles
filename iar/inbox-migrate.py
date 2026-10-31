@@ -58,6 +58,14 @@ def is_stray(p):
     return root.startswith(STRAY_PREFIXES) or (canon is not None and p["root"] != canon)
 
 
+def home_of(p):
+    """The canonical project root of a project's repo (the name, or the repo folder under ~/.worktrees);
+    the precog one when the repo has none."""
+    rel = p["root"].removeprefix(f"{HOME}/.worktrees/")
+    repo = rel.split("/")[0] if rel != p["root"] else p["name"]
+    return CANONICAL.get(p["name"]) or CANONICAL.get(repo) or os.environ.get("IAR_INBOX_PROJECT", question.PROJECT)
+
+
 def bead_of(subject):
     """The bead a thread subject names (`precog-x: ...`, `x: ...`, `precog-x W12: ...`), else None."""
     m = SUBJECT_BEAD.match(subject or "")
@@ -107,9 +115,8 @@ def plan():
         rows.append({"thread": t["id"], "project": p, "subject": t["subject"], "session": t["session"],
                      "quiet": t["quiet"], "bead": bead["id"] if bead else ORPHAN_PARENT if open_qs else None, "action": action,
                      "questions": open_qs if action == "question" else []})
-        canon = os.environ.get("IAR_INBOX_PROJECT", question.PROJECT)
         if action == "question":  # ponytail: one new thread per question; the Inbox may group them by thread name
-            after[canon] = after.get(canon, 0) + len(open_qs)
+            after[home_of(p)] = after.get(home_of(p), 0) + len(open_qs)
     return rows, before, after
 
 
@@ -122,7 +129,7 @@ def ask(row, q):
                                       f"Moved by inbox-migrate (W16) from Inbox thread {row['thread']} in the stray "
                                       f"project {row['project']['root']}."] if x)
     argv = [row["bead"], text, *[a for o in opts for a in ("-o", o)], "--default", default, "--reversible", "no",
-            "--gated", "no", "--blocks", "no", "--context", context]
+            "--gated", "no", "--blocks", "no", "--context", context, "--project", home_of(row["project"])]
     session = row["session"] or os.environ.get("CLAUDE_CODE_SESSION_ID")
     if session:
         argv += ["--session", session]
@@ -222,36 +229,41 @@ def self_test():
             ask_q("tmp", "m-ask", "Port?", [{"label": "80"}, {"label": "443"}])
             project("main", "precog", f"{HOME}/Documents/precog")
             thread("main", "m-main", "a note")
+            project("dots", "w16", f"{HOME}/.worktrees/dotfiles/u/x/w16")  # a dotfiles question goes to ~/dotfiles
+            thread("dots", "m-dots", f"{open_bead}: dotfiles question")
+            ask_q("dots", "m-dots", "Dots?", [{"label": "A"}, {"label": "B"}])
             project("other", "other-repo", f"{HOME}/src/other-repo")
             thread("other", "m-other", "other repo note")
 
             rows, before, after = plan()
             got = {r["thread"]: (r["action"], r["bead"]) for r in rows}
             assert got == {"m-q": ("question", open_bead), "m-closed": ("moot", closed_bead), "m-probe": ("moot", None),
-                           "m-main": ("moot", None), "m-ask": ("question", ORPHAN_PARENT)}, got
-            assert before[f"{HOME}/.treehouse/precog-x/1/precog"] == 2 and sum(before.values()) == 7, before
-            assert after == {question.PROJECT: 3, f"{HOME}/src/other-repo": 1}, after
+                           "m-main": ("moot", None), "m-ask": ("question", ORPHAN_PARENT),
+                           "m-dots": ("question", open_bead)}, got
+            assert before[f"{HOME}/.treehouse/precog-x/1/precog"] == 2 and sum(before.values()) == 8, before
+            assert after == {question.PROJECT: 3, f"{HOME}/dotfiles": 1, f"{HOME}/src/other-repo": 1}, after
             q = next(r for r in rows if r["questions"])["questions"][0]
             assert options_of(q) == (["Left", "Right", "Up"], "Right"), options_of(q)
             assert options_of({"parsed": {"choices": []}}) == (["Yes", "No"], "Yes")
 
             with contextlib.redirect_stdout(io.StringIO()) as out:
                 assert run(apply=False) == 0
-            assert "7 ->   4  total" in out.getvalue() and not os.path.exists(log), out.getvalue()
+            assert "8 ->   5  total" in out.getvalue() and not os.path.exists(log), out.getvalue()
 
             with contextlib.redirect_stdout(io.StringIO()) as out:
                 assert run(apply=True) == 0, out.getvalue()
             with open(log) as fh:
                 calls = [json.loads(x)["params"] for x in fh.read().splitlines() if '"tools/call"' in x]
             resolved = sorted(c["arguments"]["message_id"] for c in calls if c["name"] == "resolve_message")
-            assert resolved == ["m-ask", "m-closed", "m-main", "m-probe", "m-q"], resolved
+            assert resolved == ["m-ask", "m-closed", "m-dots", "m-main", "m-probe", "m-q"], resolved
             sends = [c["arguments"] for c in calls if c["name"] == "send_message"]
-            assert len(sends) == 2 and {x["project_path"] for x in sends} == {question.PROJECT}, sends
+            assert sorted(x["project_path"] for x in sends) == sorted([question.PROJECT] * 2 + [f"{HOME}/dotfiles"]), sends
             assert [k["title"] for k in ledger.show(ORPHAN_PARENT)["dependents"]] == \
                 [f"Q({question.short(kid)}): Port?" for kid in [ledger.show(ORPHAN_PARENT)["dependents"][0]["id"]]]
             assert ledger.show(BEAD)["comments"][0]["text"].startswith("inbox-migrate --apply\nUnresolved")
             kids = [k for k in ledger.show(open_bead)["dependents"] if k["title"].startswith("Q(")]
-            assert len(kids) == 1 and kids[0]["title"].endswith("Which way?"), kids
+            assert sorted(k["title"].split(": ", 1)[1] for k in kids) == ["Dots?", "Which way?"], kids
+            kids = [k for k in kids if k["title"].endswith("Which way?")]
             body = question.parse_body(ledger.show(kids[0]["id"])["description"])
             assert body["options"] == ["Left", "Right", "Up"] and body["default"] == "Right", body
             assert "m-q" in body["context"] and body["session"] == "s-1", body
@@ -259,12 +271,12 @@ def self_test():
             # Rerun (Inbox files unchanged by the fake): ask reuses the bead, resolve is repeated harmlessly.
             with contextlib.redirect_stdout(io.StringIO()):
                 assert run(apply=True) == 0
-            assert len([k for k in ledger.show(open_bead)["dependents"] if k["title"].startswith("Q(")]) == 1
+            assert len([k for k in ledger.show(open_bead)["dependents"] if k["title"].startswith("Q(")]) == 2
 
             os.environ["IAR_INBOX_CMD"] = "false"  # Inbox down: failures are counted, the thread stays
             with contextlib.redirect_stdout(io.StringIO()) as out:
                 assert run(apply=True) == 1
-            assert "failed: 5" in out.getvalue(), out.getvalue()
+            assert "failed: 6" in out.getvalue(), out.getvalue()
         finally:
             reconcile.INBOX = saved_inbox
             BEAD, ORPHAN_PARENT = saved_ids

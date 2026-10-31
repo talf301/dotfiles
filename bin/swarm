@@ -236,8 +236,21 @@ _chat() {  # $1 = id — open a live Fable session on a hard/structural bead in 
     # Rex: new tab (window) named after the bead, claude in the worktree. Inside Rex, REX_SESSION
     # picks the session the TUI runs in; outside, rex uses its selected session.
     local sess=(); [ -n "${REX_SESSION:-}" ] && sess=(-s "$REX_SESSION")
-    rex window new ${sess[@]+"${sess[@]}"} -c "$wt" "$id" -- \
-      claude --model claude-fable-5 --add-dir "$wt" "$prompt" >/dev/null 2>&1
+    local blk
+    blk="$(rex window new ${sess[@]+"${sess[@]}"} -c "$wt" "$id" --json -- \
+             claude --model claude-fable-5 --add-dir "$wt" 2>/dev/null | jq -r '.block_ids[0] // empty')"
+    # A positional prompt to `claude` is NOT submitted (it opens to an empty input line), so type
+    # the prompt into the block and press Enter once claude shows its input box (not the trust
+    # dialog, which also draws ❯; wait while Tal answers it).
+    [ -n "$blk" ] && (
+      for _ in $(seq 120); do
+        case "$(rex capture -b "$blk" 2>/dev/null)" in
+          *"trust this folder"*) ;;
+          *❯*) sleep 1; rex send -b "$blk" "$prompt" && rex send-key -b "$blk" Enter; break;;
+        esac
+        sleep 1
+      done
+    ) >/dev/null 2>&1 &
   else
     # fallback (no rex): a launcher script opened in a new Terminal window.
     local launch="/tmp/iar-chat-$id.command"

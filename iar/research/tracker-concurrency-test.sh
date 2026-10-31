@@ -6,6 +6,7 @@
 # Usage: tracker-concurrency-test.sh br|bd|bd-server [AGENTS=5] [OPS=12]  (br caps an issue at 64 labels)
 # Exit 0 = no lost writes and no failed calls; 1 = otherwise.
 set -uo pipefail
+unset BEADS_DIR  # bd honors BEADS_DIR: an inherited one would point bd init at a real store
 TOOL=${1:?br|bd|bd-server}; AGENTS=${2:-5}; OPS=${3:-12}
 T=$(mktemp -d)
 cleanup() { [ "$TOOL" = bd-server ] && (cd "$T" && bd dolt stop >/dev/null 2>&1); rm -rf "$T"; }

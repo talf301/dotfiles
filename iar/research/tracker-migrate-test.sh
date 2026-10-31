@@ -4,6 +4,7 @@
 # Usage: tracker-migrate-test.sh [SOURCE_BEADS_DIR]   (default: the Precog store)
 # Exit 0 = every non-tombstone issue, field, label, comment and dependency survived; 1 = a diff.
 set -euo pipefail
+unset BEADS_DIR  # bd honors BEADS_DIR: an inherited one would point bd init at a real store
 SRC=${1:-/Users/tal/.local/share/beads/precog/.beads}
 HERE=$(cd "$(dirname "$0")" && pwd)
 T=$(mktemp -d)
@@ -29,9 +30,10 @@ echo "issues in br DB but not in br JSONL (ephemeral), added from br show: $(tr 
 
 # 3. Import into a new embedded-Dolt bd store and export it back.
 mkdir -p "$T/bd" && cd "$T/bd"
-bd init --non-interactive --stealth -p "$(sed -n 's/^# issue_prefix: //p' "$SRC/config.yaml")" >/dev/null 2>&1
+bd init --non-interactive --stealth -p "$(sed -n 's/^# issue_prefix: //p' "$SRC/config.yaml")" >"$T/init.log" 2>&1 ||
+  { echo "bd init failed:"; cat "$T/init.log"; exit 1; }
 start=$(date +%s)
-bd import "$T/full.jsonl" >"$T/import.log" 2>&1
+bd import "$T/full.jsonl" >"$T/import.log" 2>&1 || { echo "bd import failed:"; cat "$T/import.log"; exit 1; }
 echo "bd import: $(($(date +%s) - start)) s; $(grep -c 'Skipped dependency' "$T/import.log" || true) skipped deps"
 bd export -o "$T/bd.jsonl" >/dev/null 2>&1
 

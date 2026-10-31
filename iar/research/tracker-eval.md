@@ -56,7 +56,7 @@ Used: `update` (-s, --assignee, --add-label, --remove-label, --notes, --actor), 
 | claim lease / dead-worker recovery | no | `heartbeat`, `reclaim` | maps to spec "zombie" |
 | close --reason, dep, label, ready, blocked | yes | yes | |
 | scheduler (used by `bin/swarm-*`) | yes | no (`ready --explain` is closest) | `swarm` is retired by this epic |
-| external store via `BEADS_DIR` | yes | yes | tested: `BEADS_DIR=... bd where` |
+| external store via `BEADS_DIR` | yes | yes | tested: `BEADS_DIR=... bd where`. Both read the same variable: with the Precog `BEADS_DIR` exported, `bd init` targets the `br` store (it refused, exit 1; the store was not changed). Both scripts `unset BEADS_DIR` first |
 | labels per issue | **max 64** (`Validation failed: labels: exceeds 64 labels`) | no limit hit | seen in the first concurrency run |
 | init side effects | none outside `.beads/` | writes AGENTS.md, CLAUDE.md, `.claude/`, `.codex/`, `.cursor/`, git hooks unless `--stealth` | matters for the external Precog store |
 

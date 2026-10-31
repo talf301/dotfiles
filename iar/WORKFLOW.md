@@ -27,7 +27,8 @@
     "zombie": false,
     "stale-lease": false,
     "closed-bead-thread": false,
-    "dispatch": false
+    "dispatch": false,
+    "linear-mirror": false
   }
 }
 ---

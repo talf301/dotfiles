@@ -55,6 +55,9 @@ W13 (questions of loop-owned beads; question beads come from iar/ask):
                       or reping (not reversible: one reminder in the thread); a gated question has no deadline
   malformed-question  flag-malformed: a note; the board lists every one under Needs you (malformed()); no bead invented
   inbox-pending       post-question: post a question bead that ask could not post; last of the action classes
+W25 (Linear view, iar/linear_mirror.py, after the other actions of the tick; not per bead):
+  linear-mirror       one-way mirror of the beads into Linear team TAL. A dry run lists the writes under `linear` in the
+                      jsonl line; a live tick writes them (`linear.done`) only with the switch on
 W14 (dispatch, class `dispatch`, after the other actions of the tick):
   preflight           WORKFLOW.md loads and every source answered. A WORKFLOW.md that does not load blocks dispatch
                       only: the other actions run on the last good config ($IAR_STATE_DIR/workflow-good.json; --kill
@@ -95,6 +98,7 @@ IAR = os.path.dirname(os.path.realpath(__file__))
 sys.path.insert(0, IAR)
 import budget  # noqa: E402
 import ledger  # noqa: E402
+import linear_mirror  # noqa: E402
 import question  # noqa: E402
 import workflow  # noqa: E402
 
@@ -1364,7 +1368,7 @@ def state_dir():
     return d
 
 
-def tick(d, dry_run, sources=None, executors=None, board=False):
+def tick(d, dry_run, sources=None, executors=None, board=False, mirror=None):
     """One tick under the lock. Returns (exit code, the line written to reconcile.jsonl or None)."""
     lock = open(os.path.join(d, "reconcile.lock"), "a")
     try:
@@ -1399,6 +1403,10 @@ def tick(d, dry_run, sources=None, executors=None, board=False):
                 **result}
         if not dry_run:
             line["executed"] = execute(snap, result["actions"], executors)
+        # W25: Linear mirror. A dry run lists its writes; a live tick writes them when the switch is on.
+        mirror_on = bool(config) and config["actions"].get("linear-mirror", False)
+        if not snap["errors"] and (dry_run or mirror_on):
+            line["linear"] = (mirror or linear_mirror.run)(dry_run, snap["inbox"], snap["inbox_url"])
         with open(os.path.join(d, "reconcile.jsonl"), "a") as f:
             f.write(json.dumps(line) + "\n")
         if board:
@@ -1436,7 +1444,8 @@ def main(argv):
         print("reconcile: another tick holds the lock", file=sys.stderr)
         return code
     print(json.dumps({"errors": line["errors"], "actions": len(line["actions"]),
-                      **({"executed": line["executed"]} if "executed" in line else {})}))
+                      **({"executed": line["executed"]} if "executed" in line else {}),
+                      **({"linear": line["linear"]} if "linear" in line else {})}))
     return 0
 
 
@@ -1618,7 +1627,51 @@ def self_test():
     w13_test()
     w14_plan_test()
     w14_tick_test()
+    w25_tick_test()
     print("reconcile self-test: ok")
+
+
+def w25_tick_test():
+    """W25: a dry-run tick lists the Linear mirror's writes; a live tick runs it only with `linear-mirror` on; a
+    source error runs no mirror. The mirror itself: linear_mirror.py --self-test."""
+    saved_env = {k: os.environ.get(k) for k in ("IAR_WORKFLOW", "BEADS_DIR")}
+    with tempfile.TemporaryDirectory() as d:
+        wf = os.path.join(d, "WORKFLOW.md")
+        with open(os.path.join(IAR, "WORKFLOW.md")) as src, open(wf, "w") as dst:
+            dst.write(src.read())
+        os.environ.update(IAR_WORKFLOW=wf, BEADS_DIR=os.path.join(d, ".beads"))
+        calls, fail = [], [False]
+
+        def treehouse(s):
+            if fail[0]:
+                raise SourceError("treehouse status: no answer in 30s")
+        fakes = {"agents": lambda s: None, "treehouse": treehouse, "plannotator": lambda s: None,
+                 "git": lambda s: None,
+                 "inbox": lambda s: s.update(inbox=[{"id": "th", "subject": "x"}], inbox_url="http://i/")}
+
+        def mirror(dry_run, inbox, url):
+            calls.append((dry_run, inbox[0]["id"], url))
+            return {"writes": ["create wl-1 [Todo] x"], "error": None}
+        try:
+            ledger.init("wl")
+            set_switches(None, wf)
+            line = tick(d, True, fakes, mirror=mirror)[1]
+            assert calls == [(True, "th", "http://i/")] and line["linear"]["writes"] == ["create wl-1 [Todo] x"]
+            line = tick(d, False, fakes, mirror=mirror)[1]
+            assert len(calls) == 1 and "linear" not in line, line
+            set_switches("linear-mirror", wf)
+            tick(d, False, fakes, mirror=mirror)
+            assert calls[-1] == (False, "th", "http://i/") and len(calls) == 2
+            fail[0] = True
+            line = tick(d, False, fakes, mirror=mirror)[1]
+            assert len(calls) == 2 and "linear" not in line and line["errors"], line
+        finally:
+            for k, v in saved_env.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+    print("w25 tick: ok")
 
 
 def w14_plan_test():

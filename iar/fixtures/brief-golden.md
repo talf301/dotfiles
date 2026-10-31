@@ -69,7 +69,8 @@ Examples:
 - opening, retargeting or merging a PR
 - pushing to `main` or to any branch that is not `u/tfriedman/*`
 - force-push
-- Slack and Linear writes
+- Slack writes
+- Linear writes outside the TAL team (Tal's private team; writes to TAL are not gated)
 
 Not gated: "integrate" means merging into `u/tfriedman/pr/<slug>` and pushing that branch. Those branches are Tal's private integration branches.
 

@@ -75,7 +75,7 @@ codex exec -m gpt-6-sol -s read-only -o "$lastf" "You are the independent REVIEW
 
 $(cat "$HOME/dotfiles/iar/reviewer-scope.md")" < /dev/null >> "$rlog" 2>&1 || crc=$?
 
-v=$(grep -oE "VERDICT: (APPROVED|CHANGES REQUESTED|NEEDS HUMAN)" "$lastf" | tail -1 || true)
+v=$(grep -v '^[[:space:]]*$' "$lastf" | tail -1 | sed -E 's/[[:space:]]+$//' | grep -xE "VERDICT: (APPROVED|CHANGES REQUESTED|NEEDS HUMAN)" || true)
 if [ "$crc" != 0 ] || [ -z "$v" ]; then
   echo "iar-review: no verdict (codex exit $crc): $(tail -n 3 "$rlog" | tr '\n' ' ')— see $rlog" >&2; exit 3
 fi

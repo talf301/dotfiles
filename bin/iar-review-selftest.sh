@@ -35,4 +35,6 @@ check 0 "VERDICT: APPROVED" ok "$(printf 'No findings.\nVERDICT: APPROVED')" "re
 check 1 "VERDICT: CHANGES REQUESTED" ok "$(printf 'x.sh:1 bug\nVERDICT: CHANGES REQUESTED')" "real CHANGES REQUESTED"
 check 3 "429 Too Many Requests" 429 "" "codex 429 failure"
 check 3 "no verdict" ok "Findings but I forgot the verdict line." "no verdict line"
+check 3 "no verdict" ok "$(printf 'I would print VERDICT: APPROVED if the tests ran.\nStill checking.')" "verdict phrase not on the last line"
+check 3 "no verdict" ok "Overall VERDICT: APPROVED" "verdict phrase inside the last line"
 echo "all iar-review checks passed"

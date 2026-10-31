@@ -41,7 +41,7 @@ Actions are in EXECUTORS by verb; a verb with no executor is skipped. W12 (house
   over-limit          working past a WORKFLOW.md `limits` value (attempts, hours, tokens): one limit-nudge per
                       attempt; still working 15 min later, or over a limit again in a later attempt: quarantine
                       (labels quarantined + needs-human; bin/bg refuses a quarantined bead; board: Needs you)
-  ineligible-running  the bead was closed (once its session finished the turn) or deferred, or lost `auto` (only
+  ineligible-running  the bead was closed (its own W9 close: once the turn ends) or deferred, or lost `auto` (only
                       attempts marked `dispatch: auto`): stop-session, verified; the worktree stays and
                       stale-lease returns the slot after the preflight
 A flag is a `reconcile-note: <key>` comment. Before a nudge that stops a running session, flag-stalled, quarantine
@@ -546,9 +546,12 @@ def classify_bead(bid, b, snap, now, stall_after, sessions, leases, threads, lim
     if owned and working and b["status"] == "in_progress" and (limit := over_limit(b, n, s, now, limits)):
         return "over-limit", limit_actions(b, n, limit, now)
     if owned and running(s):
-        why = (b["status"] == "closed" and not working) or b["status"] == "deferred" \
+        # The session's own W9 close (reason "integrated into ...", WORKFLOW.md step 7) is followed by its FYI guide
+        # and READY line in the same turn, so that session is stopped once its turn ends; any other close at once.
+        own_close = (b.get("close_reason") or "").startswith("integrated into ")
+        why = (b["status"] == "closed" and not (working and own_close)) or b["status"] == "deferred" \
             or (att[n]["auto"] and "auto" not in (b.get("labels") or []))
-        if why:  # a closed bead's session may still write its READY line: it is stopped once its turn ends
+        if why:
             return "ineligible-running", [f"stop-session {a}"]
     if owned:
         qs = [q for q in snap["questions"] if q.get("asking") == bid]
@@ -1210,6 +1213,7 @@ def w12_classify_test():
         bead("p-qdone", labels=[QUARANTINE], extra=[(nudge1[0], 60)]), bead("p-olans"), bead("p-olidle"),
         bead("p-olclosed", status="closed"),
         bead("i-closed", status="closed"), bead("i-closedwork", status="closed"), bead("i-def", status="deferred"),
+        dict(bead("i-intwork", status="closed"), close_reason="integrated into u/tfriedman/pr/x at abc"),
         bead("i-auto", auto=True), bead("i-autook", auto=True, labels=["auto"]), bead("i-manual"),
         bead("i-stall", status="deferred"), bead("i-gone", status="closed"),
         bead("l-dirty", status="closed"), bead("l-unp", status="closed"), bead("l-live", status="closed"),
@@ -1229,6 +1233,7 @@ def w12_classify_test():
                      sess("p-quar", **over), sess("p-again", **over), sess("p-qdone", **over), sess("p-olans", **over),
                      sess("p-olidle", state="blocked", tokens=4_000_000), sess("p-olclosed", **over),
                      sess("i-closed", state="done", pid=1, alive=True), sess("i-closedwork", **work),
+                     sess("i-intwork", **work),
                      sess("i-def", **work), sess("i-auto", **work), sess("i-autook", **work), sess("i-manual", **work),
                      sess("i-stall", **stalled), sess("i-gone", state="done"), sess("l-run", state="done", pid=1, alive=True),
                      sess("s-flag", **stalled)],
@@ -1242,8 +1247,9 @@ def w12_classify_test():
     want = {
         "p-tok": "over-limit", "p-hrs": "over-limit", "p-att": "over-limit", "p-grace": "over-limit",
         "p-quar": "over-limit", "p-again": "over-limit", "p-qdone": "over-limit", "p-olans": "over-limit",
-        "p-olidle": "waiting", "p-olclosed": "working",
-        "i-closed": "ineligible-running", "i-closedwork": "working", "i-def": "ineligible-running",
+        "p-olidle": "waiting", "p-olclosed": "ineligible-running",
+        "i-closed": "ineligible-running", "i-closedwork": "ineligible-running", "i-intwork": "working",
+        "i-def": "ineligible-running",
         "i-auto": "ineligible-running", "i-autook": "working", "i-manual": "working", "i-stall": "ineligible-running",
         "i-gone": "idle",
         "l-dirty": "stale-lease", "l-unp": "stale-lease", "l-live": "stale-lease", "l-run": "stale-lease",
@@ -1255,7 +1261,9 @@ def w12_classify_test():
         ("p-tok", "limit-nudge attempt=1 limit=tokens"), ("p-hrs", "limit-nudge attempt=1 limit=hours"),
         ("p-att", "limit-nudge attempt=4 limit=attempts"), ("p-quar", "quarantine attempt=1"),
         ("p-again", "quarantine attempt=2"), ("p-olans", "limit-nudge attempt=1 limit=tokens"),
-        ("i-closed", "stop-session attempt=1"), ("i-def", "stop-session attempt=1"), ("i-auto", "stop-session attempt=1"),
+        ("p-olclosed", "stop-session attempt=1"), ("i-closed", "stop-session attempt=1"),
+        ("i-closedwork", "stop-session attempt=1"),
+        ("i-def", "stop-session attempt=1"), ("i-auto", "stop-session attempt=1"),
         ("i-stall", "stop-session attempt=1"),
         ("l-dirty", "flag-lease slot=l1 holder=agent:l-dirty#1"), ("l-unp", "flag-lease slot=l2 holder=agent:l-unp#1"),
         ("l-np", "flag-lease slot=l5 holder=agent:l-np#1"), ("l-ok", "return-lease slot=l6 holder=agent:l-ok#1"),

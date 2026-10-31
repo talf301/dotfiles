@@ -1,0 +1,19 @@
+{"ts":"2026-10-29T13:00:00Z","session_id":"s1","cwd":"/w","tool_name":"Bash","tool_input":{"command":"git push origin u/tfriedman/a"},"reason":"push"}
+{"ts":"2026-10-29T14:00:00Z","session_id":"s1","cwd":"/w","tool_name":"Bash","tool_input":{"command":"git push -u origin u/tfriedman/b"},"reason":"push"}
+{"ts":"2026-10-29T15:00:00Z","session_id":"s2","cwd":"/w","tool_name":"Bash","tool_input":{"command":"GIT_TRACE=0 git push origin HEAD"},"reason":"push"}
+{"ts":"2026-10-29T16:00:00Z","session_id":"s2","cwd":"/w","tool_name":"Bash","tool_input":{"command":"git push origin u/tfriedman/c"},"reason":"push"}
+{"ts":"2026-10-28T10:00:00Z","session_id":"s3","cwd":"/w","tool_name":"Bash","tool_input":{"command":"npm test"},"reason":"tests"}
+{"ts":"2026-10-28T11:00:00Z","session_id":"s3","cwd":"/w","tool_name":"Bash","tool_input":{"command":"cd /w/app && npm test -- --watch=false"},"reason":"tests"}
+{"ts":"2026-10-29T20:00:00Z","session_id":"s3","cwd":"/w","tool_name":"Bash","tool_input":{"command":"npm test"},"reason":"tests"}
+{"ts":"2026-10-27T09:00:00Z","session_id":"s4","cwd":"/w","tool_name":"WebFetch","tool_input":{"url":"https://docs.example.com/a"},"reason":"fetch"}
+{"ts":"2026-10-28T09:00:00Z","session_id":"s4","cwd":"/w","tool_name":"WebFetch","tool_input":{"url":"https://docs.example.com/b"},"reason":"fetch"}
+{"ts":"2026-10-30T09:00:00Z","session_id":"s4","cwd":"/w","tool_name":"WebFetch","tool_input":{"url":"https://docs.example.com/c"},"reason":"fetch"}
+{"ts":"2026-10-30T10:00:00Z","session_id":"s5","cwd":"/w","tool_name":"WebFetch","tool_input":{"url":"https://other.example.org/"},"reason":"fetch"}
+{"ts":"2026-10-30T10:30:00Z","session_id":"s5","cwd":"/w","tool_name":"WebFetch","tool_input":{"url":"https://other.example.org/x"},"reason":"fetch"}
+{"ts":"2026-10-30T08:00:00Z","session_id":"s6","cwd":"/w","tool_name":"Bash","tool_input":{"command":"aws ec2 run-instances --image-id ami-1"},"reason":"provision"}
+{"ts":"2026-10-30T08:10:00Z","session_id":"s6","cwd":"/w","tool_name":"Bash","tool_input":{"command":"aws ec2 run-instances --image-id ami-2"},"reason":"provision"}
+{"ts":"2026-10-30T08:20:00Z","session_id":"s6","cwd":"/w","tool_name":"Bash","tool_input":{"command":"aws ec2 run-instances --image-id ami-3"},"reason":"provision"}
+{"ts":"2026-10-26T08:00:00Z","session_id":"s7","cwd":"/w","tool_name":"Bash","tool_input":{"command":"bash -c 'make deploy'"},"reason":"shell"}
+{"ts":"2026-10-26T08:10:00Z","session_id":"s7","cwd":"/w","tool_name":"Bash","tool_input":{"command":"bash -c 'make deploy'"},"reason":"shell"}
+{"ts":"2026-10-26T08:20:00Z","session_id":"s7","cwd":"/w","tool_name":"Bash","tool_input":{"command":"bash -c 'make deploy'"},"reason":"shell"}
+not json: a torn line

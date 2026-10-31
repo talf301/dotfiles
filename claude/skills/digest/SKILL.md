@@ -5,7 +5,7 @@ description: One-screen status of every Claude session (dispatched background be
 
 # Digest
 
-Read-only except for relaying Tal's own answers. Never stop, delete or redirect a session unless Tal says so.
+Read-only except for relaying Tal's own answers and applying an allow rule Tal picks. Never stop, delete or redirect a session unless Tal says so.
 
 ## 1. Collect
 
@@ -13,6 +13,7 @@ Read-only except for relaying Tal's own answers. Never stop, delete or redirect 
 - Slots: `cd /Users/tal/Documents/precog && treehouse status` (leased slots and their holders).
 - Dispatched beads: `BEADS_DIR=/Users/tal/.local/share/beads/precog/.beads br list --status in_progress --assignee tal-bg --json`.
 - Inbox: precog sessions post under one fixed project (`~/dotfiles/iar/inbox-etiquette.md`). Call `plannotator_inbox` with `action: "read_thread"`, `asked_by: "anyone"` and `project_path: "/Users/tal/.local/share/precog/Precog agents"`. Threads opened before that rule sit under older projects: also call it once with no `project_path` and once for each slot folder in `treehouse status` (`project_path: "/Users/tal/.treehouse/precog-28077b/<n>/precog"`), and merge the results by `thread_id`. A folder with no Inbox project of its own returns the default project's threads again, so expect duplicates. Each call lists the unresolved threads: `subject`, `author.session` (the session that started it), `questions` (`open`, `stopped`, `prompt`), `guide`, `last_author`, `last_at` and `waiting_on_person`. Thread link: `<Inbox url>#thread=<thread_id>`, with the url from `plannotator inbox --background`. Match `author.session` to `sessionId` in `~/dotfiles/iar/agents-digest.sh --all`. The session is stopped when it has no entry or its `pid` is null; its resume command is `cd <cwd> && claude --bg --resume <sessionId>`. If the tool is missing or fails, say so on the count line: never report an empty Inbox you could not read.
+- Decided without you: `~/dotfiles/iar/ratchet` prints this section, ready to show: `decision:auto` decisions and timeout answers from the last 24 h, the top denials (from the PermissionDenied log `~/.local/state/iar/denials.jsonl`), and numbered suggested allow rules for rules denied 3 or more times. A `ledger error` line means Beads was not read: say so, do not report "none".
 - Plannotator: `~/dotfiles/iar/plannotator-open.sh` prints one JSON object per open Plannotator session: `mode` (annotate or review), `url`, `started`, `target` (what it opened), `cwd`, and `session` (the Claude session that opened it, or null).
 
 ## 2. Show
@@ -27,9 +28,10 @@ An Inbox thread and its session are one item: show the session's line once, with
 2. **Ready for review.** Sessions whose `last_message` starts with `READY:`, dispatched sessions (named `<bead-id>: …`, background or herdr tab) that ended their turn without a question while their bead is still in progress, and Inbox guided reviews (`guide`) with `waiting_on_person`.
    **Inbox to read.** Other Inbox threads with `waiting_on_person` and no open question, such as a session's report of what landed. Read the last message with `read_thread` and its `thread_id`, show its first line, and suggest Tal reads and resolves the thread.
 3. **Open Plannotator sessions.** Each is a review or document waiting on Tal. Show the target (file name or "review" plus its worktree), the owning session, age and URL, newest first. Sessions older than 2 days whose owner session is gone go under loose ends, with `plannotator sessions --clean` or closing the tab as the suggestion.
-4. **Working.** Background sessions in state `working`, and interactive tabs with status `busy`.
-5. **Open tabs.** Idle interactive tabs active in the last 3 days.
-6. **Loose ends.** Show each with a suggested action, but do not take it:
+4. **Decided without you.** The `iar/ratchet` output as it is. Leave out the subsections that say none; leave out the section when all of them do.
+5. **Working.** Background sessions in state `working`, and interactive tabs with status `busy`.
+6. **Open tabs.** Idle interactive tabs active in the last 3 days.
+7. **Loose ends.** Show each with a suggested action, but do not take it:
    - Inbox threads where Tal spoke last (`last_author` is the person) and the session is stopped: his reply is held until that session runs again. Put these first and give the resume command;
    - idle tabs inactive for more than 3 days: suggest closing them;
    - background sessions blocked or done for more than 2 days with no in-progress bead: suggest `claude rm <id>`;
@@ -37,7 +39,7 @@ An Inbox thread and its session are one item: show the session's line once, with
    - `tal-bg` beads in progress with no session;
    - **Archive?** Inbox threads with no open question whose work has landed (the bead is closed, or its branch is merged or its PR is closed) or whose session is gone (no entry in `agents-digest.sh --all`). Show the thread link and why; resolve one (`resolve_message` with its `thread_id`) only when Tal names it.
 
-End with a count line: needs you, ready, Inbox to read, open Plannotator sessions, working, open tabs, loose ends.
+End with a count line: needs you, ready, Inbox to read, open Plannotator sessions, decided without you, working, open tabs, loose ends.
 
 ## 3. Walk through
 
@@ -49,3 +51,5 @@ If anything needs Tal, offer to go through the items one at a time. A question t
 4. Send Tal's answer to the session with SendMessage, addressed to the session's name as ListAgents shows it. Say it is Tal's answer, quote his words, and add nothing of your own. Confirm in one line that it was sent.
 
 For "Ready for review" items, offer to relay "review" (the session opens the Plannotator review) or "integrate" (the session merges or offers a draft PR, closes the bead and returns its slot).
+
+If "Decided without you" lists suggested allow rules, ask Tal with AskUserQuestion which to apply: one option per rule, plus "Skip". The rule goes into `permissions.allow`; if he wants it as an auto-mode allow entry, add `--auto`. Apply only what he picks, one at a time: `~/dotfiles/iar/ratchet --apply <n> ~/.claude/settings.json`. Numbers move up by one after each apply, so run `~/dotfiles/iar/ratchet` again before the next one, and confirm the rule it printed. Never apply a rule Tal did not pick.

@@ -34,3 +34,7 @@ def add_unique($xs): (. // []) + ($xs - (. // []));
     + ["**Routine compute (budget-covered)**: these existing clusters are routine for runs inside a bead's valid `budget:` block (iar/budget.py exits 0): "
        + (if ($clusters | length) > 0 then ($clusters | join(", ")) else "none yet" end)
        + ". Creating or provisioning compute (sky launch, AWS create/run, Baseten push) is never routine: ask every time."])
+# W15: log every PermissionDenied (auto-mode denial) to ~/.local/state/iar/denials.jsonl for the
+# digest's "Decided without you" section and iar/ratchet. Diagnostic; never blocks.
+| .hooks.PermissionDenied |= ((. // []) | map(select(any(.hooks[]?; (.command // "") | endswith("iar/denial-hook.sh")) | not))
+    + [{"hooks": [{"type": "command", "command": "/Users/tal/dotfiles/iar/denial-hook.sh", "timeout": 10}]}])

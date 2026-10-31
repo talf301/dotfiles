@@ -124,6 +124,7 @@ def desired(beads, links, inbox_url="", epics=None):
         body = "\n".join(x for x in (texts[b["id"]], f"Inbox: {links[b['id']]}" if b["id"] in links else "") if x)
         fp = hashlib.sha1(f"{b['id']}\n{body}".encode()).hexdigest()[:8]
         out[b["id"]] = {"title": b["title"][:255], "state": state_of(b, asked), "fp": fp,
+                        "question": "question" in (b.get("labels") or []),
                         "label": epics.get(b["id"]) or (b["id"] if b["id"] in roots else None),
                         "description": f"{body}\n\nBead: {b['id']} (v{fp})".lstrip()}
     return out
@@ -145,7 +146,7 @@ def plan(want, remote, comments):
         if have.get("state") is None:
             continue
         change = {k: w[k] for k in ("title", "state", "fp") if w[k] != have[k]}
-        if have["state"] == APPROVED and w["state"] == "In Review":  # Tal's approval stays until the bead closes
+        if w["question"] and have["state"] == APPROVED and w["state"] == "In Review":  # his answer: kept until closed
             change.pop("state", None)
         if w["label"] and w["label"] not in have["labels"]:
             change["label"] = w["label"]
@@ -382,6 +383,9 @@ def answers(questions, client=None):
     """W25b: Tal's Linear answers to open, unanswered question beads (reconcile's snap["questions"]) whose issue the
     mirror made. Returns ({qid: {text, at, source: "linear"}}, error or None). Read only; reconcile imports them
     through iar/answer (import-answer), so the first recorded answer wins and the delivery happens once."""
+    # ponytail: an answered question is not read again. Each tick reads Linear before it imports, so an earlier Linear
+    # answer loses to an Inbox answer only when this read failed in that tick; iar/answer then keeps the first
+    # recorded human answer (W2 E2) anyway. Read answered questions too if Tal answers in both places in practice.
     want = sorted(q["id"] for q in questions if "answered" not in (q.get("labels") or []))
     out = {}
     try:
@@ -630,6 +634,9 @@ def self_test():
             r = run(False, inbox, "http://inbox/")
             assert r["writes"] == [f"create {q4['id']} [In Review] Q4 new"], r
             assert iss[q3["id"]]["state"] == APPROVED
+            iss[c["id"]]["state"] = APPROVED  # not a question bead: the mirror moves it back
+            assert run(False, inbox, "http://inbox/")["done"] == [f"update {c['id']} {iss[c['id']]['identifier']} state"]
+            assert iss[c["id"]]["state"] == "In Review"
             ledger.label(q2["id"], add=["answered"])
             n = len(calls)
             assert answers(qs())[0].keys() == {q3["id"]} and calls[n:] == ["query"]

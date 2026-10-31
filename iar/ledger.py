@@ -21,7 +21,8 @@ CLI (output is JSON on stdout):
   ledger update ID [-s STATUS] [--assignee A] [--claim] [--title T] [-p N] [--notes T]
                 [--add-label L]... [--remove-label L]... [-d TEXT]  -> issue
   ledger close ID [--reason R]                                  -> issue
-  ledger --self-test                                            (uses a scratch store)
+  ledger init PREFIX                    new store at BEADS_DIR (self-test scratch stores) -> null
+  ledger --self-test                                           (uses a scratch store)
 """
 
 import argparse
@@ -148,6 +149,16 @@ def close(issue, reason=None):
     return out[0] if isinstance(out, list) and out else out
 
 
+def init(prefix):
+    """A new store at BEADS_DIR. `br init` prints no JSON."""
+    try:
+        p = subprocess.run(["br", "init", "--prefix", prefix], capture_output=True, text=True, timeout=TIMEOUT_S)
+    except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+        raise LedgerError(f"br init: {e}")
+    if p.returncode != 0:
+        raise LedgerError(f"br init failed (exit {p.returncode}): {(p.stdout + p.stderr).strip()}")
+
+
 def self_test():
     """Run every verb against a scratch store. Never touches the caller's store."""
     with tempfile.TemporaryDirectory() as root:
@@ -267,6 +278,9 @@ def main(argv=None):
     s.add_argument("id")
     s.add_argument("--reason")
 
+    s = sub.add_parser("init")
+    s.add_argument("prefix")
+
     a = p.parse_args(argv)
     if a.self_test:
         self_test()
@@ -301,6 +315,8 @@ def main(argv=None):
         elif a.cmd == "update":
             out = update(a.id, a.status, a.assignee, a.claim, a.title, a.priority,
                          a.notes, a.add_label, a.remove_label, a.description)
+        elif a.cmd == "init":
+            out = init(a.prefix)
         else:
             out = close(a.id, a.reason)
     except (LedgerError, OSError) as e:

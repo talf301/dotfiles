@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """bg: the single launch path for a background bead session (one attempt).
 
-  bg <bead> --done-when CMD [--name "<bead>: <2-4 words>"]
+  bg <bead> --done-when CMD [--name "<bead>: <2-4 words>"] [--auto]
   bg <bead> --cwd SLOT --prompt TEXT [--name ...]  session in a Precog slot the caller leases
   bg --new TITLE (--done-when CMD | --cwd SLOT --prompt TEXT) [--name ...]
   bg --self-test
@@ -17,7 +17,8 @@ writes the bead comment `attempt-failed: <step> attempt=<n> <error>`:
   claim    status in_progress, assignee agent:<bead>#<n>      undo: status open, assignee cleared
   brief    render iar/WORKFLOW.md to $LOG_DIR/dispatch-<bead>-<n>.md   undo: delete it
   start    claude --bg --settings iar/dispatch-settings.json  undo: stop sessions in the slot
-  comment  attempt: <n> session: <sid> slot: <path> branch: <ref> brief: <path>
+  comment  attempt: <n> session: <sid> slot: <path> branch: <ref> brief: <path>[ dispatch: auto]
+           (--auto: started by the reconciler, W14; it stops the session if the bead loses the label)
 The comment is last because `claude --bg` ignores --session-id: the session id exists only
 after start (spec order lease, claim, comment, brief, start; see decision comment on precog-lxt4).
 
@@ -127,7 +128,7 @@ def new_bead(title, prompt=None):
     return ledger.create(title, type="task", labels=["adhoc"], description=prompt or title)["id"]
 
 
-def dispatch(bead, done_when, name=None, cwd=None, prompt=None):
+def dispatch(bead, done_when, name=None, cwd=None, prompt=None, auto=False):
     issue = ledger.show(bead)
     if "quarantined" in (issue.get("labels") or []):  # reconcile.py over-limit; Tal removes the label
         print(f"bg: {bead} is quarantined (attempt limit): not dispatchable", file=sys.stderr)
@@ -220,7 +221,7 @@ def dispatch(bead, done_when, name=None, cwd=None, prompt=None):
 
         step = "comment"
         ledger.comment(bead, f"attempt: {n} session: {a['session']} slot: {a['slot']} "
-                             f"branch: {a['branch']} brief: {a['brief']}")
+                             f"branch: {a['branch']} brief: {a['brief']}" + " dispatch: auto" * auto)
         if fault == step:
             raise StepError("injected fault")
     except (StepError, ledger.LedgerError, OSError, ValueError, KeyError) as e:
@@ -442,13 +443,13 @@ def self_test():
             assert [s["name"] for s in sessions() if s["cwd"] == str(held.resolve())] == ["other"]
             assert ledger.show(b)["status"] == "open" and len(leases()) == 2
             os.environ["BG_FAULT_AFTER"] = ""
-            assert quiet(b, None, "a: ok", str(held), "do x") == 0
+            assert quiet(b, None, "a: ok", str(held), "do x", True) == 0
             s = ledger.show(b)
             assert s["labels"] == ["adhoc"] and s["description"] == "do x", s
             (sess,) = [x for x in sessions() if x["name"] == "a: ok"]
             assert sess["argv"][-1].startswith(f"do x\n\nYour bead: {b} ") and sess["cwd"] == str(held.resolve()), sess
             assert s["comments"][-1]["text"] == (f"attempt: 3 session: {sess['sessionId']} slot: "
-                                                 f"{held.resolve()} branch: main brief: none"), s
+                                                 f"{held.resolve()} branch: main brief: none dispatch: auto"), s
             assert s["assignee"] == f"agent:{b}#3" and len(leases()) == 2
         finally:
             for k, v in old.items():
@@ -467,6 +468,7 @@ def main():
     p.add_argument("--cwd")
     p.add_argument("--prompt")
     p.add_argument("--new", metavar="TITLE")
+    p.add_argument("--auto", action="store_true")
     p.add_argument("--self-test", action="store_true")
     a = p.parse_args()
     if a.self_test:
@@ -478,7 +480,7 @@ def main():
         p.error("give --done-when, or --cwd and --prompt")
     try:
         bead = a.bead or new_bead(a.new, a.prompt)
-        return dispatch(bead, a.done_when, a.name, a.cwd, a.prompt)
+        return dispatch(bead, a.done_when, a.name, a.cwd, a.prompt, a.auto)
     except ledger.LedgerError as e:  # the pre-check read failed: nothing was done
         print(f"bg: {e}", file=sys.stderr)
         return 1

@@ -4,7 +4,7 @@
 # Usage: act.sh rm <session id> | bead <bead id> | slot <slot number> | plannotator <pid> | resolve <thread id>
 
 export BEADS_DIR="$HOME/.local/share/beads/precog/.beads" PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/bin:/bin"
-POOL=$HOME/.treehouse/precog-28077b
+POOL=$HOME/.treehouse/precog-28077b LEDGER=$HOME/dotfiles/iar/ledger  # the only tracker client
 verb=$1 arg=$2
 print -r -- "$(date '+%F %T') $*" >> "$HOME/Library/Logs/session-board-actions.log"
 
@@ -22,10 +22,10 @@ case $verb in
     out=$(claude rm "$arg" 2>&1) || { tell "claude rm refused:\n${out//\"/\'}"; exit 1 }
     done_ "Removed $name" ;;
   bead)
-    title=$(br show "$arg" --json 2>/dev/null | jq -r '(if type == "array" then .[0] else . end).title // ""')
+    title=$("$LEDGER" show "$arg" 2>/dev/null | jq -r '.title // ""')
     case $(ask "$arg: ${title//\"/\'}\n\nRelease puts it back to open. Close finishes it." Release Close) in
-      Release) br update "$arg" --status open && done_ "Released $arg" ;;
-      Close) br close "$arg" --reason "closed from board" && done_ "Closed $arg" ;;
+      Release) "$LEDGER" update "$arg" -s open >/dev/null && done_ "Released $arg" ;;
+      Close) "$LEDGER" close "$arg" --reason "closed from board" >/dev/null && done_ "Closed $arg" ;;
     esac ;;
   slot)
     dir=$POOL/$arg/precog

@@ -143,6 +143,9 @@ def classify(data, now):
         add("Plannotator", f"[{clip(target, 60)}]({p['url']}) — {p.get('mode')}, {owner} · {ago(started, now)}"
             f" [close](claudego://act/plannotator/{p['pid']})", started)
 
+    if data.get("config_error"):
+        add("Needs you", f"WORKFLOW.md: {clip(data['config_error'], 160)}. No auto-dispatch until it loads; the other "
+            f"actions run on the last good config", None)
     for name, error in sorted(data.get("errors", {}).items()):
         add("Loose ends", f"Reconciler source `{name}` failed, no actions this tick: {clip(error, 140)}", now)
     for slot in data["slots"]:
@@ -233,6 +236,8 @@ def self_test():
     assert any(line.startswith("Malformed question") for line in classify(data, now)["Needs you"])
     data["errors"] = {"br": "LedgerError: tracker list: no answer in 30s"}
     assert any("`br` failed" in line for line in classify(data, now)["Loose ends"])
+    data["config_error"] = "config error: bad front matter"
+    assert any("bad front matter" in line for line in classify(data, now)["Needs you"])
     print("ok")
 
 

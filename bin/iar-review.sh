@@ -31,8 +31,12 @@ mkdir -p "$LOG_DIR"
 
 critf="$LOG_DIR/crit-$id.txt"
 rlog="$LOG_DIR/review-$id.log"
-parent=$(br show "$id" --json 2>/dev/null | jq -r '.[0].parent // empty' || true)
-{ br show "$id"; if [ -n "$parent" ]; then echo; echo "=== PARENT SPECIFICATION ($parent) ==="; br show "$parent"; fi; } 2>/dev/null | tr -d '\r' > "$critf"
+ledger="$(cd "$(dirname "$(readlink -f "$0")")/../iar" && pwd)/ledger"  # the only tracker client (W24)
+show() {  # the bead as text: title, labels, description, acceptance criteria, comments
+  "$ledger" show "$1" | jq -r '"\(.id) · \(.title) [\(.status)]\nLabels: \((.labels // []) | join(", "))\n\n\(.description // "")\n\nAcceptance criteria: \(.acceptance_criteria // "(see description)")\n\nComments:\n" + ((.comments // []) | map("  [\(.created_at)] \(.author // ""): \(.text)") | join("\n"))'
+}
+parent=$("$ledger" show "$id" 2>/dev/null | jq -r '.parent // empty' || true)
+{ show "$id"; if [ -n "$parent" ]; then echo; echo "=== PARENT SPECIFICATION ($parent) ==="; show "$parent"; fi; } 2>/dev/null | tr -d '\r' > "$critf"
 
 tlog="$LOG_DIR/tests-$id.log"
 pickf="$LOG_DIR/review-$id.pick.txt"; lastf="$LOG_DIR/review-$id.last.txt"
@@ -83,12 +87,12 @@ elif [ "$v" = "VERDICT: APPROVED" ] && [ "$trc" != 0 ]; then
 fi
 case "$v" in
   "VERDICT: APPROVED")
-    br update "$id" --add-label iar:approved --remove-label iar:awaiting-review --remove-label iar:changes-requested --remove-label needs-human --actor "$ACTOR" >/dev/null 2>&1 || true; rc=0 ;;
+    LEDGER_ACTOR="$ACTOR" "$ledger" update "$id" --add-label iar:approved --remove-label iar:awaiting-review --remove-label iar:changes-requested --remove-label needs-human >/dev/null 2>&1 || true; rc=0 ;;
   "VERDICT: CHANGES REQUESTED")
-    br update "$id" --add-label iar:changes-requested --remove-label iar:awaiting-review --remove-label iar:approved --remove-label needs-human --actor "$ACTOR" >/dev/null 2>&1 || true; rc=1 ;;
+    LEDGER_ACTOR="$ACTOR" "$ledger" update "$id" --add-label iar:changes-requested --remove-label iar:awaiting-review --remove-label iar:approved --remove-label needs-human >/dev/null 2>&1 || true; rc=1 ;;
   "VERDICT: NEEDS HUMAN")
-    br update "$id" --add-label needs-human --remove-label iar:awaiting-review --remove-label iar:approved --remove-label iar:changes-requested --actor "$ACTOR" >/dev/null 2>&1 || true; rc=2 ;;
+    LEDGER_ACTOR="$ACTOR" "$ledger" update "$id" --add-label needs-human --remove-label iar:awaiting-review --remove-label iar:approved --remove-label iar:changes-requested >/dev/null 2>&1 || true; rc=2 ;;
 esac
-br comments add "$id" --actor "reviewer:sol" -m "$v (reviewer:sol)$note. Tests executed: $tests. Full findings in $rlog" >/dev/null 2>&1 || true
+LEDGER_ACTOR="reviewer:sol" "$ledger" comment "$id" "$v (reviewer:sol)$note. Tests executed: $tests. Full findings in $rlog" >/dev/null 2>&1 || true
 echo "$v$note. Tests executed: $tests. Full findings in $rlog"
 exit "$rc"

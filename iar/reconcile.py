@@ -31,6 +31,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 from datetime import datetime, timedelta, timezone
 
 IAR = os.path.dirname(os.path.realpath(__file__))
@@ -43,7 +44,8 @@ HOME = os.path.expanduser("~")
 BIN = f"{HOME}/.local/bin"
 INBOX = f"{HOME}/.plannotator/inbox"
 PRECOG = f"{HOME}/Documents/precog"
-TIMEOUT_S = 30
+TIMEOUT_S = 30  # per source: its commands share one deadline, and a source that ends late is an error
+_deadline = [float("inf")]
 CPU_WINDOW = timedelta(minutes=5)
 BEAD_RE = re.compile(r"^([a-z0-9]+-[a-z0-9.]+): ")
 HOLDER_RE = re.compile(r"^agent:([a-z0-9]+-[a-z0-9.]+)#(\d+)$")
@@ -64,7 +66,10 @@ def need(ok, what):
 
 def sh(cmd, cwd=None, check=True):
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=TIMEOUT_S, cwd=cwd)
+        left = min(TIMEOUT_S, _deadline[0] - time.monotonic())
+        if left <= 0:
+            raise subprocess.TimeoutExpired(cmd, 0)
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=left, cwd=cwd)
     except (OSError, subprocess.TimeoutExpired) as e:
         raise SourceError(f"{os.path.basename(cmd[0])}: {e}")
     if check and p.returncode != 0:
@@ -304,10 +309,14 @@ def snapshot(now, sources=None, state_dir=None):
     """Run every source; a failure lands in snap["errors"] and leaves that source's defaults."""
     snap = {"at": now.isoformat(), "errors": {}, **json.loads(json.dumps(DEFAULTS))}
     for name, fn in {**SOURCES, **(sources or {})}.items():
+        _deadline[0] = start = time.monotonic() + TIMEOUT_S
         try:
             fn(snap)
+            if time.monotonic() > start:  # ledger calls have their own 30 s limit each
+                raise SourceError(f"took more than {TIMEOUT_S}s")
         except (SourceError, OSError, ValueError, TypeError, KeyError) as e:
             snap["errors"][name] = f"{type(e).__name__}: {e}"
+        _deadline[0] = float("inf")
     in_progress = {b["id"] for b in snap["beads"]}
     for s in snap["sessions"]:
         m = BEAD_RE.match(s.get("name") or "")
@@ -524,6 +533,11 @@ def self_test():
     def broken(s):
         raise SourceError("treehouse status: no answer in 30s")
     fakes = {name: fake(name) for name in SOURCES}
+    global TIMEOUT_S
+    TIMEOUT_S, saved = 0.05, TIMEOUT_S  # a source whose commands together pass the limit is a source error
+    slow = snapshot(now, {**fakes, "git": lambda s: (time.sleep(0.03), sh(["/bin/sleep", "0.05"]))})
+    TIMEOUT_S = saved
+    assert list(slow["errors"]) == ["git"] and "sleep" in slow["errors"]["git"], slow["errors"]
     assert classify(snapshot(now, fakes), now) == got
     bad = snapshot(now, {**fakes, "treehouse": broken})
     assert bad["errors"] == {"treehouse": "SourceError: treehouse status: no answer in 30s"}, bad["errors"]

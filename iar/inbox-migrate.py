@@ -4,14 +4,16 @@
 A project is stray when its root is a treehouse slot, a ~/.worktrees checkout or a tmp folder, or when it
 is a second project of a repo that has a canonical one (precog -> "Precog agents", dotfiles -> ~/dotfiles).
 Each unresolved thread in a stray project gets one action:
-  question  an unanswered :::question whose thread subject names an open bead: `iar/ask` files a question
-            bead under that bead (posted to the canonical project), then the stray thread is resolved
-  keep      an unanswered :::question whose subject names no bead: left open and listed for Tal to answer
+  question  an unanswered :::question, unless the bead its subject names is closed: `iar/ask` files a question
+            bead under that bead (no bead named: under the epic precog-am8w) and posts it to the canonical
+            project, then the stray thread is resolved
   moot      no unanswered question, or the named bead is closed: the thread is resolved
-Threads stay readable in the Inbox as Archived. Nothing is moved or deleted.
+Threads stay readable in the Inbox as Archived. The project folders stay: the Inbox has no tool to delete a
+project, and a project with no unresolved thread has nothing in the list.
 
   inbox-migrate.py             dry run: list stray threads, the planned actions, before/after counts
-  inbox-migrate.py --apply     do the actions (rerun-safe: resolved threads drop out, ask reuses its bead)
+  inbox-migrate.py --apply     do the actions, then write the before/after counts as a comment on precog-mmjm
+                               (rerun-safe: resolved threads drop out, ask reuses its bead)
   inbox-migrate.py --self-test fake Inbox files, fake Inbox MCP, scratch br store
 """
 
@@ -35,6 +37,8 @@ HOME = os.path.expanduser("~")
 CANONICAL = {"precog": question.PROJECT, "precog-agents": question.PROJECT, "dotfiles": f"{HOME}/dotfiles"}
 STRAY_PREFIXES = (f"{HOME}/.treehouse/", f"{HOME}/.worktrees/", "/tmp/", "/private/tmp/", "/var/folders/",
                   "/private/var/folders/")
+BEAD = "precog-mmjm"  # W16: --apply writes its counts here
+ORPHAN_PARENT = "precog-am8w"  # the parent of a question whose thread names no bead
 SUBJECT_BEAD = re.compile(r"^(?:precog-)?([a-z0-9]{3,8}(?:\.\d+)*)[: ]")
 
 
@@ -99,12 +103,10 @@ def plan():
         open_qs = [q for q in questions.values() if q["message_id"] in ids[t["id"]] and q.get("answer") is None
                    and not q.get("action_result") and not q.get("superseded_by")]
         bead = bead_of(t["subject"]) if open_qs else None
-        action = "moot" if not open_qs or (bead and bead["status"] == "closed") else "question" if bead else "keep"
+        action = "moot" if not open_qs or (bead and bead["status"] == "closed") else "question"
         rows.append({"thread": t["id"], "project": p, "subject": t["subject"], "session": t["session"],
-                     "quiet": t["quiet"], "bead": bead and bead["id"], "action": action,
+                     "quiet": t["quiet"], "bead": bead["id"] if bead else ORPHAN_PARENT if open_qs else None, "action": action,
                      "questions": open_qs if action == "question" else []})
-        if action == "keep":
-            after[p["root"]] = after.get(p["root"], 0) + 1
         canon = os.environ.get("IAR_INBOX_PROJECT", question.PROJECT)
         if action == "question":  # ponytail: one new thread per question; the Inbox may group them by thread name
             after[canon] = after.get(canon, 0) + len(open_qs)
@@ -140,7 +142,7 @@ def run(apply):
         print(f"{r['action']:8} {r['thread']} {r['project']['root']} | {r['subject'][:80]}{note}")
         for q in r["questions"]:
             print(f"         question -> bead under {r['bead']}: {(q.get('prompt') or '').strip()[:80]}")
-        if not apply or r["action"] == "keep":
+        if not apply:
             continue
         try:
             for q in r["questions"]:
@@ -152,17 +154,20 @@ def run(apply):
             print(f"         FAILED: {e}")
     if apply:  # the real after: the Inbox files once the actions ran
         _, after, _ = plan()
-    print(f"\nUnresolved threads per project (before -> after{'' if apply else ', planned'}):")
-    for root in sorted(set(before) | set(after)):
-        print(f"  {before[root]:3} -> {after.get(root, 0):3}  {root}")
-    print(f"  {sum(before.values()):3} -> {sum(after.values()):3}  total; stray threads: {len(rows)}, "
-          f"question: {sum(r['action'] == 'question' for r in rows)}, moot: {sum(r['action'] == 'moot' for r in rows)}, "
-          f"keep: {sum(r['action'] == 'keep' for r in rows)}"
-          f"{f', failed: {failed}' if failed else ''}")
+    lines = [f"Unresolved Inbox threads per project (before -> after{'' if apply else ', planned'}):"]
+    lines += [f"  {before.get(root, 0):3} -> {after.get(root, 0):3}  {root}" for root in sorted(set(before) | set(after))]
+    lines += [f"  {sum(before.values()):3} -> {sum(after.values()):3}  total; stray threads: {len(rows)}, "
+              f"question: {sum(r['action'] == 'question' for r in rows)}, moot: {sum(r['action'] == 'moot' for r in rows)}"
+              f"{f', failed: {failed}' if failed else ''}"]
+    print("\n" + "\n".join(lines))
+    if apply:
+        ledger.comment(BEAD, "inbox-migrate --apply\n" + "\n".join(lines))
     return 1 if failed else 0
 
 
 def self_test():
+    global BEAD, ORPHAN_PARENT
+    saved_ids = BEAD, ORPHAN_PARENT
     with tempfile.TemporaryDirectory() as d:
         saved_env = {k: os.environ.get(k) for k in ("BEADS_DIR", "IAR_INBOX_CMD", "IAR_STATE_DIR", "IAR_INBOX_PROJECT")}
         saved_inbox = reconcile.INBOX
@@ -173,6 +178,7 @@ def self_test():
             open_bead = ledger.create("open work", type="task")["id"]
             closed_bead = ledger.create("done work", type="task")["id"]
             ledger.close(closed_bead)
+            BEAD, ORPHAN_PARENT = ledger.create("W16", type="task")["id"], ledger.create("epic", type="epic")["id"]
             log, fake = os.path.join(d, "inbox.log"), os.path.join(d, "fake-inbox")
             with open(fake, "w") as fh:
                 fh.write(f"#!/bin/sh\ncat >> '{log}'\n"
@@ -212,7 +218,7 @@ def self_test():
             thread("slot", "m-gone", "gone", resolved=True)
             project("tmp", "tmp", "/private/tmp")
             thread("tmp", "m-probe", "probe")
-            thread("tmp", "m-ask", "Which port?")  # an open question with no bead: kept for Tal
+            thread("tmp", "m-ask", "Which port?")  # an open question with no bead: filed under the epic
             ask_q("tmp", "m-ask", "Port?", [{"label": "80"}, {"label": "443"}])
             project("main", "precog", f"{HOME}/Documents/precog")
             thread("main", "m-main", "a note")
@@ -222,9 +228,9 @@ def self_test():
             rows, before, after = plan()
             got = {r["thread"]: (r["action"], r["bead"]) for r in rows}
             assert got == {"m-q": ("question", open_bead), "m-closed": ("moot", closed_bead), "m-probe": ("moot", None),
-                           "m-main": ("moot", None), "m-ask": ("keep", None)}, got
+                           "m-main": ("moot", None), "m-ask": ("question", ORPHAN_PARENT)}, got
             assert before[f"{HOME}/.treehouse/precog-x/1/precog"] == 2 and sum(before.values()) == 7, before
-            assert after == {question.PROJECT: 2, f"{HOME}/src/other-repo": 1, "/private/tmp": 1}, after
+            assert after == {question.PROJECT: 3, f"{HOME}/src/other-repo": 1}, after
             q = next(r for r in rows if r["questions"])["questions"][0]
             assert options_of(q) == (["Left", "Right", "Up"], "Right"), options_of(q)
             assert options_of({"parsed": {"choices": []}}) == (["Yes", "No"], "Yes")
@@ -238,9 +244,12 @@ def self_test():
             with open(log) as fh:
                 calls = [json.loads(x)["params"] for x in fh.read().splitlines() if '"tools/call"' in x]
             resolved = sorted(c["arguments"]["message_id"] for c in calls if c["name"] == "resolve_message")
-            assert resolved == ["m-closed", "m-main", "m-probe", "m-q"], resolved
+            assert resolved == ["m-ask", "m-closed", "m-main", "m-probe", "m-q"], resolved
             sends = [c["arguments"] for c in calls if c["name"] == "send_message"]
-            assert len(sends) == 1 and sends[0]["project_path"] == question.PROJECT, sends
+            assert len(sends) == 2 and {x["project_path"] for x in sends} == {question.PROJECT}, sends
+            assert [k["title"] for k in ledger.show(ORPHAN_PARENT)["dependents"]] == \
+                [f"Q({question.short(kid)}): Port?" for kid in [ledger.show(ORPHAN_PARENT)["dependents"][0]["id"]]]
+            assert ledger.show(BEAD)["comments"][0]["text"].startswith("inbox-migrate --apply\nUnresolved")
             kids = [k for k in ledger.show(open_bead)["dependents"] if k["title"].startswith("Q(")]
             assert len(kids) == 1 and kids[0]["title"].endswith("Which way?"), kids
             body = question.parse_body(ledger.show(kids[0]["id"])["description"])
@@ -255,9 +264,10 @@ def self_test():
             os.environ["IAR_INBOX_CMD"] = "false"  # Inbox down: failures are counted, the thread stays
             with contextlib.redirect_stdout(io.StringIO()) as out:
                 assert run(apply=True) == 1
-            assert "failed: 4" in out.getvalue(), out.getvalue()
+            assert "failed: 5" in out.getvalue(), out.getvalue()
         finally:
             reconcile.INBOX = saved_inbox
+            BEAD, ORPHAN_PARENT = saved_ids
             for k, v in saved_env.items():
                 os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
     print("inbox-migrate self-test: ok")

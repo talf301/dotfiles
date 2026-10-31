@@ -53,7 +53,7 @@ W13 (questions of loop-owned beads; question beads come from iar/ask):
                       labelled `delivered` and closed
   question-deadline   timeout (reversible, not gated: iar/answer --timeout writes the default, delivered next tick)
                       or reping (not reversible: one reminder in the thread); a gated question has no deadline
-  malformed-question  flag-malformed: a note, and the board lists it under Needs you; no question bead is invented
+  malformed-question  flag-malformed: a note; the board lists every one under Needs you (malformed()); no bead invented
   inbox-pending       post-question: post a question bead that ask could not post; last of the action classes
 A flag is a `reconcile-note: <key>` comment. Before a nudge that stops a running session, flag-stalled, quarantine
 or stop-session, the tick saves the
@@ -570,6 +570,13 @@ def limit_actions(b, n, limit, now):
     return [f"quarantine attempt={n}"] if now - nudged[n] >= LIMIT_GRACE else []
 
 
+def malformed(s, qs):
+    """W5: the session's last message is a `QUESTION:` line with no question id, or with an id that is not one of qs
+    (the open question beads of its bead). The board flags it under Needs you whatever the bead's class."""
+    said = s.get("last_message") or ""
+    return said.startswith("QUESTION:") and not ((m := QID_RE.match(said)) and m[1] in {q["id"] for q in qs})
+
+
 def classify_bead(bid, b, snap, now, stall_after, sessions, leases, threads, limits=None):
     """Return (class, [action key, …]) for one bead. Predicates: spec W10 and factory-scan.md 1.4."""
     att = attempts(b)
@@ -608,9 +615,7 @@ def classify_bead(bid, b, snap, now, stall_after, sessions, leases, threads, lim
                and (q.get("reversible") == "yes" or "inbox:pending" not in q["labels"])]  # reping needs a thread
         if [k for k in due if k not in done_keys(b)]:
             return "question-deadline", due
-        if s and not working and (s.get("last_message") or "").startswith("QUESTION:") \
-                and not ((m := QID_RE.match(s["last_message"])) and m[1] in {q["id"] for q in qs}):
-            # malformed (W5): no question id, or an id that is not an open question bead of this bead
+        if s and not working and malformed(s, qs):
             return "malformed-question", [f"flag-malformed {a}"]
         wrote = parse_time(s.get("transcript_at")) if s else None
         if working and wrote and now - wrote >= stall_after and s.get("cpu_active") is False:
@@ -1189,7 +1194,7 @@ def tick(d, dry_run, sources=None, executors=None, board=False):
             f.write(json.dumps(line) + "\n")
         if board:
             import board as board_mod
-            board_mod.write(board_mod.render(board_mod.classify({**snap, **result}, now)), now)
+            board_mod.write(board_mod.render(board_mod.classify(snap, now)), now)
         return 0, line
     finally:
         lock.close()
@@ -1494,9 +1499,9 @@ def w13_test():
                 ledger.update(bid, status="in_progress", assignee=assignee or f"agent:{bid}#{n}")
                 return bid
 
-            def ask(bid, text, deadline=None, reversible="yes"):
+            def ask(bid, text, deadline=None, reversible="yes", more=()):
                 argv = [bid, text, "-o", "Keep", "-o", "Drop", "--default", "Keep", "--reversible", reversible,
-                        "--gated", "no", "--blocks", "no", "--session", f"s-{bid}-1"]
+                        "--gated", "no", "--blocks", "no", "--session", f"s-{bid}-1", *more]
                 out = io.StringIO()
                 with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
                     rc = question.main_ask(argv + (["--deadline", deadline] if deadline else []))
@@ -1515,7 +1520,8 @@ def w13_test():
             ip = asking("inbox down")
             os.environ["IAR_INBOX_CMD"] = "false"
             # Not reversible and past its deadline: its reping waits for the post (it needs a thread).
-            rc, qip = ask(ip, "Post me later?", deadline=past, reversible="no")
+            rc, qip = ask(ip, "Post me later?", deadline=past, reversible="no",
+                          more=["--project", "/inbox/other", "--thread", "my thread"])
             assert rc == 3 and "inbox:pending" in ledger.show(qip)["labels"], rc
             assert run() == [(ip, "post-question", "error: RuntimeError: Inbox gave no answer (exit 1): ")], run
             os.environ["IAR_INBOX_CMD"] = fake
@@ -1552,6 +1558,9 @@ def w13_test():
             # E5: posted once, later; the thread id is written back.
             assert [s for s in sent()[posted:] if s[0].startswith(qip)] and "inbox:pending" not in ledger.show(qip)["labels"]
             assert question.parse_body(ledger.show(qip)["description"])["inbox_thread"] == "msg_T1"
+            with open(log) as f:  # the retry posts where ask was told to
+                call = [json.loads(x) for x in f.read().splitlines() if qip + ":" in x][0]["params"]["arguments"]
+            assert (call["project_path"], call["thread"]) == ("/inbox/other", "my thread"), call
             assert [s for s in sent()[posted:] if s[0] == "msg_T1" and qrv in s[1]]  # the reping, in the thread
             assert any(x.startswith("reconcile-note: flag-malformed attempt=1\n") and "should I ship?" in x
                        for x in texts(mq))

@@ -288,13 +288,22 @@ class Linear:
             after = team[field]["pageInfo"]["endCursor"]
 
     def question_issue(self, identifier):
-        """A mirrored question issue with its comments and state history (read only; team TAL only)."""
-        i = self.gql("query($id: String!) { issue(id: $id) { team { id } comments(first: 250) { nodes { body createdAt "
-                     "user { id } } } history(first: 250) { nodes { createdAt actor { id } toState { name } } } } }",
-                     {"id": identifier})["issue"]
-        if not i or i["team"]["id"] != self.team:
-            raise LinearError(f"{identifier} is not an issue of team TAL")
-        return i
+        """A mirrored question issue with all its comments and state history (read only; team TAL only)."""
+        out = {}
+        for field, nodes in (("comments", "body createdAt user { id }"),
+                             ("history", "createdAt actor { id } toState { name }")):
+            out[field], after = {"nodes": []}, None
+            while True:
+                i = self.gql(f"query($id: String!, $after: String) {{ issue(id: $id) {{ team {{ id }} {field}("
+                             f"first: 250, after: $after) {{ nodes {{ {nodes} }} pageInfo {{ hasNextPage endCursor }} "
+                             "} } }", {"id": identifier, "after": after})["issue"]
+                if not i or i["team"]["id"] != self.team:
+                    raise LinearError(f"{identifier} is not an issue of team TAL")
+                out[field]["nodes"] += i[field]["nodes"]
+                if not i[field]["pageInfo"]["hasNextPage"]:
+                    break
+                after = i[field]["pageInfo"]["endCursor"]
+        return out
 
     def mutate(self, name, query, variables):
         """One mutation; `success: false` is an error, so a failed write is never reported as done."""
@@ -463,9 +472,11 @@ def self_test():
                                                        else ""))
             if "issue(id:" in q:
                 i = next((i for i in team_issues if i["identifier"] == v["id"]), None)
-                return self.reply(200, {"data": {"issue": i and {
-                    "team": {"id": TAL_TEAM}, "comments": {"nodes": i.get("comments", [])},
-                    "history": {"nodes": i.get("history", [])}}}})
+                field, start = "comments" if "comments(" in q else "history", int(v["after"] or 0)  # pages of 2
+                rows = (i or {}).get(field, [])
+                return self.reply(200, {"data": {"issue": i and {"team": {"id": TAL_TEAM}, field: {
+                    "nodes": rows[start:start + 2],
+                    "pageInfo": {"hasNextPage": start + 2 < len(rows), "endCursor": str(start + 2)}}}}})
             if q.startswith("query"):
                 field = q.split("{ id ")[1].split("(")[0]
                 calls[-1] += f" {field}"
@@ -619,7 +630,7 @@ def self_test():
             iss[q2["id"]]["comments"] = [
                 {"body": "answer: Drop", "createdAt": at(1), "user": {"id": other}},  # not Tal: ignored
                 {"body": "looks fine", "createdAt": at(2), "user": {"id": TAL_USER}},  # not an answer
-                {"body": "Answer:  Keep \n", "createdAt": at(3), "user": {"id": TAL_USER}},
+                {"body": "Answer:  Keep \n", "createdAt": at(3), "user": {"id": TAL_USER}},  # on page 2
                 {"body": "answer: Drop", "createdAt": at(5), "user": {"id": TAL_USER}}]  # later: loses
             iss[q2["id"]]["history"] = [{"createdAt": at(4), "actor": {"id": TAL_USER},
                                          "toState": {"name": APPROVED}}]
@@ -630,7 +641,7 @@ def self_test():
             got, err = answers(qs() + [{"id": q4["id"], "labels": ["question"]}])
             assert err is None and got == {q2["id"]: {"text": "Keep", "at": at(3), "source": "linear"},
                                            q3["id"]: {"text": "approve", "at": at(6), "source": "linear"}}, got
-            assert calls[n:] == ["query", "query"], calls[n:]
+            assert calls[n:] == ["query"] * 5, calls[n:]  # q2: 2 pages of comments + history; q3: 1 + 1
             # The mirror keeps Approved on an answered question (the tick imported the move); a move on an unanswered
             # question (nobody imported it) or on any other bead goes back to In Review.
             ledger.label(q3["id"], add=["answered"])
@@ -642,7 +653,7 @@ def self_test():
             # An answered question is read until it is delivered (a timeout answer can still lose to Tal's).
             ledger.label(q2["id"], add=["delivered"])
             n = len(calls)
-            assert answers(qs())[0].keys() == {q3["id"]} and calls[n:] == ["query"]
+            assert answers(qs())[0].keys() == {q3["id"]} and calls[n:] == ["query"] * 2
             # A Linear failure is reported, not raised.
             os.remove(os.path.join(root, "state", "linear-token.json"))
             credentials = no_keychain

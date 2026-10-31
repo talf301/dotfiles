@@ -69,6 +69,17 @@ self_test() {
   t [ $rc -eq 143 ]; t [ "$(grp)" = "$before" ]; t free
   t [ "$($g -C "$d/wt-c" branch --show-current)" = b-c ]; t [ "$($g -C "$d/wt-c" status --porcelain)" = "" ]
   sleep 0.2; t [ -z "$(pgrep -f 'sleep 31' || true)" ]
+  # SIGTERM mid-merge (a merge driver that sleeps): the same.
+  $g -C "$d/clone" config merge.slow.driver 'sleep 33; git merge-file %A %O %B'
+  mkdir -p "$d/clone/.git/info"; echo 'f merge=slow' > "$d/clone/.git/info/attributes"
+  "$me" pc "$d/wt-c" grp true > /dev/null 2>&1 & pk=$!
+  for _ in $(seq 100); do pgrep -f "sleep 33" > /dev/null && break; sleep 0.1; done
+  t pgrep -f "sleep 33" > /dev/null
+  kill -TERM $pk; rc=0; wait $pk 2> /dev/null || rc=$?
+  t [ $rc -eq 143 ]; t [ "$(grp)" = "$before" ]; t free; t [ "$($g -C "$d/wt-c" rev-parse b-c)" = "$c0" ]
+  t [ "$($g -C "$d/wt-c" branch --show-current)" = b-c ]; t [ "$($g -C "$d/wt-c" status --porcelain)" = "" ]
+  sleep 0.2; t [ -z "$(pgrep -f 'sleep 33' || true)" ]
+  rm "$d/clone/.git/info/attributes"
   # A held lock: exit 5 after the wait; SIGTERM during the wait ends it at once.
   python3 -c 'import fcntl,sys,time; f=open(sys.argv[1],"a"); fcntl.flock(f,fcntl.LOCK_EX); time.sleep(20)' \
     "$IAR_STATE_DIR/locks/pr-grp.lock" & local holder=$!
@@ -96,15 +107,18 @@ branch=$(git symbolic-ref -q --short HEAD) || { echo "integrate: $wt is not on a
 [ -z "$(git status --porcelain)" ] || { echo "integrate: $wt has uncommitted changes" >&2; exit 1; }
 orig=$(git rev-parse HEAD)
 
+set -m  # each background job gets its own process group, so cleanup can stop it with its children
 kid=
 waited() {  # run in the background and wait: a signal is handled at once, not when the child ends
   "$@" & kid=$!
   local rc=0; wait $kid || rc=$?; kid=; return $rc
 }
 cleanup() {
-  [ -n "$kid" ] && kill "$kid" 2> /dev/null  # ponytail: TERM reaches this pid only, not its children
+  set +e  # every step runs, whatever the one before did
+  if [ -n "$kid" ]; then kill -TERM -- "-$kid" 2> /dev/null; wait "$kid" 2> /dev/null; fi
   git rev-parse -q --verify MERGE_HEAD > /dev/null && git merge --abort
-  git checkout -q -f "$branch" || true
+  # The worktree was clean at the start: put the bead branch back as it was.
+  git checkout -q -f "$branch" && git reset -q --hard && git clean -qfd || true
 }
 trap cleanup EXIT
 trap 'exit 143' TERM INT HUP
@@ -133,8 +147,8 @@ fi
 git fetch -q origin "+refs/heads/$base:refs/remotes/origin/$base"
 # 2. Merge it into the bead branch, detached.
 git checkout -q --detach
-if ! git merge -q --no-edit -m "Merge $base into $branch" "origin/$base" > /dev/null; then
-  git merge --abort
+if ! waited git merge -q --no-edit -m "Merge $base into $branch" "origin/$base" > /dev/null; then
+  git merge --abort 2> /dev/null || true
   echo "integrate: $branch conflicts with $base; merge it into your branch, resolve, test, review, run again" >&2
   exit 3
 fi
@@ -146,7 +160,7 @@ if [ "$(git rev-parse "$orig^{tree}")" != "$(git rev-parse HEAD^{tree})" ]; then
 fi
 # 4. One merge commit per bead in the group; both branches move together or not at all.
 git checkout -q --detach "origin/$base"
-git merge -q --no-ff --no-edit -m "Merge $branch ($bead) into $group" "$merged" > /dev/null
+waited git merge -q --no-ff --no-edit -m "Merge $branch ($bead) into $group" "$merged" > /dev/null
 sha=$(git rev-parse HEAD)
 git push -q --atomic origin "$merged:refs/heads/$branch" "$sha:refs/heads/$group" \
   || { echo "integrate: push to $group rejected; report it, never force-push" >&2; exit 1; }

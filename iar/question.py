@@ -60,6 +60,15 @@ def iso(t):
     return t.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def clock():
+    """Answer times keep milliseconds, so a human answer in the same second as a timeout write still orders."""
+    return dt.datetime.now(dt.timezone.utc)
+
+
+def stamp(t):
+    return t.astimezone(dt.timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
 def parse_time(s):
     t = dt.datetime.fromisoformat(s.replace("Z", "+00:00"))
     if t.tzinfo is None:
@@ -268,7 +277,7 @@ def _answer(qid, text, at, source, timeout):
     if "question" not in (q.get("labels") or []):
         raise ValueError(f"{qid} is not a question bead")
     f = parse_body(q.get("description"))
-    t = now()
+    t = clock()
     prior = answers(q)
     if timeout:
         if f["reversible"] != "yes" or f["gated"] != "no":
@@ -286,7 +295,7 @@ def _answer(qid, text, at, source, timeout):
         at = parse_time(at) if at else t
     labels = set(q.get("labels") or [])
     choice = next((o for o in f["options"] if o.lower() == text.lower()), None)
-    meta = f"\n-- at: {iso(at)} source: {source}"
+    meta = f"\n-- at: {stamp(at)} source: {source}"
     if q["status"] == "closed" or "delivered" in labels:
         result = "late"
     elif not prior:
@@ -445,6 +454,18 @@ def self_test():
                                                    "at": answers(ledger.show(q3))[0]["at"]}
             assert run(main_answer, [q3, "Drop", "--at", past]) == (0, "overrode-timeout")
             assert effective_answer(ledger.show(q3))["text"] == "Drop"
+            # E2b in one second: the timeout written at .900, a human answer picked at .100 still wins.
+            global clock
+            real_clock, second = clock, now()
+            rc, q7 = run(main_ask, [a2, "Same second?", "--blocks", "no", "--deadline", past, *base])
+            clock = lambda: second + dt.timedelta(milliseconds=900)
+            try:
+                assert run(main_answer, [q7, "--timeout"]) == (0, "answered")
+            finally:
+                clock = real_clock
+            picked = stamp(second + dt.timedelta(milliseconds=100))
+            assert run(main_answer, [q7, "Drop", "--at", picked]) == (0, "overrode-timeout")
+            assert effective_answer(ledger.show(q7))["text"] == "Drop"
             gated = [x if x != "no" else "yes" for x in base]  # --gated yes
             rc, q4 = run(main_ask, [a2, "Spend?", "--blocks", "no", *gated])
             assert parse_body(ledger.show(q4)["description"])["deadline"] == ""

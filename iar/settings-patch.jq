@@ -38,3 +38,7 @@ def add_unique($xs): (. // []) + ($xs - (. // []));
 # digest's "Decided without you" section and iar/ratchet. Diagnostic; never blocks.
 | .hooks.PermissionDenied |= ((. // []) | map(select(any(.hooks[]?; (.command // "") | endswith("iar/denial-hook.sh")) | not))
     + [{"hooks": [{"type": "command", "command": "/Users/tal/dotfiles/iar/denial-hook.sh", "timeout": 10}]}])
+# W21: herdr -> Rex. Drop the herdr-agent-state hook from every event; name rex, not herdr, in
+# autoMode.environment. The hook script itself is removed by W22.
+| .hooks |= with_entries(.value |= map(select(any(.hooks[]?; (.command // "") | contains("herdr-agent-state")) | not)))
+| .autoMode.environment |= ((. // []) | map(gsub("\\bherdr\\b"; "rex")))

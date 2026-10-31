@@ -8,7 +8,7 @@ Steps, in order. If a step fails, bg undoes the earlier steps in reverse order a
 writes the bead comment `attempt-failed: <step> attempt=<n> <error>`:
   lease    treehouse get --lease, holder agent:<bead>#<n>     undo: return each slot that holder has
   claim    status in_progress, assignee agent:<bead>#<n>      undo: status open, assignee cleared
-  brief    render iar/brief.md to $LOG_DIR/dispatch-<bead>-<n>.md   undo: delete it
+  brief    render iar/WORKFLOW.md to $LOG_DIR/dispatch-<bead>-<n>.md   undo: delete it
   start    claude --bg --settings iar/dispatch-settings.json  undo: stop sessions in the slot
   comment  attempt: <n> session: <sid> slot: <path> branch: <ref> brief: <path>
 The comment is last because `claude --bg` ignores --session-id: the session id exists only
@@ -32,6 +32,7 @@ from pathlib import Path
 IAR = Path(__file__).resolve().parent.parent / "iar"
 sys.path.insert(0, str(IAR))
 import ledger  # noqa: E402
+import workflow  # noqa: E402
 
 os.environ.setdefault("BEADS_DIR", "/Users/tal/.local/share/beads/precog/.beads")
 REPO = os.environ.get("REPO", os.path.expanduser("~/Documents/precog"))
@@ -84,12 +85,10 @@ def base_and_branch(issue, slot):
 
 
 def render(values):
-    text = (IAR / "brief.md").read_text()
-    text = re.sub(r"\{\{include ([\w.-]+)\}\}", lambda m: (IAR / m.group(1)).read_text().strip(), text)
-    text = re.sub(r"\{\{(\w+)\}\}", lambda m: str(values[m.group(1)]), text)  # KeyError on unknown
-    if "{{" in text:
-        raise StepError("brief: unrendered {{...}} left")
-    return text
+    try:
+        return workflow.render(values)
+    except workflow.WorkflowError as e:
+        raise StepError(str(e))
 
 
 def dispatch(bead, done_when, name=None):

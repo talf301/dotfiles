@@ -14,15 +14,15 @@
 Exit codes: 0 ok, 1 no or invalid block (or tracker error), 3 budget used up, expired, or a
 start that does not fit.
 
-The allowlist is iar/compute-allowlist.txt (one name per line, `#` comments) until
-WORKFLOW.md `compute_allowlist` exists. Env overrides: IAR_COMPUTE_ALLOWLIST (file),
-IAR_STATE_DIR (lock dir, default ~/.local/state/iar).
+The allowlist is WORKFLOW.md `compute_allowlist` (iar/workflow.py). Env overrides:
+IAR_WORKFLOW (file), IAR_STATE_DIR (lock dir, default ~/.local/state/iar).
 """
 
 import argparse
 import datetime
 import decimal
 import fcntl
+import json
 import os
 import re
 import subprocess
@@ -32,6 +32,7 @@ import tempfile
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import ledger  # noqa: E402  (the only module that calls the tracker)
+import workflow  # noqa: E402
 
 FIELDS = ("compute", "gpu_hours", "max_runs", "kill_if", "until")
 STATUSES = ("started", "done", "failed", "killed")
@@ -46,11 +47,9 @@ class BudgetError(Exception):
 
 
 def allowlist():
-    path = os.environ.get("IAR_COMPUTE_ALLOWLIST") or os.path.join(HERE, "compute-allowlist.txt")
     try:
-        with open(path) as f:
-            return {ln.split("#", 1)[0].strip() for ln in f} - {""}
-    except OSError as e:
+        return set(workflow.load()[0]["compute_allowlist"])
+    except workflow.WorkflowError as e:
         raise BudgetError(f"cannot read compute allowlist: {e}")
 
 
@@ -191,10 +190,11 @@ def record(bead, run_id, status, gpu_hours=None):
 
 def self_test():
     with tempfile.TemporaryDirectory() as root:
-        allow = os.path.join(root, "allow.txt")
+        allow = os.path.join(root, "WORKFLOW.md")
+        config = dict(workflow.load()[0], compute_allowlist=["ray-a100", "sky-h100"])
         with open(allow, "w") as f:
-            f.write("# test\nray-a100  # existing\nsky-h100\n")
-        env = {"BEADS_DIR": os.path.join(root, ".beads"), "IAR_COMPUTE_ALLOWLIST": allow,
+            f.write("---\n" + json.dumps(config) + "\n---\nbrief\n")
+        env = {"BEADS_DIR": os.path.join(root, ".beads"), "IAR_WORKFLOW": allow,
                "IAR_STATE_DIR": os.path.join(root, "state")}
         saved = {k: os.environ.get(k) for k in env}
         os.environ.update(env)

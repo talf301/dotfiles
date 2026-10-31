@@ -33,7 +33,7 @@ Show Tal one line per bead: id, title, PR group, the done-when command, and pass
 
 ## 3. Dispatch with `bg`
 
-For each approved bead, run `~/dotfiles/bin/bg` by its full path (a bare `bg` is the shell's job-control builtin). It is the only launch path: it leases a treehouse slot (holder `agent:<id>#<n>`), claims the bead, renders the brief `~/dotfiles/iar/brief.md` to `$LOG_DIR/dispatch-<id>-<n>.md`, resolves the base (`pr:<slug>` group branch, else `origin/main`; writes `$LOG_DIR/base-<id>`), starts the session from the slot with `--settings ~/dotfiles/iar/dispatch-settings.json`, and writes the bead comment `attempt: <n> session: <sid> slot: <path> branch: <ref> brief: <path>`. If a step fails, it undoes the earlier steps and writes `attempt-failed: <step> attempt=<n> <error>`.
+For each approved bead, run `~/dotfiles/bin/bg` by its full path (a bare `bg` is the shell's job-control builtin). It is the only launch path: it leases a treehouse slot (holder `agent:<id>#<n>`), claims the bead, renders the brief template in `~/dotfiles/iar/WORKFLOW.md` (body below the front matter) to `$LOG_DIR/dispatch-<id>-<n>.md`, resolves the base (`pr:<slug>` group branch, else `origin/main`; writes `$LOG_DIR/base-<id>`), starts the session from the slot with `--settings ~/dotfiles/iar/dispatch-settings.json`, and writes the bead comment `attempt: <n> session: <sid> slot: <path> branch: <ref> brief: <path>`. If a step fails, it undoes the earlier steps and writes `attempt-failed: <step> attempt=<n> <error>`.
 
 ```bash
 ~/dotfiles/bin/bg <id> --done-when "<done-when command>" --name "<session name>"

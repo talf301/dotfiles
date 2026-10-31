@@ -712,10 +712,20 @@ def classify(snap, now, stall_after_min=30, limits=None):
 
 def bead_files(issue):
     """The paths of the bead's `Files:` list (`- <path> ...` lines, up to the first other line); `(none ...)` is no
-    path. `~` is expanded; beads of one repo name their files the same way."""
+    path. A path under a known repo (dotfiles, Precog) becomes repo-relative, so `~/dotfiles/iar/x.py` and
+    `iar/x.py` are one file."""
     m = re.search(r"(?im)^\W*files:[ \t]*\n((?:[ \t]*[-*] .*(?:\n|$))+)", issue.get("description") or "")
     items = [line.strip()[2:].strip() for line in (m[1].splitlines() if m else [])]
-    return {os.path.expanduser(x.split()[0].strip("`")) for x in items if x and not x.startswith("(")}
+    return {repo_path(x.split()[0].strip("`")) for x in items if x and not x.startswith("(")}
+
+
+def repo_path(path):
+    # ponytail: two known repo roots; a bead in another repo compares by its paths as written
+    p = os.path.normpath(os.path.expanduser(path))
+    for root in (f"{HOME}/dotfiles", PRECOG):
+        if p.startswith(root + "/"):
+            return p[len(root) + 1:]
+    return p
 
 
 def done_when(issue):
@@ -757,8 +767,10 @@ def gate(issue, busy, budget_check):
     if re.search(r"(?m)^```[^\n]*\n\s*budget", issue.get("description") or ""):  # it needs compute
         try:
             budget_check(issue["id"])
-        except Exception as e:  # budget.BudgetError, or the tracker failed
+        except budget.BudgetError as e:
             return f"budget block not valid: {e}"
+        except Exception as e:  # the tracker failed: not a verdict on the bead, try again next tick
+            return f"wait: budget check failed: {type(e).__name__}: {e}"
     if overlap := sorted(files & busy):
         return f"wait: files in use by running work: {', '.join(overlap)}"
     return None
@@ -1615,7 +1627,8 @@ def w14_plan_test():
 
     assert bead_files(cand("a")) == {"iar/a.py", "bin/a"} and done_when(cand("a")) == "iar-run-tests.sh x tests/a"
     assert bead_files({"description": "Files:\n- (none: branch-only chore)\n"}) == set()
-    assert bead_files({"description": "Files:\n- ~/dotfiles/iar/x.py\n"}) == {os.path.expanduser("~/dotfiles/iar/x.py")}
+    assert bead_files({"description": "Files:\n- ~/dotfiles/iar/x.py\n- ./bin/y\n"}) == {"iar/x.py", "bin/y"}
+    assert bead_files({"description": f"Files:\n- {PRECOG}/hydra/z.py\n- /elsewhere/w\n"}) == {"hydra/z.py", "/elsewhere/w"}
     # Sort by priority, then creation time; 5 ready, 4 free slots: 2 starts per tick (limits.max_starts_per_tick).
     five = [cand("e", 3), cand("d", 1, "2026-10-03"), cand("c", 1, "2026-10-02"), cand("b", 2), cand("a", 0)]
     assert keys(plan(five)) == [("a", "dispatch attempt=1"), ("c", "dispatch attempt=1")], keys(plan(five))
@@ -1647,6 +1660,10 @@ def w14_plan_test():
     why = {a["item"]: a.get("detail") for a in out}
     assert "Files" in why["nf"] and "Done when" in why["nd"] and "allowlist" in why["bu"], why
     assert keys(plan([budgeted])) == [("bu", "dispatch attempt=1")]  # a valid budget passes
+
+    def tracker_down(bid):
+        raise ledger.LedgerError("br show: no answer in 30s")
+    assert plan([budgeted], check=tracker_down) == []  # not a verdict on the bead: wait, no reject
     # Files in use by an in_progress bead or a running session's bead: wait, no reject; and within one tick.
     busy = {"w": dict(mine("w"), description=body.format(f="a"))}
     assert plan([cand("a")], busy) == []
@@ -1654,6 +1671,8 @@ def w14_plan_test():
     assert keys(plan([cand("a")], ended)) == [("a", "dispatch attempt=1")]
     assert plan([cand("a")], ended, [{"bead": "w", "alive": True}]) == []
     assert keys(plan([cand("x", files="same"), cand("y", files="same")])) == [("x", "dispatch attempt=1")]
+    mixed = {"w": dict(mine("w"), description="Files:\n- ~/dotfiles/iar/a.py\n")}  # same file, other spelling
+    assert plan([cand("a")], mixed) == []
     # Over limits.max_attempts: rejected and quarantined, not dispatched.
     att = lambda k: (f"attempt: {k} session: s{k} slot: /s branch: b brief: /b dispatch: auto", ago(9999))
     out = plan([cand("ol", comments=[att(1), att(2), att(3)])])

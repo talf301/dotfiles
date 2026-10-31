@@ -96,18 +96,28 @@ def thread_links(inbox, inbox_url):
             if (m := BEAD_RE.match(t.get("subject") or ""))}
 
 
-def desired(beads, links):
-    """{bead id: {title, state, label, description, fp}} for the beads to mirror (with comments, deps, parent)."""
-    asked = {question.parse_body(b.get("description")).get("asking") for b in beads
-             if b["status"] != "closed" and "question" in (b.get("labels") or [])}
-    parents = {b.get("parent") for b in beads} - {None}
-    out = {}
+def desired(beads, links, inbox_url="", epics=None):
+    """{bead id: {title, state, label, description, fp}} for the beads to mirror (with comments, deps, parent).
+    epics: {bead id: its top ancestor} (scope() fills it); default: the parent. The label is that epic, and an
+    epic with mirrored children gets its own label. A question bead shows its question and its own Inbox thread."""
+    epics = epics or {b["id"]: b["parent"] for b in beads if b.get("parent")}
+    asked, roots, texts, out = set(), set(epics.values()), {}, {}
     for b in beads:
-        body = "\n".join(x for x in (summary(b.get("description")), f"Inbox: {links[b['id']]}" if b["id"] in links
-                                     else "") if x)
+        if "question" in (b.get("labels") or []):
+            f = question.parse_body(b.get("description"))
+            if b["status"] != "closed":
+                asked.add(f.get("asking"))
+            text = f.get("question") or ""
+            if (f.get("inbox_thread") or "").startswith("msg_"):
+                links = {**links, b["id"]: f"{inbox_url}#thread={f['inbox_thread']}"}
+        else:
+            text = summary(b.get("description"))
+        texts[b["id"]] = text
+    for b in beads:
+        body = "\n".join(x for x in (texts[b["id"]], f"Inbox: {links[b['id']]}" if b["id"] in links else "") if x)
         fp = hashlib.sha1(f"{b['id']}\n{body}".encode()).hexdigest()[:8]
         out[b["id"]] = {"title": b["title"][:255], "state": state_of(b, asked), "fp": fp,
-                        "label": b.get("parent") or (b["id"] if b["id"] in parents else None),
+                        "label": epics.get(b["id"]) or (b["id"] if b["id"] in roots else None),
                         "description": f"{body}\n\nBead: {b['id']} (v{fp})".lstrip()}
     return out
 
@@ -290,6 +300,22 @@ def scope(remote_beads):
     return [{**b, "close_reason": b.get("close_reason") or close.get(b["id"])} for b in beads]
 
 
+def epics_of(beads):
+    """{bead id: its top ancestor} for beads with a parent; fetches ancestors that are not in `beads` (closed)."""
+    parent = {b["id"]: b.get("parent") for b in beads}
+    while missing := sorted({p for p in parent.values() if p and p not in parent}):
+        parent.update({b["id"]: b.get("parent") for b in ledger.show_many(missing)})
+    out = {}
+    for bid, p in parent.items():
+        seen = {bid}
+        while p and parent.get(p) and parent[p] not in seen:  # a cycle stops the walk
+            seen.add(p)
+            p = parent[p]
+        if p:
+            out[bid] = p
+    return {b["id"]: out[b["id"]] for b in beads if b["id"] in out}
+
+
 def offline(issues_with_comments):
     """remote as known from `linear:` bead comments alone (no Linear read)."""
     out = {}
@@ -339,7 +365,7 @@ def run(dry_run, inbox=(), inbox_url="", client=None):
         remote = remote or offline(beads)
         if not dry_run and (missing := set(STATES) - set(remote["states"])):
             raise LinearError(f"team TAL has no state {sorted(missing)}")
-        writes = plan(desired(beads, thread_links(inbox, inbox_url)), remote,
+        writes = plan(desired(beads, thread_links(inbox, inbox_url), inbox_url, epics_of(beads)), remote,
                       {b["id"]: [c.get("text") or "" for c in b.get("comments") or []] for b in beads})
         out["writes"] = [brief(w) for w in writes]
         if not dry_run:
@@ -445,12 +471,14 @@ def self_test():
             a = ledger.create("Ready child", type="task", parent=epic["id"])
             b = ledger.create("Blocked child", type="task", parent=epic["id"])
             ledger.dep(b["id"], a["id"])
+            sub = ledger.create("Nested", type="task", parent=b["id"])
             c = ledger.create("Working", type="task", status="in_progress")
-            q = ledger.create("Q about c", labels=["question"], description=f"asking: {c['id']}\nquestion: ok?")
+            q = ledger.create("Q about c", labels=["question"],
+                              description=f"question: ok?\nasking: {c['id']}\ninbox_thread: msg_Q1\n\nlong context")
             old = ledger.create("Closed before", type="task")
             ledger.close(old["id"], reason="done")
             inbox = [{"id": "th1", "subject": f"{c['id']}: integrate?", "last_at": "2026-10-30T00:00:00Z"}]
-            mine = {epic["id"], a["id"], b["id"], c["id"], q["id"]}
+            mine = {epic["id"], a["id"], b["id"], sub["id"], c["id"], q["id"]}
 
             # Dry run with no credentials: plans from bead comments, writes nothing anywhere.
             def no_keychain():
@@ -461,17 +489,19 @@ def self_test():
             assert sorted(r["writes"]) == sorted([f"label {epic['id']}"] + [
                 f"create {epic['id']} [Todo] Epic", f"create {a['id']} [Todo] Ready child",
                 f"create {b['id']} [Backlog] Blocked child", f"create {c['id']} [In Review] Working",
+                f"create {sub['id']} [Todo] Nested",
                 f"create {q['id']} [In Review] Q about c"]), r
             assert not calls and not team_issues
 
             # Live run: one issue per bead, the label, a `linear:` comment on each bead.
             credentials = lambda: ("cid", "sec")
             r = run(False, inbox, "http://inbox/")
-            assert r["error"] is None and len(r["done"]) == 6, r
-            assert len(team_issues) == 5 and labels == {epic["id"]: f"lb-{epic['id']}"}
+            assert r["error"] is None and len(r["done"]) == 7, r
+            assert len(team_issues) == 6 and labels == {epic["id"]: f"lb-{epic['id']}"}
             got = {MARK_RE.search(i["description"])[1]: i for i in team_issues}
             assert set(got) == mine
-            assert got[a["id"]]["labels"] == [epic["id"]] and got[epic["id"]]["labels"] == [epic["id"]]
+            assert got[a["id"]]["labels"] == got[sub["id"]]["labels"] == got[epic["id"]]["labels"] == [epic["id"]]
+            assert got[q["id"]]["description"].startswith("ok?\nInbox: http://inbox/#thread=msg_Q1\n\nBead: ")
             assert got[epic["id"]]["description"].startswith("The epic goal. Second line.\n\nBead: ")
             assert "Inbox: http://inbox/#thread=th1\n" in got[c["id"]]["description"]
             for bid in mine:
@@ -482,8 +512,8 @@ def self_test():
             n = len(calls)
             r = run(False, inbox, "http://inbox/")
             assert r == {"writes": [], "error": None, "done": []}, r
-            assert len(team_issues) == 5 and set(calls[n:]) == {"query states", "query labels", "query issues"}
-            assert calls[n:].count("query issues") == 3, calls[n:]  # 5 issues, pages of 2
+            assert len(team_issues) == 6 and set(calls[n:]) == {"query states", "query labels", "query issues"}
+            assert calls[n:].count("query issues") == 3, calls[n:]  # 6 issues, pages of 2
 
             # Closed bead -> Done; closed as superseded -> Canceled; the unblocked open bead -> Todo.
             ledger.close(a["id"], reason="integrated into u/tfriedman/pr/x at abc")
@@ -493,8 +523,9 @@ def self_test():
             assert {i["identifier"]: i["state"] for i in team_issues} == {
                 got[epic["id"]]["identifier"]: "Todo", got[a["id"]]["identifier"]: "Done",
                 got[b["id"]]["identifier"]: "Todo", got[c["id"]]["identifier"]: "In Progress",
+                got[sub["id"]]["identifier"]: "Todo",
                 got[q["id"]]["identifier"]: "Canceled"}, team_issues
-            assert len(team_issues) == 5 and run(False, inbox, "http://inbox/")["writes"] == []
+            assert len(team_issues) == 6 and run(False, inbox, "http://inbox/")["writes"] == []
 
             # A crash after create, before the bead comment: the rerun writes the comment, not a second issue.
             d = ledger.create("Crashed", type="task")
@@ -504,7 +535,7 @@ def self_test():
                                                        {})[d["id"]]["description"]})
             r = run(False, inbox, "http://inbox/")
             assert r["done"] == [f"comment {d['id']} linear: TAL-99 https://linear.app/x/TAL-99"], r
-            assert len(team_issues) == 6
+            assert len(team_issues) == 7
 
             # Linear answers success: false: an error, not done; the rerun tries again.
             ledger.update(d["id"], title="Refused")

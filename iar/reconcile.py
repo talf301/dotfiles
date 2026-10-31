@@ -612,7 +612,7 @@ def classify_bead(bid, b, snap, now, stall_after, sessions, leases, threads, lim
         due = [f"{'timeout' if q.get('reversible') == 'yes' else 'reping'} q={q['id']}" for q in qs
                if "answered" not in q["labels"] and q.get("gated") == "no" and q.get("deadline")
                and question.parse_time(q["deadline"]) <= now
-               and (q.get("reversible") == "yes" or "inbox:pending" not in q["labels"])]  # reping needs a thread
+               and "inbox:pending" not in q["labels"]]  # not before Tal could see it: inbox-pending posts it first
         if [k for k in due if k not in done_keys(b)]:
             return "question-deadline", due
         if s and not working and malformed(s, qs):
@@ -1519,11 +1519,16 @@ def w13_test():
             # E5, part 1: the Inbox is down when the question is asked and at the next tick.
             ip = asking("inbox down")
             os.environ["IAR_INBOX_CMD"] = "false"
-            # Not reversible and past its deadline: its reping waits for the post (it needs a thread).
+            # Not reversible and past its deadline: its reping waits for the post.
             rc, qip = ask(ip, "Post me later?", deadline=past, reversible="no",
                           more=["--project", "/inbox/other", "--thread", "my thread"])
             assert rc == 3 and "inbox:pending" in ledger.show(qip)["labels"], rc
-            assert run() == [(ip, "post-question", "error: RuntimeError: Inbox gave no answer (exit 1): ")], run
+            # Reversible and past its deadline: no timeout before Tal could see it; the post comes first.
+            ir = asking("inbox down, reversible")
+            qir = ask(ir, "Time me out only once posted?", deadline=past)[1]
+            down = "error: RuntimeError: Inbox gave no answer (exit 1): "
+            assert run() == sorted([(ip, "post-question", down), (ir, "post-question", down)])
+            assert not question.answers(ledger.show(qir))
             os.environ["IAR_INBOX_CMD"] = fake
 
             ap = asking("E4: answer from the Inbox, two attempts, the asking session stopped", n=2)
@@ -1554,7 +1559,7 @@ def w13_test():
             assert run() == sorted([
                 (ip, "post-question", "done"), (ap, "import-answer", "done"), (hw, "import-answer", "done"),
                 (to, "timeout", "done"), (td, "timeout", "done"), (rv, "reping", "done"),
-                (mq, "flag-malformed", "done")])
+                (mq, "flag-malformed", "done"), (ir, "post-question", "done")])
             # E5: posted once, later; the thread id is written back.
             assert [s for s in sent()[posted:] if s[0].startswith(qip)] and "inbox:pending" not in ledger.show(qip)["labels"]
             assert question.parse_body(ledger.show(qip)["description"])["inbox_thread"] == "msg_T1"
@@ -1570,7 +1575,8 @@ def w13_test():
 
             assert run() == sorted([
                 (ap, "deliver-answer", "done"), (hw, "deliver-answer", "done"), (to, "import-answer", "done"),
-                (to, "deliver-answer", "done"), (td, "deliver-answer", "done"), (ip, "reping", "done")])
+                (to, "deliver-answer", "done"), (td, "deliver-answer", "done"), (ip, "reping", "done"),
+                (ir, "timeout", "done")])
             with open(log) as f:  # the reping goes to the project the question was posted to
                 call = [json.loads(x) for x in f.read().splitlines() if f"reping-{qip}" in x][0]["params"]["arguments"]
             assert call["reply_to"] == "msg_T1" and call["project_path"] == "/inbox/other", call
@@ -1587,11 +1593,12 @@ def w13_test():
             assert sum("(timeout)" in x for x in texts(qto)) == 1 and not any("(timeout)" in x for x in texts(qhw))
             assert question.effective_answer(ledger.show(qto))["text"] == "Drop"
 
+            assert run() == [(ir, "deliver-answer", "done")]
             # Nothing left: each action ran once. E3b: the gated question never timed out; the external bead got no
             # import or delivery.
             n_sent = len(sent())
             assert run() == [] and run() == [] and len(sent()) == n_sent
-            assert len([c for c in calls if c[0] == "resume"]) == 4
+            assert len([c for c in calls if c[0] == "resume"]) == 5
             assert ledger.show(qgt)["status"] == "open" and not question.answers(ledger.show(qgt))
             try:
                 question.answer(qgt, "", timeout=True)

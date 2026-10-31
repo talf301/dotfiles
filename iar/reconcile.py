@@ -598,13 +598,14 @@ def classify_bead(bid, b, snap, now, stall_after, sessions, leases, threads, lim
         qs = [q for q in snap["questions"] if q.get("asking") == bid]
         # W13: import Tal's Inbox answer through iar/answer, then deliver the recorded answer to the latest attempt.
         keys = [f"import-answer q={q['id']}" for q in qs if q["id"] in snap.get("inbox_answers", {})]
-        keys += [f"deliver-answer q={q['id']} {a}" for q in qs
-                 if "answered" in q["labels"] and "delivered" not in q["labels"]]
+        # Open until closed: a crash between the `delivered` label and the close leaves it here, and the act closes it.
+        keys += [f"deliver-answer q={q['id']} {a}" for q in qs if "answered" in q["labels"]]
         if [k for k in keys if k not in done_keys(b)]:
             return "answer-pending", keys
         due = [f"{'timeout' if q.get('reversible') == 'yes' else 'reping'} q={q['id']}" for q in qs
                if "answered" not in q["labels"] and q.get("gated") == "no" and q.get("deadline")
-               and question.parse_time(q["deadline"]) <= now]
+               and question.parse_time(q["deadline"]) <= now
+               and (q.get("reversible") == "yes" or "inbox:pending" not in q["labels"])]  # reping needs a thread
         if [k for k in due if k not in done_keys(b)]:
             return "question-deadline", due
         if s and not working and (s.get("last_message") or "").startswith("QUESTION:") \
@@ -1082,8 +1083,8 @@ def imported(a, snap):
 
 def act_deliver(a, snap):
     """Send the recorded answer to the attempt's session (resumed if stopped), check that its transcript has the new
-    turn, then label the question `delivered` and close it. A crash after the send: the turn is in the transcript, so
-    the retry does not send again."""
+    turn, then label the question `delivered` and close it. A crash after the send: the turn is in the transcript (or
+    the label is set), so the retry does not send again."""
     qid = key_field(a, "q")
     q = ledger.show(qid)
     ans = question.effective_answer(q)
@@ -1092,7 +1093,7 @@ def act_deliver(a, snap):
     text = answer_text(qid, q, ans)
     att, s = session_of(a, snap)
     since = started_at(a)
-    if not got_since(att["session"], text, since):
+    if "delivered" not in (q.get("labels") or []) and not got_since(att["session"], text, since):
         if running(s):
             save_output(a, s)  # send() stops a running session first
         send(s or {"sessionId": att["session"]}, att["slot"], text)
@@ -1508,7 +1509,8 @@ def w13_test():
             # E5, part 1: the Inbox is down when the question is asked and at the next tick.
             ip = asking("inbox down")
             os.environ["IAR_INBOX_CMD"] = "false"
-            rc, qip = ask(ip, "Post me later?")
+            # Not reversible and past its deadline: its reping waits for the post (it needs a thread).
+            rc, qip = ask(ip, "Post me later?", deadline=past, reversible="no")
             assert rc == 3 and "inbox:pending" in ledger.show(qip)["labels"], rc
             assert run() == [(ip, "post-question", "error: RuntimeError: Inbox gave no answer (exit 1): ")], run
             os.environ["IAR_INBOX_CMD"] = fake
@@ -1554,7 +1556,8 @@ def w13_test():
 
             assert run() == sorted([
                 (ap, "deliver-answer", "done"), (hw, "deliver-answer", "done"), (to, "import-answer", "done"),
-                (to, "deliver-answer", "done"), (td, "deliver-answer", "done")])
+                (to, "deliver-answer", "done"), (td, "deliver-answer", "done"), (ip, "reping", "done")])
+            assert [s for s in sent() if s[0] == "msg_T1" and qip in s[1]]
             resumes = {c[1]: c[2] for c in calls if c[0] == "resume"}
             assert sorted(resumes) == sorted([f"s-{ap}-2", f"s-{hw}-1", f"s-{to}-1", f"s-{td}-1"]), resumes  # E4: attempt 2
             assert resumes[f"s-{ap}-2"].startswith(f"ANSWER {qap}: Keep\n"), resumes
@@ -1580,6 +1583,26 @@ def w13_test():
             except ValueError:
                 pass
             assert not question.answers(ledger.show(qex)) and texts(ex) == [texts(ex)[0]]
+
+            # A crash between the `delivered` label and the close: the next tick closes it and does not send again
+            # (the transcript is gone here, so only the label tells).
+            cr = asking("crash after the delivered label")
+            qcr = ask(cr, "Crash?")[1]
+            question.answer(qcr, "Drop")
+            real_close = ledger.close
+
+            def close_fails(*args, **kw):
+                ledger.close = real_close
+                raise ledger.LedgerError("close failed")
+            ledger.close = close_fails
+            try:
+                assert run() == [(cr, "deliver-answer", "error: LedgerError: close failed")]
+            finally:
+                ledger.close = real_close
+            assert "delivered" in ledger.show(qcr)["labels"] and ledger.show(qcr)["status"] == "open"
+            os.remove(os.path.join(tdir, f"s-{cr}-1.jsonl"))
+            assert run() == [(cr, "deliver-answer", "done")] and ledger.show(qcr)["status"] == "closed"
+            assert [c[1] for c in calls if c[0] == "resume"].count(f"s-{cr}-1") == 1 and run() == []
 
             # inbox_answers: drafts (no sent reply) and skips with no reply are not answers; a note rides along.
             q = lambda **kw: {"message_id": "m", "position": 0, "picked_at": "t", "sent_reply_id": "r", **kw}

@@ -44,7 +44,8 @@ Actions are in EXECUTORS by verb; a verb with no executor is skipped. W12 (house
   ineligible-running  the bead was closed (once its session finished the turn) or deferred, or lost `auto` (only
                       attempts marked `dispatch: auto`): stop-session, verified; the worktree stays and
                       stale-lease returns the slot after the preflight
-A flag is a `reconcile-note: <key>` comment. Before flag-stalled, quarantine or stop-session, the tick saves the
+A flag is a `reconcile-note: <key>` comment. Before a nudge that stops a running session, flag-stalled, quarantine
+or stop-session, the tick saves the
 last 40 lines of the session's final assistant text (`last-output: <key>`).
 A nudge is `claude --bg --resume <sid> <text>`. That CLI starts a copy when the session process runs, so a running
 session is stopped first (verified); conversation, attempt, slot and branch stay (Inbox msg_01M67Q4XVNNV1H27VZA6YGZVXT).
@@ -107,9 +108,9 @@ def left():
     return remaining
 
 
-def sh(cmd, cwd=None, check=True):
+def sh(cmd, cwd=None, check=True, input=None):
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=left(), cwd=cwd)
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=left(), cwd=cwd, input=input)
     except (OSError, subprocess.TimeoutExpired) as e:
         raise SourceError(f"{os.path.basename(cmd[0])}: {e}")
     if check and p.returncode != 0:
@@ -395,10 +396,16 @@ def branch_state(slot, branch):
 
 
 def slot_state(path):
-    """Release preflight git checks: uncommitted or untracked files; a local branch with commits no origin branch
-    has (remote-tracking refs, no fetch: a stale ref can only make the check fail)."""
-    dirty = sh(["/usr/bin/git", "-C", path, "status", "--porcelain"])
-    unpushed = sh(["/usr/bin/git", "-C", path, "rev-list", "--max-count=1", "--branches", "--not", "--remotes=origin"])
+    """Release preflight git checks: uncommitted or untracked files; a local branch with commits that no current
+    origin branch has. Origin heads come from `git ls-remote` (not cached remote-tracking refs, which may name a
+    deleted or rewritten branch); a head not in the local object store cannot cover a local commit."""
+    git = ["/usr/bin/git", "-C", path]
+    dirty = sh([*git, "status", "--porcelain"])
+    heads = "\n".join(line.split()[0] for line in sh([*git, "ls-remote", "--heads", "origin"]).splitlines() if line.strip())
+    known = [line.split()[0] for line in sh([*git, "cat-file", "--batch-check"], input=heads + "\n").splitlines()
+             if line.split()[1:2] == ["commit"]]
+    # `--not` does not reach revisions read from --stdin: each one gets its own ^
+    unpushed = sh([*git, "rev-list", "--max-count=1", "--branches", "--stdin"], input="".join(f"^{x}\n" for x in known))
     return {"dirty": bool(dirty.strip()), "unpushed": bool(unpushed.strip())}
 
 
@@ -879,6 +886,8 @@ def act_nudge(text):
     def act(a, snap):
         att, s = session_of(a, snap)
         msg = text.format(limit=key_field(a, "limit")) if "{limit}" in text else text
+        if running(s):
+            save_output(a, s)  # send() stops a running session first
         send(s, att["slot"], msg)
         note(a, f"Sent session {att['session']}: {msg}")
     return act
@@ -1279,7 +1288,7 @@ def w12_executor_test():
     race = {"slot": None}
     real_sh, real_inbox = sh, inbox
 
-    def fake_sh(cmd, cwd=None, check=True):
+    def fake_sh(cmd, cwd=None, check=True, input=None):
         tool, args = os.path.basename(cmd[0]), cmd[1:]
         if tool == "claude" and args[0] == "agents":
             return json.dumps([{k: v for k, v in r.items() if k not in ("transcript_at", "cpu_active", "last_output",
@@ -1299,7 +1308,7 @@ def w12_executor_test():
             calls.append(("return", args[1], args[4]))
             slots[:] = [x for x in slots if x["path"] != args[1]]
             return ""
-        return real_sh(cmd, cwd, check)
+        return real_sh(cmd, cwd, check, input)
 
     def fake_inbox(tool, args):
         calls.append((tool, args.get("reply_to") or args.get("message_id"), args.get("body")))
@@ -1377,6 +1386,8 @@ def w12_executor_test():
             dirty = bead("closed dirty", status="closed", slot=clone("dirty", "b-x", dirty=True), lease="2")
             unp = bead("closed unpushed", status="closed", slot=clone("unp", "b-y", unpushed=True), lease="3")
             rc = bead("closed race", status="closed", slot=clone("race", "b-z"), lease="4")
+            gone = bead("closed, remote branch deleted", status="closed", slot=clone("gone", "b-gone"), lease="6")
+            git("push", "-q", "origin", "--delete", "b-gone", cwd=f"{d}/seed")  # gone's origin/b-gone ref is stale
             race["slot"] = f"{d}/race"
             st = bead("stalled", session={"state": "working", "pid": 1, "transcript_at": old, "cpu_active": False})
             ol = bead("over limit again", session={"state": "working", "pid": 1, "transcript_at": now.isoformat()},
@@ -1391,7 +1402,7 @@ def w12_executor_test():
             first = run()
             assert sorted(first) == sorted([
                 (zp, "release", "done"), (zf, "flag-zombie", "done"), (ok, "return-lease", "done"),
-                (dirty, "flag-lease", "done"), (unp, "flag-lease", "done"),
+                (dirty, "flag-lease", "done"), (unp, "flag-lease", "done"), (gone, "flag-lease", "done"),
                 (rc, "return-lease", "error: RuntimeError: release preflight failed: worktree not clean"),
                 (st, "nudge", "done"), (ol, "quarantine", "done"), (tk, "limit-nudge", "done"),
                 (df, "stop-session", "done")]), first
@@ -1399,9 +1410,10 @@ def w12_executor_test():
             z = ledger.show(zp)
             assert z["status"] == "open" and not z.get("assignee"), z
             assert any(f"claude --resume s-{zf}" in x for x in texts(zf)), texts(zf)
-            assert [x["slot"] for x in slots] == ["2", "3", "4"]  # E10: dirty, unpushed and late-dirty slots stay
+            assert [x["slot"] for x in slots] == ["2", "3", "4", "6"]  # E10: dirty, unpushed, late-dirty, stale-ref slots stay
             assert any("local commits missing from origin" in x for x in texts(unp))
             assert ("stop", f"s-{st}") in calls and ("resume", f"s-{st}", "status?") in calls
+            assert any(x.startswith("last-output: nudge attempt=1") for x in texts(st))
             assert ledger.show(ol)["labels"] and {QUARANTINE, "needs-human"} <= set(ledger.show(ol)["labels"])
             assert any(x.startswith("last-output: quarantine attempt=1") and f"final words of {ol}" in x for x in texts(ol))
             assert any(c[0] == "resume" and c[1] == f"s-{tk}" and "tokens limit" in c[2] for c in calls), calls
@@ -1422,10 +1434,10 @@ def w12_executor_test():
             assert sum(c[0] == "stop" for c in calls) == stops  # no automatic kill
             assert any(x.startswith("last-output: flag-stalled") for x in texts(st))
             # Idempotency: nothing left to do, and no comment written.
-            count = {b: len(texts(b)) for b in (zp, zf, ok, dirty, unp, rc, st, ol, tk, df)}
+            count = {b: len(texts(b)) for b in (zp, zf, ok, dirty, unp, rc, gone, st, ol, tk, df)}
             assert run() == [] and run() == []
             assert {b: len(texts(b)) for b in count} == count
-            assert [x["slot"] for x in slots] == ["2", "3", "4"] and sum(c[0] == "stop" for c in calls) == stops
+            assert [x["slot"] for x in slots] == ["2", "3", "4", "6"] and sum(c[0] == "stop" for c in calls) == stops
         finally:
             g["sh"], g["inbox"] = real_sh, real_inbox
             for k, v in saved_env.items():

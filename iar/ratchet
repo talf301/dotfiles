@@ -12,8 +12,8 @@ SETTINGS defaults to ~/.claude/settings.json; --denials to $IAR_STATE_DIR/denial
 - Timeouts: `answer: <default> (timeout)` on question beads, same window.
 - Top denials: the 5 most denied rules in the window.
 - Suggested allow rules: every rule denied 3 or more times (whole log) that SETTINGS does not
-  allow yet. A rule for a gated command (iar/gate-hook.py) or a shell/eval wrapper is never
-  suggested. Numbers follow the time a rule reached 3 denials, so new denials do not renumber
+  allow yet. Never suggested: a rule that could cover a gated, outward-facing or irreversible
+  action (gate-hook.py, NEVER, RISKY_SUB), a one-word Bash rule, MCP and write tools. Numbers follow the time a rule reached 3 denials, so new denials do not renumber
   older suggestions; applying one removes it and the later numbers move up by one.
 --apply adds the rule to permissions.allow, or with --auto a prose entry to autoMode.allow
 (seeded with "$defaults" when the list is new). It writes through a symlink, never replaces it.
@@ -68,27 +68,48 @@ def read_denials(path):
     return out
 
 
-def rule_for(d):
-    """The allow rule a denial suggests, or None when no safe rule exists."""
-    tool, inp = d.get("tool_name") or "", d.get("tool_input") or {}
-    if tool == "Bash":
-        cmd = inp.get("command", "")
-        if gate.check(cmd):
-            return None  # gated: Tal approves each time, never a standing rule
-        for seg in gate.segments(gate.tokenize(cmd)):
-            argv = gate.strip_wrappers(seg)
-            if not argv or argv[0] == "cd":
-                continue
-            if os.path.basename(argv[0]) in gate.SHELLS | {"eval"}:
-                return None
-            words = argv[:2] if len(argv) > 1 and SUBCOMMAND.match(argv[1]) else argv[:1]
-            return f"Bash({' '.join(words)} *)"
-        return None
+# Never suggested: rules that could cover a gated, outward-facing or irreversible action
+# (iar/autonomy.md). ponytail: fixed lists; extend them when a new risky CLI shows up in denials.
+NEVER = gate.SHELLS | set(gate.GATED) | {
+    "eval", "exec", "source", ".", "gh", "aws", "curl", "wget", "http", "xh", "ssh",
+    "scp", "rsync", "rm", "dd", "kubectl", "helm", "docker", "op", "security"}
+RISKY_SUB = {"git": {"push", "reset", "clean", "branch", "tag", "rebase", "filter-branch",
+                     "filter-repo", "update-ref", "gc", "prune", "reflog", "stash", "checkout",
+                     "switch", "restore", "rm", "worktree", "remote", "config", "send-email"}}
+SAFE_TOOLS = {"WebSearch", "Read", "Glob", "Grep"}  # read-only; no rule for MCP or write tools
+
+
+def pattern(d):
+    """(key, safe): the rule a denial points at, and whether it may be suggested.
+
+    A Bash rule names a program and a subcommand (`Bash(npm test *)`); a one-word rule is too
+    broad. A command is unsafe when any of its segments is gated or risky."""
+    tool, inp = d.get("tool_name") or "?", d.get("tool_input") or {}
     if tool == "WebFetch":
         host = urlparse(inp.get("url", "")).hostname
-        return f"WebFetch(domain:{host})" if host else None
-    # ponytail: whole tool for other tools; path-scoped rules if file-tool denials repeat.
-    return tool or None
+        return (f"WebFetch(domain:{host})", True) if host else ("WebFetch", False)
+    if tool != "Bash":
+        return tool, tool in SAFE_TOOLS
+    cmd = inp.get("command", "")
+    key, safe = None, not gate.check(cmd)  # gated: Tal approves each time, never a standing rule
+    for seg in gate.segments(gate.tokenize(cmd)):
+        argv = gate.strip_wrappers(seg)
+        if not argv or argv[0] == "cd":
+            continue
+        prog = os.path.basename(argv[0])
+        sub = argv[1] if len(argv) > 1 and SUBCOMMAND.match(argv[1]) else None
+        if prog in NEVER or sub in RISKY_SUB.get(prog, ()) or (prog in RISKY_SUB and not sub):
+            safe = False
+        if key is None:
+            key = f"Bash({argv[0]} {sub} *)" if sub else f"Bash({argv[0]} *)"
+            safe = safe and sub is not None
+    return key or "Bash", safe and key is not None
+
+
+def rule_for(d):
+    """The allow rule a denial suggests, or None when no safe rule exists."""
+    key, safe = pattern(d)
+    return key if safe else None
 
 
 def sample(d):
@@ -161,7 +182,8 @@ def section(now, denials_path, settings_path):
     examples = {}
     for d in denials:
         if start <= d["at"] <= now:
-            key = rule_for(d) or f"{d.get('tool_name')} (no rule)"
+            key, safe = pattern(d)
+            key += "" if safe else " (never suggested)"
             recent[key] += 1
             examples[key] = sample(d)
     lines.append("Top denials:")
@@ -274,27 +296,31 @@ def self_test():
             want = [
                 "Decisions (decision:auto):", f"- {a} asking bead: decision: keep the old port",
                 "Timeouts:", f"- {q} Q(x): drop the cache? -> Keep (timeout)",
-                "Top denials:", "- 4x Bash(git push *)", "x Bash (no rule)  e.g. `aws ec2 run-instances",
-                "Suggested allow rules", "1. Bash(git push *)  (4 denials",
+                "Top denials:", "- 4x Bash(git fetch *)  e.g.",
+                "x Bash(aws ec2 *) (never suggested)  e.g. `aws ec2 run-instances",
+                "x mcp__claude_ai_Slack__slack_send_message (never suggested)",
+                "Suggested allow rules", "1. Bash(git fetch *)  (4 denials",
                 "2. Bash(npm test *)  (3 denials", "3. WebFetch(domain:docs.example.com)",
             ]
             for w in want:
                 assert w in out, f"missing {w!r}"
-            assert rc == 0 and "4. " not in out and "Q(y)" not in out and "unrelated" not in out
-            assert "run-instances" in out and "Bash(aws" not in out, "gated command suggested"
-            assert "Bash(bash *)" not in out and "Bash(cd" not in out
+            assert rc == 0 and "Q(y)" not in out and "unrelated" not in out
+            sug = out.split("Suggested allow rules")[1]
+            assert "4. " not in sug, "risky rule suggested: " + sug
+            for bad in ("push", "gh ", "aws", "Bash(git *)", "Bash(bash", "mcp__", "other.example"):
+                assert bad not in sug, f"suggested {bad!r}"
 
             assert run("--now", question.iso(now + 2 * WINDOW), "--denials", denials,
                        "--settings", link)[1].count("- none") == 3
             assert run("--apply", "9", link, "--denials", denials)[0] != 0
             rc, out = run("--apply", "1", link, "--denials", denials)
-            assert rc == 0 and "applied Bash(git push *) -> permissions.allow" in out, out
+            assert rc == 0 and "applied Bash(git fetch *) -> permissions.allow" in out, out
             assert os.path.islink(link)
             with open(target) as fh:
                 s = json.load(fh)
-            assert s["permissions"]["allow"] == ["Read", "Bash(git push *)"], s
+            assert s["permissions"]["allow"] == ["Read", "Bash(git fetch *)"], s
             out = run("--denials", denials, "--settings", link)[1]
-            assert "1. Bash(npm test *)" in out and "Bash(git push *)  (" not in out, out
+            assert "1. Bash(npm test *)" in out and "Bash(git fetch *)  (" not in out, out
             rc, out = run("--apply", "1", "--auto", link, "--denials", denials)
             with open(target) as fh:
                 s = json.load(fh)

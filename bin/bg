@@ -2,13 +2,14 @@
 """bg: the single launch path for a background bead session (one attempt).
 
   bg <bead> --done-when CMD [--name "<bead>: <2-4 words>"]
-  bg <bead> --cwd DIR --prompt TEXT [--name ...]   session in a folder the caller holds
-  bg --new TITLE (--done-when CMD | --cwd DIR --prompt TEXT) [--name ...]
+  bg <bead> --cwd SLOT --prompt TEXT [--name ...]  session in a Precog slot the caller leases
+  bg --new TITLE (--done-when CMD | --cwd SLOT --prompt TEXT) [--name ...]
   bg --self-test
 
 --new is for non-bead work: it creates a task bead (label adhoc) first, then runs as above.
-With --cwd there is no lease and no brief: the session starts in DIR with TEXT as its prompt,
-and the attempt comment has `brief: none`.
+With --cwd there is no new lease and no brief: SLOT must be a leased treehouse slot of REPO
+(bin/bg stays Precog-only). The session starts in SLOT with TEXT (plus its bead id) as its
+prompt, and the attempt comment has `brief: none`.
 
 Steps, in order. If a step fails, bg undoes the earlier steps in reverse order and
 writes the bead comment `attempt-failed: <step> attempt=<n> <error>`:
@@ -139,8 +140,12 @@ def dispatch(bead, done_when, name=None, cwd=None, prompt=None):
     undo, a = [], {"attempt": n}  # undo: (label, fn) pairs, run in reverse
     step = "lease"
     try:
-        if cwd:  # the caller holds this folder: no lease to take or undo
+        if cwd:  # the caller leases this slot: no lease to take or undo
             a["slot"] = str(Path(cwd).resolve())
+            leased = [s["path"] for s in json.loads(sh(["treehouse", "status", "--json"], cwd=REPO))
+                      if s.get("lease_holder")]
+            if a["slot"] not in {str(Path(p).resolve()) for p in leased}:
+                raise StepError(f"--cwd {a['slot']} is not a leased treehouse slot of {REPO}")
         else:
             def unlease():  # finds the lease by holder, so it works when get's output is lost
                 for s in held_by(holder):
@@ -421,24 +426,27 @@ def self_test():
             # A claimed bead is refused before any side effect.
             assert quiet(b, "true") == 1 and len(leases()) == 1
 
-            # --cwd: a new adhoc bead runs in a folder the caller holds; no lease, no brief.
-            held = r / "held"
-            sh(["git", "clone", "-q", str(origin), str(held)])
-            sh(["claude", "--bg", "--name", "other", "x"], cwd=held)  # not ours: undo leaves it
+            # --cwd: a new adhoc bead runs in a slot the caller leases; no new lease, no brief.
             b = new_bead("adhoc ok", "do x")
+            assert quiet(b, None, "a: no", str(r), "do x") == 1  # not a leased slot
+            s = ledger.show(b)
+            assert s["status"] == "open" and "not a leased treehouse slot" in s["comments"][-1]["text"], s
+            out = sh(["treehouse", "get", "--lease", "--json", "--lease-holder", "agent:gnhf:t"])
+            held = Path(json.loads(out)["path"])
+            sh(["claude", "--bg", "--name", "other", "x"], cwd=held)  # not ours: undo leaves it
             os.environ["BG_FAULT_AFTER"] = "start"
             assert quiet(b, None, "a: fail", str(held), "do x") == 1
             assert [s["name"] for s in sessions() if s["cwd"] == str(held.resolve())] == ["other"]
-            assert ledger.show(b)["status"] == "open" and len(leases()) == 1
+            assert ledger.show(b)["status"] == "open" and len(leases()) == 2
             os.environ["BG_FAULT_AFTER"] = ""
             assert quiet(b, None, "a: ok", str(held), "do x") == 0
             s = ledger.show(b)
             assert s["labels"] == ["adhoc"] and s["description"] == "do x", s
             (sess,) = [x for x in sessions() if x["name"] == "a: ok"]
             assert sess["argv"][-1].startswith(f"do x\n\nYour bead: {b} ") and sess["cwd"] == str(held.resolve()), sess
-            assert s["comments"][-1]["text"] == (f"attempt: 2 session: {sess['sessionId']} slot: "
+            assert s["comments"][-1]["text"] == (f"attempt: 3 session: {sess['sessionId']} slot: "
                                                  f"{held.resolve()} branch: main brief: none"), s
-            assert s["assignee"] == f"agent:{b}#2" and len(leases()) == 1
+            assert s["assignee"] == f"agent:{b}#3" and len(leases()) == 2
         finally:
             for k, v in old.items():
                 if v is None:

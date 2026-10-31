@@ -26,9 +26,12 @@ malformed-question, stalled, zombie, stale-lease, closed-bead-thread, working, w
 An action is `reconcile: <action> <key>` on the bead; a key already in its comments is not proposed.
 
 Executor: for each proposed action, the tick reloads the switches (so --kill stops a running tick),
-re-reads the bead and skips a key already recorded. If the action's own effect is already visible
-(a crash after acting and before the comment), it writes the comment and does not act again.
-Else it acts, then writes the comment. An action fails alone: no comment, the next tick retries it.
+re-reads the bead and skips a key already recorded (`reconcile: <key>`). Before it acts, it labels the
+bead `reconcile-pending` and writes `reconcile-start: <class> <key>`; after, it writes `reconcile: <key>`
+and drops the label. A later tick fetches labelled beads and finishes each open intent: if the
+action's own effect is visible (a crash between acting and the comment), it writes the comment and
+does not act again; if not, and the action is no longer proposed, it writes `reconcile-dropped: <key>`.
+An action fails alone: no `reconcile:` comment, the next tick retries it.
 Actions are in EXECUTORS by verb (W12, W13); a verb with no executor is skipped.
 Exit 75: another tick holds $IAR_STATE_DIR/reconcile.lock.
 """
@@ -300,6 +303,7 @@ def src_br(snap):
         snap["questions"] = [{**question.parse_body(i.get("description")), "id": i["id"], "labels": i.get("labels") or []}
                              for i in issues if i["status"] == "open" and "question" in (i.get("labels") or [])]
         want = {i["id"] for i in snap["beads"]}
+        want |= {i["id"] for i in issues if "reconcile-pending" in (i.get("labels") or [])}  # open intents (W11)
         want |= {m[1] for s in snap["slots"] if (m := HOLDER_RE.match(s["holder"]))}
         want |= {m[1] for t in snap["inbox"] if (m := BEAD_RE.match(t["subject"]))}
         # A thread with another subject still belongs to the bead its author session is named after.
@@ -470,13 +474,43 @@ def classify(snap, now, stall_after_min=30):
 EXECUTORS = {}
 
 
+PENDING = "reconcile-pending"  # label: a reconcile-start: comment with no reconcile: comment yet
+
+
+def open_intents(issue):
+    """{key: class} of actions started (`reconcile-start: <class> <key>`) and not yet finished
+    (`reconcile: <key>`) or dropped (`reconcile-dropped: <key>`). Comments are read in order."""
+    started = {}
+    for c in issue.get("comments") or []:
+        verb, _, rest = (c.get("text") or "").partition(": ")
+        if verb == "reconcile-start":
+            cls, _, key = rest.strip().partition(" ")
+            started[key] = cls
+        elif verb in ("reconcile", "reconcile-dropped"):
+            started.pop(rest.strip(), None)
+    return started
+
+
+def finish(bid, text):
+    """Write the closing comment; drop the label when no intent of the bead is left open."""
+    ledger.comment(bid, text)
+    if not open_intents(ledger.show(bid)):
+        ledger.label(bid, remove=[PENDING])
+
+
 def execute(snap, actions, executors=None):
-    """Apply each action of a switched-on class once. Returns [{item, action, outcome}]."""
+    """Apply each action of a switched-on class once, and finish the open intents a crash left.
+    Returns [{item, action, outcome}]."""
     executors = EXECUTORS if executors is None else executors
     out = []
     if snap["errors"]:
         return out  # E8b: a failing tick does nothing
-    for a in actions:
+    work = [dict(a, proposed=True) for a in actions]
+    seen = {(a["item"], a["action"]) for a in actions}
+    for bid, b in sorted(snap["issues"].items()):
+        work += [{"item": bid, "class": cls, "action": key, "proposed": False}
+                 for key, cls in open_intents(b).items() if (bid, key) not in seen]
+    for a in work:
         def note(outcome):
             out.append({"item": a["item"], "action": a["action"], "outcome": outcome})
         try:
@@ -490,16 +524,27 @@ def execute(snap, actions, executors=None):
         if not ex:
             note("no-executor")
             continue
+        bid, key = a["item"], a["action"]
         try:
-            if a["action"] in done_keys(ledger.show(a["item"])):
+            fresh = ledger.show(bid)
+            if key in done_keys(fresh):
                 note("recorded")
                 continue
             visible, act = ex
-            recovered = visible(a, snap)
-            if not recovered:
-                act(a, snap)
-            ledger.comment(a["item"], f"reconcile: {a['action']}")
-            note("recovered" if recovered else "done")
+            if visible(a, snap):  # done before a crash, or not needed: record it, do not act again
+                finish(bid, f"reconcile: {key}")
+                note("recovered")
+                continue
+            if not a["proposed"]:  # started, no effect, and no longer wanted
+                finish(bid, f"reconcile-dropped: {key}")
+                note("dropped")
+                continue
+            if key not in open_intents(fresh):
+                ledger.label(bid, add=[PENDING])  # src_br fetches labelled beads, so a crash after act is found
+                ledger.comment(bid, f"reconcile-start: {a['class']} {key}")
+            act(a, snap)
+            finish(bid, f"reconcile: {key}")
+            note("done")
         except Exception as e:  # one failed action does not stop the others; no comment, so the next tick retries
             note(f"error: {type(e).__name__}: {e}")
     return out
@@ -720,7 +765,8 @@ def self_test():
     # src_br fetches a closed bead whose thread is linked only by its author session's name (session stopped).
     real = ledger.list_issues, ledger.show_many
     asked = []
-    ledger.list_issues = lambda status=None, labels=(): [{"id": "precog-cs", "status": "closed"}]
+    ledger.list_issues = lambda status=None, labels=(): [{"id": "precog-cs", "status": "closed"},
+                                                         {"id": "precog-pd", "status": "open", "labels": [PENDING]}]
     ledger.show_many = lambda ids: asked.extend(ids) or [bead("precog-cs", status="closed")]
     try:
         s = {**json.loads(json.dumps(DEFAULTS)), "session_names": {"s-precog-cs-1": "precog-cs: x"},  # stopped session
@@ -728,7 +774,7 @@ def self_test():
         src_br(s)
     finally:
         ledger.list_issues, ledger.show_many = real
-    assert asked == ["precog-cs"], asked
+    assert asked == ["precog-cs", "precog-pd"], asked  # precog-pd: an open intent
     # A malformed tracker answer is a source error: no class but source-error, no action.
     ledger.list_issues = lambda status=None, labels=(): [{"id": "precog-ap", "status": "in_progress"}]
     ledger.show_many = lambda ids: [{"id": "precog-ap", "comments": []}]  # no status
@@ -778,16 +824,20 @@ def executor_self_test(bead):
     store = {b["id"]: b for b in [bead("precog-sl", status="open", assignee=""),  # stale-lease: return-lease
                                   bead("precog-zm")]}                              # zombie: flag-zombie
     slots = [{"slot": "4", "holder": "agent:precog-sl#1"}]
-    returned, flagged, fail = [], [], {"comment": 0, "source": False}
+    returned, flagged, fail = [], [], {"comment": None, "source": False}
 
     def show(bid):
         return json.loads(json.dumps(store[bid]))
 
     def comment(bid, text, author=None):
-        if fail["comment"]:
-            fail["comment"] -= 1
+        if fail["comment"] and text.startswith(fail["comment"]):
+            fail["comment"] = None
             raise ledger.LedgerError("br comments failed (crash after the action)")
         store[bid]["comments"].append({"text": text})
+
+    def label(bid, add=(), remove=()):
+        labels = store[bid].setdefault("labels", [])
+        labels[:] = [x for x in labels if x not in remove] + [x for x in add if x not in labels]
 
     def treehouse(s):
         if fail["source"]:
@@ -796,37 +846,40 @@ def executor_self_test(bead):
     fakes = {"agents": lambda s: None, "treehouse": treehouse, "inbox": lambda s: None,
              "plannotator": lambda s: None, "git": lambda s: None,
              "br": lambda s: s.update(issues={k: show(k) for k in store})}
+    slot_of = lambda a: a["action"].split()[1][len("slot="):]
 
-    def act_return(a, snap):
+    def act_flag(a, snap):
         time.sleep(0.2)  # long enough for a concurrent tick to overlap
-        returned.append(a["action"].split()[1][len("slot="):])
-    executors = {"return-lease": (lambda a, snap: a["action"].split()[1][len("slot="):] in returned, act_return),
-                 "flag-zombie": (lambda a, snap: False, lambda a, snap: flagged.append(a["item"]))}
+        flagged.append(a["item"])
+    executors = {"return-lease": (lambda a, snap: slot_of(a) in returned, lambda a, snap: returned.append(slot_of(a))),
+                 "flag-zombie": (lambda a, snap: False, act_flag)}
+    texts = lambda bid: [c["text"] for c in store[bid]["comments"]]
 
-    real = ledger.show, ledger.comment
+    real = ledger.show, ledger.comment, ledger.label
     saved_env = {k: os.environ.get(k) for k in ("IAR_WORKFLOW", "BEADS_DIR")}
     with tempfile.TemporaryDirectory() as d:
         wf = os.path.join(d, "WORKFLOW.md")
         with open(os.path.join(IAR, "WORKFLOW.md")) as src, open(wf, "w") as dst:
             dst.write(src.read())
         os.environ.update(IAR_WORKFLOW=wf, BEADS_DIR=d)
-        ledger.show, ledger.comment = show, comment
+        ledger.show, ledger.comment, ledger.label = show, comment, label
         try:
             run = lambda: tick(d, False, fakes, executors)[1]["executed"]
             # Switches: all off -> nothing acts. --enable turns one class on; an unknown class fails.
             assert {x["outcome"] for x in run()} == {"off"} and not returned + flagged
-            assert set_switches("stale-lease")["stale-lease"] is True
             try:
                 set_switches("no-such-class")
                 raise AssertionError("set_switches accepted an unknown class")
             except workflow.WorkflowError:
                 pass
+            assert set_switches("zombie")["zombie"] is True and not workflow.load(wf)[0]["actions"]["stale-lease"]
             # E8b: a failing tick does nothing; the next healthy tick does each pending action once.
             fail["source"] = True
-            assert run() == [] and not returned
+            assert run() == [] and not flagged
             fail["source"] = False
             # E6: two ticks started at the same time do one action.
             start, codes = threading.Barrier(2), []
+
             def racer():
                 start.wait()
                 codes.append(tick(d, False, fakes, executors)[0])
@@ -835,31 +888,42 @@ def executor_self_test(bead):
                 th.start()
             for th in threads:
                 th.join()
-            assert returned == ["4"] and 0 in codes, (returned, codes)
-            assert [c["text"] for c in store["precog-sl"]["comments"]].count(
-                "reconcile: return-lease slot=4 holder=agent:precog-sl#1") == 1
-            assert run() == [{"item": "precog-zm", "action": "flag-zombie attempt=1", "outcome": "off"}]
+            assert flagged == ["precog-zm"] and 0 in codes, (flagged, codes)
+            assert texts("precog-zm")[-2:] == ["reconcile-start: zombie flag-zombie attempt=1",
+                                               "reconcile: flag-zombie attempt=1"], texts("precog-zm")
+            assert store["precog-zm"]["labels"] == []
             # A stale snapshot still proposing a recorded key: the fresh check before acting skips it.
-            assert execute({"errors": {}}, [{"item": "precog-sl", "class": "stale-lease",
-                                              "action": "return-lease slot=4 holder=agent:precog-sl#1"}],
-                           executors)[0]["outcome"] == "recorded" and returned == ["4"]
-            # Crash between "action done" and "comment written": the next tick sees the effect, writes only the comment.
-            assert set_switches("zombie")["zombie"] is True
-            flag_visible = lambda a, snap: a["item"] in flagged
-            executors["flag-zombie"] = (flag_visible, executors["flag-zombie"][1])
-            fail["comment"] = 1
-            assert run()[0]["outcome"].startswith("error: LedgerError") and flagged == ["precog-zm"]
-            assert run() == [{"item": "precog-zm", "action": "flag-zombie attempt=1", "outcome": "recovered"}]
-            assert flagged == ["precog-zm"] and run() == []
+            assert execute({"errors": {}, "issues": {}}, [{"item": "precog-zm", "class": "zombie",
+                                                           "action": "flag-zombie attempt=1"}],
+                           executors)[0]["outcome"] == "recorded" and flagged == ["precog-zm"]
+            # Crash between "action done" and "comment written". The effect (lease returned) removes the
+            # candidate, so only the open intent (label + reconcile-start:) brings the next tick back to it.
+            assert set_switches("stale-lease")["stale-lease"] is True
+            fail["comment"] = "reconcile: return-lease"
+            assert run() == [{"item": "precog-sl", "action": "return-lease slot=4 holder=agent:precog-sl#1",
+                              "outcome": "error: LedgerError: br comments failed (crash after the action)"}]
+            assert returned == ["4"] and store["precog-sl"]["labels"] == [PENDING]
+            assert run() == [{"item": "precog-sl", "action": "return-lease slot=4 holder=agent:precog-sl#1",
+                              "outcome": "recovered"}]
+            assert returned == ["4"] and store["precog-sl"]["labels"] == [] and run() == []
+            # An intent with no effect that is no longer proposed is dropped, not acted on.
+            store["precog-dr"] = bead("precog-dr", status="open", assignee="", extra=[
+                "reconcile-start: stale-lease return-lease slot=9 holder=agent:precog-dr#1"])
+            store["precog-dr"]["labels"] = [PENDING]
+            assert [x["outcome"] for x in run()] == ["dropped"] and returned == ["4"]
+            assert store["precog-dr"]["labels"] == [] and run() == []
             # --kill switches every class off.
             assert not any(set_switches().values())
             assert workflow.load(wf)[0]["actions"] == workflow.load(os.path.join(IAR, "WORKFLOW.md"))[0]["actions"]
             with open(os.path.join(d, "reconcile.jsonl")) as f:
                 assert all(json.loads(x)["dry_run"] is False for x in f)
         finally:
-            ledger.show, ledger.comment = real
+            ledger.show, ledger.comment, ledger.label = real
             for k, v in saved_env.items():
-                os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
 
 
 if __name__ == "__main__":

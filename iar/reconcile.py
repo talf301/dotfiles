@@ -50,7 +50,7 @@ CPU_WINDOW = timedelta(minutes=5)
 BEAD_RE = re.compile(r"^([a-z0-9]+-[a-z0-9.]+): ")
 HOLDER_RE = re.compile(r"^agent:([a-z0-9]+-[a-z0-9.]+)#(\d+)$")
 ATTEMPT_RE = re.compile(r"^attempt: (\d+) session: (\S+) slot: (\S+) branch: (\S+)")
-QID_RE = re.compile(r"^QUESTION:\s*precog-[A-Za-z0-9.]+")
+QID_RE = re.compile(r"^QUESTION:\s*(precog-[A-Za-z0-9]+(?:\.[A-Za-z0-9]+)*)")
 DEFAULTS = {"sessions": [], "slots": [], "inbox": [], "inbox_url": "http://localhost/", "plannotator": [],
             "beads": [], "questions": [], "issues": {}, "git": {}, "session_names": {}}
 
@@ -268,6 +268,18 @@ def src_plannotator(snap):
         snap["plannotator"] = []
 
 
+def check_issues(issues):
+    """br show: every field classify reads."""
+    for i in issues:
+        need(isinstance(i, dict) and isinstance(i.get("id"), str) and isinstance(i.get("status"), str),
+             "tracker show: id, status")
+        need(i.get("assignee") is None or isinstance(i["assignee"], str), f"tracker show {i['id']}: assignee")
+        need(isinstance(i.get("comments", []), list)
+             and all(isinstance(c, dict) and isinstance(c.get("text"), str) for c in i.get("comments", [])),
+             f"tracker show {i['id']}: comments")
+    return issues
+
+
 def src_br(snap):
     try:
         ledger.TIMEOUT_S = left()  # each tracker call gets what is left of the source's deadline
@@ -285,7 +297,7 @@ def src_br(snap):
         want |= {m[1] for t in snap["inbox"] if (m := BEAD_RE.match(names.get(t.get("session")) or ""))}
         ledger.TIMEOUT_S = left()
         shown = ledger.show_many(sorted(want & known))
-        need(all(isinstance(i, dict) and isinstance(i.get("comments", []), list) for i in shown), "tracker show: issues")
+        check_issues(shown)
         snap["issues"] = {i["id"]: i for i in shown}
     except ledger.LedgerError as e:
         raise SourceError(str(e))
@@ -390,7 +402,8 @@ def classify_bead(bid, b, snap, now, stall_after, sessions, leases, threads):
         if [k for k in due if k not in done_keys(b)]:
             return "question-deadline", due
         if s and not working and (s.get("last_message") or "").startswith("QUESTION:") \
-                and not QID_RE.match(s["last_message"]):
+                and not ((m := QID_RE.match(s["last_message"])) and m[1] in {q["id"] for q in qs}):
+            # malformed (W5): no question id, or an id that is not an open question bead of this bead
             return "malformed-question", [f"flag-malformed {a}"]
         wrote = parse_time(s.get("transcript_at")) if s else None
         if working and wrote and now - wrote >= stall_after and s.get("cpu_active") is False:
@@ -503,7 +516,7 @@ def self_test():
     snap = {
         "errors": {}, "git": {"precog-zp#1": {"pushed": True}},
         "issues": {b["id"]: b for b in [
-            bead("precog-ap"), bead("precog-dl"), bead("precog-dl2"), bead("precog-mq"), bead("precog-st"),
+            bead("precog-ap"), bead("precog-dl"), bead("precog-dl2"), bead("precog-mq"), bead("precog-mq2"), bead("precog-st"),
             bead("precog-zm"), bead("precog-zp"), bead("precog-sl", status="open", assignee=""),
             bead("precog-ct", status="closed"), bead("precog-wk"), bead("precog-wt"), bead("precog-id"),
             bead("precog-ex", n=0, assignee="factory-wf"), bead("precog-nl", n=0, status="open", assignee=""), bead("precog-ex2", assignee="factory-wf"),  # old bg lease, foreign claim
@@ -518,10 +531,12 @@ def self_test():
                       q("precog-q3", "precog-dl2", reversible="no", deadline=t(1)),
                       q("precog-q5", "precog-dl", gated="yes", deadline=t(1)), q("precog-q6", "precog-c1", ["answered"]),
                       q("precog-q4", "precog-rp", reversible="no", deadline=t(1)),
-                      q("precog-q7", "precog-ex", ["answered"]), q("precog-q8", "precog-wk", deadline=t(-60))],
+                      q("precog-q7", "precog-ex", ["answered"]), q("precog-q8", "precog-wk", deadline=t(-60)),
+                      q("precog-q9", "precog-wt", deadline=t(-60))],
         "sessions": [
             sess("precog-ap", state="blocked"), sess("precog-dl", state="blocked"), sess("precog-dl2", state="blocked"),
             sess("precog-mq", state="blocked", last_message="QUESTION: should I ship?"),
+            sess("precog-mq2", state="blocked", last_message="QUESTION: precog-q8 not mine?"),
             sess("precog-st", state="working", transcript_at=t(45), cpu_active=False, **live),
             sess("precog-c1", state="working", transcript_at=t(45), cpu_active=False, **live),
             sess("precog-ag", state="working", transcript_at=t(45), cpu_active=False, **live),
@@ -540,7 +555,7 @@ def self_test():
     }
     want = {
         "precog-ap": "answer-pending", "precog-dl": "question-deadline", "precog-dl2": "question-deadline",
-        "precog-mq": "malformed-question", "precog-st": "stalled", "precog-zm": "zombie", "precog-zp": "zombie",
+        "precog-mq": "malformed-question", "precog-mq2": "malformed-question", "precog-st": "stalled", "precog-zm": "zombie", "precog-zp": "zombie",
         "precog-sl": "stale-lease", "precog-ct": "closed-bead-thread", "precog-wk": "working",
         "precog-wt": "waiting", "precog-id": "idle", "precog-ex": "external", "precog-ex2": "external", "precog-nl": "external",
         "precog-c1": "answer-pending", "precog-c2": "zombie", "precog-c3": "stale-lease", "precog-rp": "idle",
@@ -552,6 +567,7 @@ def self_test():
     assert acts == {
         ("precog-ap", "deliver-answer q=precog-q1 attempt=1"), ("precog-dl", "timeout q=precog-q2"),
         ("precog-dl2", "reping q=precog-q3"), ("precog-mq", "flag-malformed attempt=1"),
+        ("precog-mq2", "flag-malformed attempt=1"),
         ("precog-st", "nudge attempt=1 count=1"), ("precog-zm", "flag-zombie attempt=1"),
         ("precog-zp", "release attempt=1"), ("precog-sl", "return-lease slot=4 holder=agent:precog-sl#1"),
         ("precog-ct", "resolve-thread thread=m-ct"),
@@ -586,6 +602,8 @@ def self_test():
     for check, rows in [(check_agents, [{"sessionId": "a", "kind": "background"}]),
                         (check_agents, [{"sessionId": "a", "kind": "interactive", "pid": "1"}]),
                         (check_slots, [{"name": "1", "status": "leased", "processes": []}]),
+                        (check_issues, [{"id": "a", "comments": []}]),
+                        (check_issues, [{"id": "a", "status": "open", "comments": [{"body": "x"}]}]),
                         (strict_lines, "{}\nnot json\n"), (strict_lines, "[1]\n")]:
         try:
             check(rows)
@@ -607,6 +625,15 @@ def self_test():
     finally:
         ledger.list_issues, ledger.show_many = real
     assert asked == ["precog-cs"], asked
+    # A malformed tracker answer is a source error: no class but source-error, no action.
+    ledger.list_issues = lambda status=None, labels=(): [{"id": "precog-ap", "status": "in_progress"}]
+    ledger.show_many = lambda ids: [{"id": "precog-ap", "comments": []}]  # no status
+    try:
+        broken_br = snapshot(now, {**fakes, "br": src_br})
+    finally:
+        ledger.list_issues, ledger.show_many = real
+    assert list(broken_br["errors"]) == ["br"] and "status" in broken_br["errors"]["br"], broken_br["errors"]
+    assert classify(broken_br, now)["actions"] == []
     s["errors"] = {}
     assert classify(s, now)["actions"] == [{"item": "precog-cs", "class": "closed-bead-thread",
                                             "action": "resolve-thread thread=m-cs"}]

@@ -1090,6 +1090,11 @@ def act_deliver(a, snap):
     ans = question.effective_answer(q)
     if not ans:
         raise RuntimeError(f"{qid} has no recorded answer")
+    got = ans["source"] == "timeout" and inbox_answers(*inbox_records()[:2]).get(qid)
+    if got:  # E2b: Tal's Inbox answer that landed after the snapshot still goes in before the default is sent
+        question.answer(qid, got["text"], at=got["at"], source="inbox")
+        q = ledger.show(qid)
+        ans = question.effective_answer(q)
     text = answer_text(qid, q, ans)
     att, s = session_of(a, snap)
     since = started_at(a)
@@ -1603,6 +1608,18 @@ def w13_test():
             os.remove(os.path.join(tdir, f"s-{cr}-1.jsonl"))
             assert run() == [(cr, "deliver-answer", "done")] and ledger.show(qcr)["status"] == "closed"
             assert [c[1] for c in calls if c[0] == "resume"].count(f"s-{cr}-1") == 1 and run() == []
+
+            # E2b race: Tal's answer, picked before the timeout write, lands after the delivery tick's snapshot (the
+            # git source runs after the Inbox source). The delivery imports it and sends it, not the default.
+            rt = asking("E2b: answer lands after the snapshot")
+            qrt = ask(rt, "Late race?", deadline=past)[1]
+            assert run() == [(rt, "timeout", "done")]
+            wrote = question.answers(ledger.show(qrt))[0]["at"]
+            late = [lambda: tal_answers(qrt, stamp(wrote - timedelta(milliseconds=1)), choice="Drop")]
+            fakes["git"] = lambda s: late and late.pop()()
+            assert run() == [(rt, "deliver-answer", "done")]
+            assert [c[2] for c in calls if c[0] == "resume" and c[1] == f"s-{rt}-1"][0].startswith(f"ANSWER {qrt}: Drop\n")
+            assert question.effective_answer(ledger.show(qrt))["source"] == "inbox" and run() == []
 
             # inbox_answers: drafts (no sent reply) and skips with no reply are not answers; a note rides along.
             q = lambda **kw: {"message_id": "m", "position": 0, "picked_at": "t", "sent_reply_id": "r", **kw}

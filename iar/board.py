@@ -14,7 +14,7 @@ import os
 import sys
 from datetime import datetime, timedelta, timezone
 
-from reconcile import BEAD_RE, parse_time, snapshot
+from reconcile import BEAD_RE, malformed, parse_time, snapshot
 
 HOME = os.path.expanduser("~")
 VAULT = f"{HOME}/Library/Mobile Documents/com~apple~CloudDocs/vault"
@@ -109,7 +109,10 @@ def classify(data, now):
         elif s.get("state") == "working":
             add("Stalled" if quiet > WORKING_QUIET else "Working", line, now)
         elif said.startswith("QUESTION:"):
-            if not reported:
+            # W13: a QUESTION: line with no question bead of its bead is flagged even when its session posted.
+            if s.get("bead") and malformed(s, [q for q in data.get("questions", []) if q.get("asking") == s["bead"]]):
+                add("Needs you", f"Malformed question (no question bead, so no timeout or delivery): {line}", active)
+            elif not reported:
                 add("Needs you", line, active)
         elif said.startswith("READY:"):
             if not reported:
@@ -217,6 +220,17 @@ def self_test():
     assert any("precog-z3" in line for line in sec["Old"]), sec["Old"]
     data["issues"] = {"precog-q1": {"id": "precog-q1", "status": "in_progress", "title": "runaway", "labels": ["quarantined"]}}
     assert any("`precog-q1` quarantined" in line for line in classify(data, now)["Needs you"])
+    # A malformed question (no question bead of its bead) is flagged under Needs you even when its session posted
+    # to the Inbox; a valid one whose session posted is not listed again.
+    data["inbox"][0]["session"] = "a"
+    data["sessions"][0]["bead"] = "precog-mq"
+    assert any(line.startswith("Malformed question") and "QUESTION: which?" in line
+               for line in classify(data, now)["Needs you"]), classify(data, now)["Needs you"]
+    data["sessions"][0]["last_message"] = "QUESTION: precog-q9 which?"
+    data["questions"] = [{"id": "precog-q9", "asking": "precog-mq"}]
+    assert not any("which?" in line for line in classify(data, now)["Needs you"])
+    data["questions"] = [{"id": "precog-q9", "asking": "precog-other"}]
+    assert any(line.startswith("Malformed question") for line in classify(data, now)["Needs you"])
     data["errors"] = {"br": "LedgerError: tracker list: no answer in 30s"}
     assert any("`br` failed" in line for line in classify(data, now)["Loose ends"])
     print("ok")
@@ -228,7 +242,8 @@ if __name__ == "__main__":
     else:
         os.environ.setdefault("BEADS_DIR", BEADS_DIR)
         now = datetime.now(timezone.utc)
-        body = render(classify(snapshot(now), now))
+        snap = snapshot(now)
+        body = render(classify(snap, now))
         if "--stdout" in sys.argv:
             print(body, end="")
         else:

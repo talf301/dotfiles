@@ -19,8 +19,8 @@ Spec: precog-am8w (Concepts: Question bead; State machines: Question bead).
     --timeout writes `answer: <default> (timeout)` only when reversible: yes, gated: no and the
     deadline has passed; it labels the asking bead `decision:auto`.
 
-State labels on the question bead: `inbox:pending`, `answered`, `delivered` (set by the
-reconciler, W13), then the bead is closed (`moot` when the asking bead closed first).
+State labels on the question bead: `inbox:pending`, `answered`, `delivered` (the reconciler,
+W13, sets it and closes the bead after delivery; `moot` when the asking bead closed first).
 The tracker is reached only through ledger.py. The Inbox command is `plannotator inbox mcp`;
 IAR_INBOX_CMD overrides it (self-test). IAR_INBOX_PROJECT overrides the Inbox project.
 One lock file, $IAR_STATE_DIR/question.lock (default ~/.local/state/iar), serializes the
@@ -49,7 +49,7 @@ PROJECT = "/Users/tal/.local/share/precog/Precog agents"  # inbox-etiquette.md
 DEFAULT_DEADLINE = dt.timedelta(hours=4)
 INBOX_TIMEOUT_S = 20
 FIELDS = ("question", "asking", "session", "blocks", "default", "reversible", "gated",
-          "deadline", "inbox_thread")
+          "deadline", "inbox_thread", "inbox_project", "thread_name")  # the last two: where a retry posts
 
 
 def now():
@@ -58,6 +58,15 @@ def now():
 
 def iso(t):
     return t.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def clock():
+    """Answer times keep milliseconds, so a human answer in the same second as a timeout write still orders."""
+    return dt.datetime.now(dt.timezone.utc)
+
+
+def stamp(t):
+    return t.astimezone(dt.timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
 def parse_time(s):
@@ -84,7 +93,7 @@ def short(bead_id):
 # --- body: `key: value` lines, `option:` repeated, then a blank line and free context ---
 
 def render_body(f, options, context):
-    lines = [f"{k}: {f[k]}" for k in FIELDS] + [f"option: {o}" for o in options]
+    lines = [f"{k}: {f.get(k, '')}" for k in FIELDS] + [f"option: {o}" for o in options]
     return "\n".join(lines) + ("\n\n" + context if context else "")
 
 
@@ -193,7 +202,8 @@ def ask(a):
         if q is None:
             f = {"question": a.question, "asking": a.asking, "session": a.session or "",
                  "blocks": a.blocks, "default": a.default, "reversible": a.reversible,
-                 "gated": a.gated, "deadline": deadline, "inbox_thread": "pending"}
+                 "gated": a.gated, "deadline": deadline, "inbox_thread": "pending",
+                 "inbox_project": a.project, "thread_name": a.thread or ""}
             # inbox:pending from birth: a crash before the post leaves the bead for the reconciler.
             q = ledger.create(f"Q(?): {a.question}", type="task", parent=a.asking,
                               labels=["question", "no-swarm", "inbox:pending"],
@@ -208,16 +218,23 @@ def ask(a):
     print(qid)
     if "inbox:pending" not in (q.get("labels") or []):
         return 0
-    thread = a.thread or f"{short(a.asking)}: {asking['title']}"
     try:
-        thread_id = inbox_post(qid, f, a.project, thread)
+        post(qid, f, a.project, a.thread or f"{short(a.asking)}: {asking['title']}")
     except RuntimeError as e:
         print(f"ask: {qid} filed with inbox:pending; {e}", file=sys.stderr)
         return 3
-    f["inbox_thread"] = thread_id
+    return 0
+
+
+def post(qid, f, project=None, thread=None):
+    """Post the Inbox :::question of question bead qid (body fields f), write the thread id back and drop
+    `inbox:pending`. `ask` and the reconciler's inbox-pending retry (W13) use it; the retry posts to the project
+    and thread name that `ask` stored on the bead. Raises RuntimeError."""
+    project = project or f.get("inbox_project") or PROJECT
+    thread = thread or f.get("thread_name") or f"{short(f['asking'])}: {ledger.show(f['asking'])['title']}"
+    f = dict(f, inbox_thread=inbox_post(qid, f, project, thread))
     ledger.update(qid, description=render_body(f, f["options"], f["context"]),
                   remove_labels=["inbox:pending"])
-    return 0
 
 
 # --- answer ---
@@ -262,7 +279,7 @@ def _answer(qid, text, at, source, timeout):
     if "question" not in (q.get("labels") or []):
         raise ValueError(f"{qid} is not a question bead")
     f = parse_body(q.get("description"))
-    t = now()
+    t = clock()
     prior = answers(q)
     if timeout:
         if f["reversible"] != "yes" or f["gated"] != "no":
@@ -280,7 +297,7 @@ def _answer(qid, text, at, source, timeout):
         at = parse_time(at) if at else t
     labels = set(q.get("labels") or [])
     choice = next((o for o in f["options"] if o.lower() == text.lower()), None)
-    meta = f"\n-- at: {iso(at)} source: {source}"
+    meta = f"\n-- at: {stamp(at)} source: {source}"
     if q["status"] == "closed" or "delivered" in labels:
         result = "late"
     elif not prior:
@@ -439,6 +456,18 @@ def self_test():
                                                    "at": answers(ledger.show(q3))[0]["at"]}
             assert run(main_answer, [q3, "Drop", "--at", past]) == (0, "overrode-timeout")
             assert effective_answer(ledger.show(q3))["text"] == "Drop"
+            # E2b in one second: the timeout written at .900, a human answer picked at .100 still wins.
+            global clock
+            real_clock, second = clock, now()
+            rc, q7 = run(main_ask, [a2, "Same second?", "--blocks", "no", "--deadline", past, *base])
+            clock = lambda: second + dt.timedelta(milliseconds=900)
+            try:
+                assert run(main_answer, [q7, "--timeout"]) == (0, "answered")
+            finally:
+                clock = real_clock
+            picked = stamp(second + dt.timedelta(milliseconds=100))
+            assert run(main_answer, [q7, "Drop", "--at", picked]) == (0, "overrode-timeout")
+            assert effective_answer(ledger.show(q7))["text"] == "Drop"
             gated = [x if x != "no" else "yes" for x in base]  # --gated yes
             rc, q4 = run(main_ask, [a2, "Spend?", "--blocks", "no", *gated])
             assert parse_body(ledger.show(q4)["description"])["deadline"] == ""

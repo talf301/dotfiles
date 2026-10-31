@@ -18,6 +18,7 @@ kind=$(print -r -- "$agent" | "$JQ" -r '.kind')
 
 # Find the tab by name with `rex window ls --json`: a tab or pane label equal to the session name or its bead id
 # (bin/swarm names tabs after the bead), else a Rex session with that label (its active tab).
+# Each `window ls --json` result also carries its Rex session's `label`, so one call per session covers both.
 # Prints "<session_id> <window_id>".
 sessions=$("$REX" ls --json 2>/dev/null | "$JQ" -r '.sessions[].session_id')
 target=$(for s in ${(f)sessions}; do "$REX" window ls -s "$s" --json 2>/dev/null; done | "$JQ" -rs --arg n "$name" '

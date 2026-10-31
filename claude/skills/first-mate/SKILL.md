@@ -13,6 +13,7 @@ Name the session once: `/rename first-mate`.
 
 - **"What's going on", "what needs me", "status":** run the `digest` skill.
 - **"Dispatch …", "start overnight work", "what's ready":** run the `dispatch-bead` skill. Its readiness gate decides what runs in the background; beads that fail it go to `/next-bead`, to be done interactively.
+- **Other background work** ("run X in the background", a task that is not a bead yet): `~/dotfiles/bin/bg` creates the bead first. Confirm the title and the task with Tal, then run `~/dotfiles/bin/bg --new "<title>" --done-when "<done-when command>"` (Precog work: it leases a slot and the session follows the `iar/WORKFLOW.md` brief), or `~/dotfiles/bin/bg --new "<title>" --cwd <folder you already hold> --prompt "<task>"` (any other work, for example in a `~/dotfiles` worktree). Then watch the session.
 - **"Go through the questions":** run the walkthrough in step 3 of `digest`. Before asking Tal about a question, check it against `~/dotfiles/iar/autonomy.md`:
   - The rules say a human must decide (gated action, over budget, outward or irreversible action, spec ambiguity that changes the result): ask Tal, and relay his answer word for word with SendMessage.
   - The rules say the session should handle it, and the answer follows from the bead, its spec or the repo: answer the session yourself with SendMessage, starting with "first-mate:" and citing the source. Then tell Tal in one line what you answered and why. If you are unsure which side it is on, ask Tal.
@@ -32,7 +33,7 @@ Name the session once: `/rename first-mate`.
 
 ## Rules
 
-- Never open herdr tabs, panes or terminal windows. Dispatched work runs as `claude --bg` sessions, out of sight until it needs Tal.
+- Never open herdr tabs, panes or terminal windows. All background work starts with `~/dotfiles/bin/bg` and runs out of sight until it needs Tal. Never start a background session any other way: without the bead and attempt comment that `bin/bg` writes, the digest and the reconciler cannot see it.
 - Never implement, edit repo files or run tests here. Hand work to `/dispatch-bead` or `/next-bead`.
 - Never start an outward action yourself (push, PR, merge, Slack, Linear), and never let a relayed answer authorize more than Tal said.
 - Keep answers short: what changed since Tal last asked, what needs him, and what you did on your own.

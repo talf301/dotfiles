@@ -5,7 +5,7 @@
 #   --base (default origin/main). Writes build/gnhf/{base,env.sh}; freezes the hydra-check baseline
 #   if the prompt names hydra-check. Runs gnhf --agent claude --current-branch in the foreground.
 #   A quota watchdog sends one Ctrl+C when the weekly Claude quota falls to --quota-floor percent
-#   remaining (default 60). When gnhf exits, it starts `claude --bg` with the gnhf-walkthrough skill.
+#   remaining (default 60). When gnhf exits, bin/bg --new starts the gnhf-walkthrough session.
 #   The slot stays leased and nothing is pushed.
 set -euo pipefail
 DOTFILES=$(cd "$(dirname "$(realpath "$0")")/.." && pwd)
@@ -82,8 +82,8 @@ if [ -z "$run" ] || [ ! .gnhf/runs/"$run" -nt build/gnhf/base ]; then
   echo "gnhf-run: gnhf wrote no run directory; no walkthrough"
   exit "$gnhf_rc"
 fi
-walkthrough=(claude --bg --settings "$DOTFILES/iar/dispatch-settings.json" --name "gnhf walkthrough: $name"
-  "Follow $DOTFILES/claude/skills/gnhf-walkthrough/SKILL.md for gnhf run $run in slot $slot (name $name, branch $branch).")
-echo "gnhf-run: starting the walkthrough (to rerun it, from the slot):$(printf ' %q' "${walkthrough[@]}")"
+walkthrough=("$DOTFILES/bin/bg" --new "gnhf walkthrough: $name" --cwd "$slot"
+  --prompt "Follow $DOTFILES/claude/skills/gnhf-walkthrough/SKILL.md for gnhf run $run in slot $slot (name $name, branch $branch).")
+echo "gnhf-run: starting the walkthrough (to rerun it):$(printf ' %q' "${walkthrough[@]}")"
 "${walkthrough[@]}"
 echo "gnhf-run: return the slot when you are done: treehouse return $slot"

@@ -7,7 +7,7 @@ description: Turn a finished gnhf run in a Precog treehouse slot into a walkthro
 
 You get a slot path, a gnhf run id, a run name and a branch. Tal did not write this code and did not watch the run. Your page must let him decide what to keep without reading the diffs first.
 
-**Read-only.** Do not switch commits, commit, rebase, push, open PRs, change Beads, edit files in the slot or return the slot. Write only to `~/.local/state/iar/`. Do not rerun the check: each iteration already ran it, and the logs hold the result.
+**Read-only.** Do not switch commits, commit, rebase, push, open PRs, change Beads, edit files in the slot or return the slot. The one Beads change: close your own bead (named in your prompt) at the end. Write only to `~/.local/state/iar/`. Do not rerun the check: each iteration already ran it, and the logs hold the result.
 
 ## 1. Gather
 
@@ -89,3 +89,4 @@ End your turn with a short summary. Its first line is exactly `READY: <one-line 
 
 - **Return the slot:** run `treehouse return <slot>` from outside the slot only after he says so; it resets the slot and the local branch can be lost. Post one line in the thread and resolve it.
 - **Keep commits:** do only what he asked. Pushing a branch or opening a PR needs his explicit word in the reply.
+- **Done:** when the thread is resolved, close your bead with `br close <bead> --reason "<what Tal decided>"`, with `BEADS_DIR` set to the store named in your prompt.

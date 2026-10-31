@@ -1,0 +1,356 @@
+#!/usr/bin/env python3
+"""ratchet (W15): the /digest "Decided without you" section, and the step that turns a repeated
+permission denial into an allow rule after Tal picks it.
+
+  ratchet [--now ISO] [--denials F] [--settings F]   print the section
+  ratchet --apply N [--auto] [SETTINGS]              write suggestion N into SETTINGS
+  ratchet --self-test                                fixture run on a scratch store and settings copy
+
+SETTINGS defaults to ~/.claude/settings.json; --denials to $IAR_STATE_DIR/denials.jsonl
+(default ~/.local/state/iar, written by iar/denial-hook.sh). The section shows:
+- Decisions: `decision:` comments on beads labeled decision:auto, in the 24 h before --now.
+- Timeouts: `answer: <default> (timeout)` on question beads, same window.
+- Top denials: the 5 most denied rules in the window.
+- Suggested allow rules: every rule denied 3 or more times (whole log) that SETTINGS does not
+  allow yet. Never suggested: a rule that could cover a gated, outward-facing or irreversible
+  action (gate-hook.py, NEVER, RISKY_SUB, RISKY_WORDS), a one-word Bash rule, MCP and write
+  tools. Numbers follow the time a rule reached 3 denials, so new denials do not renumber older
+  suggestions; applying one removes it and the later numbers move up by one.
+--apply adds the rule to permissions.allow, or with --auto a prose entry to autoMode.allow
+(seeded with "$defaults" when the list is new). It writes through a symlink, never replaces it.
+"""
+
+import argparse
+import collections
+import datetime as dt
+import importlib.util
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from urllib.parse import urlparse
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+import ledger  # noqa: E402
+import question  # noqa: E402
+
+_spec = importlib.util.spec_from_file_location("gate_hook", os.path.join(HERE, "gate-hook.py"))
+gate = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(gate)
+
+WINDOW = dt.timedelta(hours=24)
+THRESHOLD = 3
+TOP = 5
+SUBCOMMAND = re.compile(r"^[a-z][a-z0-9._-]*$")
+SETTINGS = os.path.expanduser("~/.claude/settings.json")
+
+
+def state_dir():
+    return os.environ.get("IAR_STATE_DIR") or os.path.expanduser("~/.local/state/iar")
+
+
+def read_denials(path):
+    out = []
+    try:
+        with open(path) as fh:
+            for line in fh:
+                try:
+                    d = json.loads(line)
+                    d["at"] = question.parse_time(d["ts"])
+                    out.append(d)
+                except (ValueError, KeyError, TypeError):
+                    continue  # diagnostic log: skip a torn or foreign line
+    except FileNotFoundError:
+        pass
+    return out
+
+
+# Never suggested: rules that could cover a gated, outward-facing or irreversible action
+# (iar/autonomy.md). ponytail: fixed lists; extend them when a new risky CLI shows up in denials.
+NEVER = gate.SHELLS | set(gate.GATED) | {
+    "eval", "exec", "source", ".", "gh", "aws", "curl", "wget", "http", "xh", "ssh",
+    "scp", "rsync", "rm", "dd", "kubectl", "helm", "docker", "op", "security"}
+RISKY_SUB = {"git": {"push", "reset", "clean", "branch", "tag", "rebase", "filter-branch",
+                     "filter-repo", "update-ref", "gc", "prune", "reflog", "stash", "checkout",
+                     "switch", "restore", "rm", "worktree", "remote", "config", "send-email"}}
+# Any argument word (split on punctuation) that names outward-facing, provisioning or destructive
+# work: `make deploy`, `npm run publish:prod`, `just release`. Conservative on purpose; Tal's pick
+# of a suggestion stays the last control.
+RISKY_WORDS = {"deploy", "publish", "release", "push", "apply", "up", "launch", "provision",
+               "upload", "send", "post", "merge", "destroy", "delete", "drop", "prod",
+               "production", "migrate", "rollout", "promote", "ship"}
+SAFE_TOOLS = {"WebSearch", "Read", "Glob", "Grep"}  # read-only; no rule for MCP or write tools
+
+
+def pattern(d):
+    """(key, safe): the rule a denial points at, and whether it may be suggested.
+
+    A Bash rule names a program and a subcommand (`Bash(npm test *)`); a one-word rule is too
+    broad. A command is unsafe when any of its segments is gated or risky.
+
+    A suggested `Bash(git fetch *)` cannot approve `git fetch && git push origin main`: Claude Code
+    splits compound commands on &&, ||, ;, |, |&, & and newlines, and every subcommand must be
+    allowed on its own (code.claude.com/docs/en/permissions, "Compound commands")."""
+    tool, inp = d.get("tool_name") or "?", d.get("tool_input") or {}
+    if tool == "WebFetch":
+        host = urlparse(inp.get("url", "")).hostname
+        return (f"WebFetch(domain:{host})", True) if host else ("WebFetch", False)
+    if tool != "Bash":
+        return tool, tool in SAFE_TOOLS
+    cmd = inp.get("command", "")
+    key, safe = None, not gate.check(cmd)  # gated: Tal approves each time, never a standing rule
+    for seg in gate.segments(gate.tokenize(cmd)):
+        argv = gate.strip_wrappers(seg)
+        if not argv or argv[0] == "cd":
+            continue
+        prog = os.path.basename(argv[0])
+        sub = argv[1] if len(argv) > 1 and SUBCOMMAND.match(argv[1]) else None
+        words = {w for t in argv[1:] for w in re.split(r"[^a-z0-9]+", t.lower())}
+        if (prog in NEVER or sub in RISKY_SUB.get(prog, ()) or (prog in RISKY_SUB and not sub)
+                or words & RISKY_WORDS):
+            safe = False
+        if key is None:
+            key = f"Bash({argv[0]} {sub} *)" if sub else f"Bash({argv[0]} *)"
+            safe = safe and sub is not None
+    return key or "Bash", safe and key is not None
+
+
+def rule_for(d):
+    """The allow rule a denial suggests, or None when no safe rule exists."""
+    key, safe = pattern(d)
+    return key if safe else None
+
+
+def sample(d):
+    inp = d.get("tool_input") or {}
+    return clip(inp.get("command") or inp.get("url") or inp.get("file_path") or json.dumps(inp), 80)
+
+
+def clip(s, n):
+    s = s.splitlines()[0] if s else ""
+    return s[:n] + ("…" if len(s) > n else "")
+
+
+def allowed(settings):
+    return list((settings.get("permissions") or {}).get("allow") or []) + \
+        list((settings.get("autoMode") or {}).get("allow") or [])
+
+
+def suggestions(denials, settings):
+    """[(rule, count, sample)] in the order each rule reached THRESHOLD denials."""
+    have = allowed(settings)
+    seen, reached = collections.defaultdict(list), {}
+    for d in sorted(denials, key=lambda d: d["at"]):
+        rule = rule_for(d)
+        if rule:
+            seen[rule].append(d)
+            if len(seen[rule]) == THRESHOLD:
+                reached[rule] = d["at"]
+    return [(r, len(seen[r]), sample(seen[r][-1])) for r in sorted(reached, key=reached.get)
+            if not any(e == r or e.startswith(r + " ") or e.startswith(r + ":") for e in have)]
+
+
+def decisions(start, end):
+    out = []
+    for i in ledger.list_issues(["decision:auto"], all=True):
+        for c in ledger.show(i["id"]).get("comments") or []:
+            at = question.parse_time(c["created_at"])
+            if c["text"].startswith("decision:") and start <= at <= end:
+                out.append((at, f"{i['id']} {clip(i['title'], 60)}: {clip(c['text'], 100)}"))
+    return sorted(out, reverse=True)
+
+
+def timeouts(start, end):
+    out = []
+    for q in ledger.list_issues(["question"], all=True):
+        if question.parse_time(q["updated_at"]) < start:
+            continue  # a timeout answer also adds labels, which moves updated_at
+        for a in question.answers(ledger.show(q["id"])):
+            if a["source"] == "timeout" and start <= a["at"] <= end:
+                out.append((a["at"], f"{q['id']} {q['title']} -> {a['text']} (timeout)"))
+    return sorted(out, reverse=True)
+
+
+def ago(now, t):
+    h = (now - t).total_seconds() / 3600
+    return f"{h:.0f} h ago" if h >= 1 else f"{h * 60:.0f} min ago"
+
+
+def section(now, denials_path, settings_path):
+    start = now - WINDOW
+    lines = [f"## Decided without you (24 h to {question.iso(now)})", ""]
+    for name, fn in (("Decisions (decision:auto)", decisions), ("Timeouts", timeouts)):
+        lines.append(f"{name}:")
+        try:
+            rows = fn(start, now)
+            lines += [f"- {text} ({ago(now, at)})" for at, text in rows] or ["- none"]
+        except ledger.LedgerError as e:
+            lines.append(f"- ledger error, not read: {e}")
+    denials = read_denials(denials_path)
+    recent = collections.Counter()
+    examples = {}
+    for d in denials:
+        if start <= d["at"] <= now:
+            key, safe = pattern(d)
+            key += "" if safe else " (never suggested)"
+            recent[key] += 1
+            examples[key] = sample(d)
+    lines.append("Top denials:")
+    lines += [f"- {n}x {k}  e.g. `{examples[k]}`" for k, n in recent.most_common(TOP)] or ["- none"]
+    try:
+        with open(settings_path) as fh:
+            settings = json.load(fh)
+    except FileNotFoundError:
+        settings = {}
+    sug = suggestions(denials, settings)
+    lines.append("Suggested allow rules (Tal picks; apply with `iar/ratchet --apply <n>`, "
+                 "add `--auto` for autoMode.allow):")
+    lines += [f"{n}. {r}  ({c} denials, e.g. `{s}`)" for n, (r, c, s) in enumerate(sug, 1)] \
+        or ["- none"]
+    return "\n".join(lines)
+
+
+def apply(n, settings_path, auto, denials_path):
+    real = os.path.realpath(settings_path)
+    with open(real) as fh:
+        settings = json.load(fh)
+    sug = suggestions(read_denials(denials_path), settings)
+    if not 1 <= n <= len(sug):
+        raise SystemExit(f"ratchet: no suggestion {n} (there are {len(sug)}); rerun the digest")
+    rule, count, _ = sug[n - 1]
+    if auto:
+        target = settings.setdefault("autoMode", {}).setdefault("allow", ["$defaults"])
+        target.append(f"{rule}: routine. Tal allowed it with iar/ratchet after {count} denials.")
+    else:
+        settings.setdefault("permissions", {}).setdefault("allow", []).append(rule)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(real), prefix=".settings.")
+    with os.fdopen(fd, "w") as fh:
+        json.dump(settings, fh, indent=2, ensure_ascii=False)
+        fh.write("\n")
+    shutil.copymode(real, tmp)
+    os.replace(tmp, real)
+    where = "autoMode.allow" if auto else "permissions.allow"
+    print(f"applied {rule} -> {where} in {settings_path}")
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(prog="ratchet", description=__doc__.split("\n")[0])
+    p.add_argument("--now", help="end of the 24 h window, ISO-8601 UTC (default: now)")
+    p.add_argument("--denials", default=None)
+    p.add_argument("--settings", default=SETTINGS)
+    p.add_argument("--apply", type=int, metavar="N")
+    p.add_argument("--auto", action="store_true")
+    p.add_argument("path", nargs="?", help="settings file for --apply")
+    p.add_argument("--self-test", action="store_true")
+    a = p.parse_args(argv)
+    if a.self_test:
+        return self_test()
+    denials = a.denials or os.path.join(state_dir(), "denials.jsonl")
+    if a.apply is not None:
+        apply(a.apply, a.path or a.settings, a.auto, denials)
+    elif a.path or a.auto:
+        p.error("SETTINGS and --auto go with --apply")
+    else:
+        print(section(question.parse_time(a.now) if a.now else question.now(), denials, a.settings))
+    return 0
+
+
+FIXTURE_NOW = "2026-10-30T12:00:00Z"  # iar/fixtures/denials.jsonl timestamps are relative to this
+
+
+def self_test():
+    def run(*args):
+        p = subprocess.run([sys.executable, os.path.abspath(__file__), *args],
+                           capture_output=True, text=True)
+        return p.returncode, p.stdout + p.stderr
+
+    with tempfile.TemporaryDirectory() as root:
+        env = {k: os.environ.get(k) for k in ("BEADS_DIR", "IAR_STATE_DIR")}
+        os.environ["BEADS_DIR"] = os.path.join(root, ".beads")
+        os.environ["IAR_STATE_DIR"] = root
+        try:
+            subprocess.run(["br", "init", "--prefix", "rt"], cwd=root, check=True,
+                           capture_output=True)
+            now = question.now()
+            a = ledger.create("asking bead", labels=["decision:auto"])["id"]
+            ledger.comment(a, "decision: keep the old port\nwhy: reversible; roll back: revert")
+            ledger.comment(a, "unrelated note")
+            q = ledger.create("Q(x): drop the cache?", labels=["question"])["id"]
+            ledger.comment(q, f"answer: Keep (timeout)\n-- at: {question.iso(now)} source: timeout")
+            ledger.label(q, add=["answered"])
+            h = ledger.create("Q(y): human answered", labels=["question"])["id"]
+            ledger.comment(h, f"answer: Drop\n-- at: {question.iso(now)} source: human")
+
+            shift = now - question.parse_time(FIXTURE_NOW)
+            denials = os.path.join(root, "denials.jsonl")
+            with open(os.path.join(HERE, "fixtures", "denials.jsonl")) as src, \
+                    open(denials, "w") as dst:
+                for line in src:
+                    try:
+                        d = json.loads(line)
+                        d["ts"] = question.iso(question.parse_time(d["ts"]) + shift)
+                        line = json.dumps(d) + "\n"
+                    except ValueError:
+                        pass
+                    dst.write(line)
+            target = os.path.join(root, "real-settings.json")
+            with open(target, "w") as fh:
+                json.dump({"permissions": {"allow": ["Read"], "ask": ["Bash(sky launch *)"]},
+                           "autoMode": {"soft_deny": ["$defaults"]}}, fh)
+            link = os.path.join(root, "settings.json")
+            os.symlink(target, link)
+
+            rc, out = run("--denials", denials, "--settings", link)
+            print(out)
+            want = [
+                "Decisions (decision:auto):", f"- {a} asking bead: decision: keep the old port",
+                "Timeouts:", f"- {q} Q(x): drop the cache? -> Keep (timeout)",
+                "Top denials:", "- 4x Bash(git fetch *)  e.g.",
+                "x Bash(aws ec2 *) (never suggested)  e.g. `aws ec2 run-instances",
+                "x mcp__claude_ai_Slack__slack_send_message (never suggested)",
+                "Suggested allow rules", "1. Bash(git fetch *)  (4 denials",
+                "2. Bash(npm test *)  (3 denials", "3. WebFetch(domain:docs.example.com)",
+            ]
+            for w in want:
+                assert w in out, f"missing {w!r}"
+            assert rc == 0 and "Q(y)" not in out and "unrelated" not in out
+            sug = out.split("Suggested allow rules")[1]
+            assert "4. " not in sug, "risky rule suggested: " + sug
+            for bad in ("push", "deploy", "publish", "gh ", "aws", "Bash(git *)", "Bash(bash", "mcp__", "other.example"):
+                assert bad not in sug, f"suggested {bad!r}"
+
+            assert run("--now", question.iso(now + 2 * WINDOW), "--denials", denials,
+                       "--settings", link)[1].count("- none") == 3
+            assert run("--apply", "9", link, "--denials", denials)[0] != 0
+            rc, out = run("--apply", "1", link, "--denials", denials)
+            assert rc == 0 and "applied Bash(git fetch *) -> permissions.allow" in out, out
+            assert os.path.islink(link)
+            with open(target) as fh:
+                s = json.load(fh)
+            assert s["permissions"]["allow"] == ["Read", "Bash(git fetch *)"], s
+            out = run("--denials", denials, "--settings", link)[1]
+            assert "1. Bash(npm test *)" in out and "Bash(git fetch *)  (" not in out, out
+            rc, out = run("--apply", "1", "--auto", link, "--denials", denials)
+            with open(target) as fh:
+                s = json.load(fh)
+            allow = s["autoMode"]["allow"]
+            assert rc == 0 and allow[0] == "$defaults" and allow[1].startswith("Bash(npm test *): "), s
+            assert s["autoMode"]["soft_deny"] == ["$defaults"] and s["permissions"]["ask"]
+            assert "1. WebFetch(domain:docs.example.com)" in run(
+                "--denials", denials, "--settings", link)[1]
+        finally:
+            for k, v in env.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+    print("ok ratchet: section, suggestions, apply to a settings copy")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

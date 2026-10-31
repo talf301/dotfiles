@@ -1,0 +1,35 @@
+{"ts":"2026-10-29T13:00:00Z","session_id":"s1","cwd":"/w","tool_name":"Bash","tool_input":{"command":"git fetch origin u/tfriedman/a"},"reason":"fetch"}
+{"ts":"2026-10-29T14:00:00Z","session_id":"s1","cwd":"/w","tool_name":"Bash","tool_input":{"command":"git fetch --prune origin"},"reason":"fetch"}
+{"ts":"2026-10-29T15:00:00Z","session_id":"s2","cwd":"/w","tool_name":"Bash","tool_input":{"command":"GIT_TRACE=0 git fetch origin main"},"reason":"fetch"}
+{"ts":"2026-10-29T16:00:00Z","session_id":"s2","cwd":"/w","tool_name":"Bash","tool_input":{"command":"git fetch origin u/tfriedman/c"},"reason":"fetch"}
+{"ts":"2026-10-28T10:00:00Z","session_id":"s3","cwd":"/w","tool_name":"Bash","tool_input":{"command":"npm test"},"reason":"tests"}
+{"ts":"2026-10-28T11:00:00Z","session_id":"s3","cwd":"/w","tool_name":"Bash","tool_input":{"command":"cd /w/app && npm test -- --watch=false"},"reason":"tests"}
+{"ts":"2026-10-29T20:00:00Z","session_id":"s3","cwd":"/w","tool_name":"Bash","tool_input":{"command":"npm test"},"reason":"tests"}
+{"ts":"2026-10-27T09:00:00Z","session_id":"s4","cwd":"/w","tool_name":"WebFetch","tool_input":{"url":"https://docs.example.com/a"},"reason":"fetch"}
+{"ts":"2026-10-28T09:00:00Z","session_id":"s4","cwd":"/w","tool_name":"WebFetch","tool_input":{"url":"https://docs.example.com/b"},"reason":"fetch"}
+{"ts":"2026-10-30T09:00:00Z","session_id":"s4","cwd":"/w","tool_name":"WebFetch","tool_input":{"url":"https://docs.example.com/c"},"reason":"fetch"}
+{"ts":"2026-10-30T10:00:00Z","session_id":"s5","cwd":"/w","tool_name":"WebFetch","tool_input":{"url":"https://other.example.org/"},"reason":"fetch"}
+{"ts":"2026-10-30T10:30:00Z","session_id":"s5","cwd":"/w","tool_name":"WebFetch","tool_input":{"url":"https://other.example.org/x"},"reason":"fetch"}
+{"ts":"2026-10-30T08:00:00Z","session_id":"s6","cwd":"/w","tool_name":"Bash","tool_input":{"command":"aws ec2 run-instances --image-id ami-1"},"reason":"provision"}
+{"ts":"2026-10-30T08:10:00Z","session_id":"s6","cwd":"/w","tool_name":"Bash","tool_input":{"command":"aws ec2 run-instances --image-id ami-2"},"reason":"provision"}
+{"ts":"2026-10-30T08:20:00Z","session_id":"s6","cwd":"/w","tool_name":"Bash","tool_input":{"command":"aws ec2 run-instances --image-id ami-3"},"reason":"provision"}
+{"ts":"2026-10-26T08:00:00Z","session_id":"s7","cwd":"/w","tool_name":"Bash","tool_input":{"command":"bash -c 'make deploy'"},"reason":"shell"}
+{"ts":"2026-10-26T08:10:00Z","session_id":"s7","cwd":"/w","tool_name":"Bash","tool_input":{"command":"bash -c 'make deploy'"},"reason":"shell"}
+{"ts":"2026-10-26T08:20:00Z","session_id":"s7","cwd":"/w","tool_name":"Bash","tool_input":{"command":"bash -c 'make deploy'"},"reason":"shell"}
+not json: a torn line
+{"ts":"2026-10-30T07:00:00Z","session_id":"s8","cwd":"/w","tool_name":"Bash","tool_input":{"command":"git push origin u/tfriedman/x"},"reason":"push"}
+{"ts":"2026-10-30T07:10:00Z","session_id":"s8","cwd":"/w","tool_name":"Bash","tool_input":{"command":"npm test && git push origin u/tfriedman/x"},"reason":"push"}
+{"ts":"2026-10-30T07:20:00Z","session_id":"s8","cwd":"/w","tool_name":"Bash","tool_input":{"command":"git -C /w push origin main"},"reason":"push"}
+{"ts":"2026-10-30T07:30:00Z","session_id":"s8","cwd":"/w","tool_name":"Bash","tool_input":{"command":"git -C /w push origin main"},"reason":"push"}
+{"ts":"2026-10-30T06:00:00Z","session_id":"s9","cwd":"/w","tool_name":"mcp__claude_ai_Slack__slack_send_message","tool_input":{"channel":"c","text":"hi"},"reason":"slack write"}
+{"ts":"2026-10-30T06:10:00Z","session_id":"s9","cwd":"/w","tool_name":"mcp__claude_ai_Slack__slack_send_message","tool_input":{"channel":"c","text":"hi"},"reason":"slack write"}
+{"ts":"2026-10-30T06:20:00Z","session_id":"s9","cwd":"/w","tool_name":"mcp__claude_ai_Slack__slack_send_message","tool_input":{"channel":"c","text":"hi"},"reason":"slack write"}
+{"ts":"2026-10-25T06:00:00Z","session_id":"s9","cwd":"/w","tool_name":"Bash","tool_input":{"command":"gh pr merge 12 --squash"},"reason":"merge"}
+{"ts":"2026-10-25T06:10:00Z","session_id":"s9","cwd":"/w","tool_name":"Bash","tool_input":{"command":"gh pr merge 13 --squash"},"reason":"merge"}
+{"ts":"2026-10-25T06:20:00Z","session_id":"s9","cwd":"/w","tool_name":"Bash","tool_input":{"command":"gh pr merge 14 --squash"},"reason":"merge"}
+{"ts":"2026-10-24T06:00:00Z","session_id":"s10","cwd":"/w","tool_name":"Bash","tool_input":{"command":"make deploy"},"reason":"deploy"}
+{"ts":"2026-10-24T06:10:00Z","session_id":"s10","cwd":"/w","tool_name":"Bash","tool_input":{"command":"make deploy ENV=staging"},"reason":"deploy"}
+{"ts":"2026-10-24T06:20:00Z","session_id":"s10","cwd":"/w","tool_name":"Bash","tool_input":{"command":"make deploy"},"reason":"deploy"}
+{"ts":"2026-10-24T07:00:00Z","session_id":"s10","cwd":"/w","tool_name":"Bash","tool_input":{"command":"npm run publish:prod"},"reason":"publish"}
+{"ts":"2026-10-24T07:10:00Z","session_id":"s10","cwd":"/w","tool_name":"Bash","tool_input":{"command":"npm run publish:prod"},"reason":"publish"}
+{"ts":"2026-10-24T07:20:00Z","session_id":"s10","cwd":"/w","tool_name":"Bash","tool_input":{"command":"npm run publish:prod"},"reason":"publish"}

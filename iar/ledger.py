@@ -104,6 +104,12 @@ def blocked(label=None, type=None):
     return _br("blocked", *_opt("--label", label), *_opt("--type", type)) or []
 
 
+def list_issues(labels=(), all=False):
+    """Issues that have every label in `labels` (no comments); `all` includes closed ones."""
+    out = _br("list", "--limit=0", *(["--all"] if all else []), *[f"--label={n}" for n in labels])
+    return (out or {}).get("issues", []) if isinstance(out, dict) else out or []
+
+
 def show(issue):
     out = _br("show", issue)
     return out[0] if isinstance(out, list) else out

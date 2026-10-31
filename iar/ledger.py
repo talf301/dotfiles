@@ -115,6 +115,20 @@ def show(issue):
     return out[0] if isinstance(out, list) else out
 
 
+def show_many(ids):
+    """One `br show` for many ids (with comments). Fails if any id is missing."""
+    if not ids:
+        return []
+    out = _br("show", *ids)
+    return out if isinstance(out, list) else [out]
+
+
+def list_issues(status=None, labels=()):
+    """All issues (no comments). status: open, in_progress, closed or all; default excludes closed."""
+    out = _br("list", "--limit=0", *_opt("--status", status), *[f"--label={x}" for x in labels]) or []
+    return out if isinstance(out, list) else out.get("issues", [])
+
+
 def update(issue, status=None, assignee=None, claim=False, title=None,
            priority=None, notes=None, add_labels=(), remove_labels=(), description=None):
     args = ["update", issue, *_opt("--status", status), *_opt("--assignee", assignee),
@@ -171,6 +185,11 @@ def self_test():
 
             assert close(q["id"], reason="moot")["status"] == "closed"
             assert show(q["id"])["status"] == "closed"
+            assert [i["id"] for i in show_many([a["id"], q["id"]])] == [a["id"], q["id"]]
+            assert show_many([a["id"]])[0]["comments"][0]["text"] == c["text"]
+            assert {i["id"] for i in list_issues(status="all")} == {a["id"], q["id"]}
+            assert list_issues(labels=["question"]) == []  # closed is excluded by default
+            assert [i["id"] for i in list_issues(status="closed", labels=["question"])] == [q["id"]]
 
             try:
                 show("lt-nope")

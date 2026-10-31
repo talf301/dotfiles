@@ -255,20 +255,27 @@ class Linear:
                 return out
             after = team[field]["pageInfo"]["endCursor"]
 
+    def mutate(self, name, query, variables):
+        """One mutation; `success: false` is an error, so a failed write is never reported as done."""
+        r = (self.gql(query, variables) or {}).get(name) or {}
+        if r.get("success") is not True:
+            raise LinearError(f"{name}: success={r.get('success')}")
+        return r
+
     def label(self, name):
-        r = self.gql("mutation($input: IssueLabelCreateInput!) { issueLabelCreate(input: $input) "
-                     "{ success issueLabel { id } } }", {"input": {"name": name, "teamId": self.guard(self.team)}})
-        return r["issueLabelCreate"]["issueLabel"]["id"]
+        return self.mutate("issueLabelCreate", "mutation($input: IssueLabelCreateInput!) { issueLabelCreate("
+                           "input: $input) { success issueLabel { id } } }",
+                           {"input": {"name": name, "teamId": self.guard(self.team)}})["issueLabel"]["id"]
 
     def create(self, fields):
-        r = self.gql("mutation($input: IssueCreateInput!) { issueCreate(input: $input) "
-                     "{ success issue { id identifier url } } }", {"input": {**fields, "teamId": self.guard(self.team)}})
-        return r["issueCreate"]["issue"]
+        return self.mutate("issueCreate", "mutation($input: IssueCreateInput!) { issueCreate(input: $input) "
+                           "{ success issue { id identifier url } } }",
+                           {"input": {**fields, "teamId": self.guard(self.team)}})["issue"]
 
     def update(self, issue, team, fields):
         self.guard(team)
-        self.gql("mutation($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) "
-                 "{ success } }", {"id": issue, "input": fields})
+        self.mutate("issueUpdate", "mutation($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, "
+                    "input: $input) { success } }", {"id": issue, "input": fields})
 
 
 # --- one run ---
@@ -293,9 +300,10 @@ def offline(issues_with_comments):
     return {"states": {}, "labels": {}, "issues": out}
 
 
-def apply(writes, client, remote):
-    """Do the writes in order (labels first); returns one brief line per write done. Stops at the first error."""
-    labels, done = dict(remote["labels"]), []
+def apply(writes, client, remote, done):
+    """Do the writes in order (labels first); appends one brief line per write done to `done`. Stops at the first
+    error, so `done` still shows what was written before it."""
+    labels = dict(remote["labels"])
     for w in writes[:MAX_WRITES]:
         if w["op"] == "label":
             labels[w["name"]] = client.label(w["name"])
@@ -314,7 +322,6 @@ def apply(writes, client, remote):
                 fields["labelIds"] = [labels[n] for n in w["labels"] if n in labels] + [labels[w["label"]]]
             client.update(w["issue"], w["team"], fields)
         done.append(brief(w))
-    return done
 
 
 def run(dry_run, inbox=(), inbox_url="", client=None):
@@ -336,7 +343,8 @@ def run(dry_run, inbox=(), inbox_url="", client=None):
                       {b["id"]: [c.get("text") or "" for c in b.get("comments") or []] for b in beads})
         out["writes"] = [brief(w) for w in writes]
         if not dry_run:
-            out["done"] = apply(writes, client, remote)
+            out["done"] = []
+            apply(writes, client, remote, out["done"])
     except (LinearError, ledger.LedgerError, subprocess.TimeoutExpired) as e:
         out["error"] = f"{type(e).__name__}: {e}"
     return out
@@ -404,6 +412,8 @@ def self_test():
                 return self.reply(200, {"data": {"issueCreate": {"success": True, "issue": {
                     k: team_issues[-1][k] for k in ("id", "identifier", "url")}}}})
             i = next(i for i in team_issues if i["id"] == v["id"])
+            if inp.get("title") == "Refused":
+                return self.reply(200, {"data": {"issueUpdate": {"success": False}}})
             i.update({k: inp[k] for k in ("title", "description") if k in inp})
             if "stateId" in inp:
                 i["state"] = by_state[inp["stateId"]]
@@ -495,6 +505,13 @@ def self_test():
             r = run(False, inbox, "http://inbox/")
             assert r["done"] == [f"comment {d['id']} linear: TAL-99 https://linear.app/x/TAL-99"], r
             assert len(team_issues) == 6
+
+            # Linear answers success: false: an error, not done; the rerun tries again.
+            ledger.update(d["id"], title="Refused")
+            for _ in range(2):
+                r = run(False, inbox, "http://inbox/")
+                assert r["done"] == [] and "issueUpdate: success=False" in r["error"], r
+            ledger.update(d["id"], title="Crashed")
 
             # A rejected cached token: one new token, then the call succeeds.
             with open(os.path.join(root, "state", "linear-token.json"), "w") as f:

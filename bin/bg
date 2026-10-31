@@ -129,6 +129,9 @@ def new_bead(title, prompt=None):
 
 def dispatch(bead, done_when, name=None, cwd=None, prompt=None):
     issue = ledger.show(bead)
+    if "quarantined" in (issue.get("labels") or []):  # reconcile.py over-limit; Tal removes the label
+        print(f"bg: {bead} is quarantined (attempt limit): not dispatchable", file=sys.stderr)
+        return 1
     if issue["status"] != "open" or issue.get("assignee"):
         print(f"bg: {bead} is {issue['status']}, assignee {issue.get('assignee')}: not dispatchable",
               file=sys.stderr)

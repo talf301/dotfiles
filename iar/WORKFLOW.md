@@ -13,9 +13,12 @@
     "max_concurrent_by_state": {"in_progress": 3}
   },
   "stall_after_min": 30,
+  "limits": {"max_attempts": 3, "max_attempt_hours": 4, "max_attempt_tokens": 3000000},
   "max_retry_backoff_ms": 300000,
   "compute_allowlist": [],
   "actions": {
+    "over-limit": false,
+    "ineligible-running": false,
     "answer-pending": false,
     "question-deadline": false,
     "malformed-question": false,

@@ -21,8 +21,8 @@ Items are beads. A bead is loop-owned when its latest `attempt: <n> session: ...
 matches its assignee `agent:<bead>#<n>`. Leases count only when the holder is exactly
 `agent:<bead>#<n>`. Everything else is `external` and gets no action.
 
-Classes, first match wins: source-error, external, answer-pending, question-deadline,
-malformed-question, stalled, zombie, stale-lease, closed-bead-thread, working, waiting, idle.
+Classes, first match wins: source-error, external, over-limit, ineligible-running, answer-pending,
+question-deadline, malformed-question, stalled, zombie, stale-lease, closed-bead-thread, working, waiting, idle.
 An action is `reconcile: <action> <key>` on the bead; a key already in its comments is not proposed.
 
 Executor: for each proposed action, the tick reloads the switches (so --kill stops a running tick),
@@ -32,7 +32,23 @@ and drops the label. A later tick fetches labelled beads and finishes each open 
 action's own effect is visible (a crash between acting and the comment), it writes the comment and
 does not act again; if not, and the action is no longer proposed, it writes `reconcile-dropped: <key>`.
 An action fails alone: no `reconcile:` comment, the next tick retries it.
-Actions are in EXECUTORS by verb (W12, W13); a verb with no executor is skipped.
+Actions are in EXECUTORS by verb; a verb with no executor is skipped. W12 (housekeeping):
+  zombie              release (branch pushed: status open, assignee cleared) or flag-zombie (with the resume command)
+  stale-lease         return-lease only after the release preflight passes, checked again at act time (E10);
+                      flag-lease when a check fails that waiting does not fix (dirty, unpushed, branch not pushed)
+  closed-bead-thread  resolve-thread: one "landed" line in the thread, then resolve it
+  stalled             one nudge ("status?") per attempt, then flag-stalled; no automatic kill
+  over-limit          working past a WORKFLOW.md `limits` value (attempts, hours, tokens): one limit-nudge per
+                      attempt; still working 15 min later, or over a limit again in a later attempt: quarantine
+                      (labels quarantined + needs-human; bin/bg refuses a quarantined bead; board: Needs you)
+  ineligible-running  the bead was closed (its own W9 close: once the turn ends) or deferred, or lost `auto` (only
+                      attempts marked `dispatch: auto`): stop-session, verified; the worktree stays and
+                      stale-lease returns the slot after the preflight
+A flag is a `reconcile-note: <key>` comment. Before a nudge that stops a running session, flag-stalled, quarantine
+or stop-session, the tick saves the
+last 40 lines of the session's final assistant text (`last-output: <key>`).
+A nudge is `claude --bg --resume <sid> <text>`. That CLI starts a copy when the session process runs, so a running
+session is stopped first (verified); conversation, attempt, slot and branch stay (Inbox msg_01M67Q4XVNNV1H27VZA6YGZVXT).
 Exit 75: another tick holds $IAR_STATE_DIR/reconcile.lock.
 """
 
@@ -41,6 +57,7 @@ import glob
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -65,7 +82,14 @@ HOLDER_RE = re.compile(r"^agent:([a-z0-9]+-[a-z0-9.]+)#(\d+)$")
 ATTEMPT_RE = re.compile(r"^attempt: (\d+) session: (\S+) slot: (\S+) branch: (\S+)")
 QID_RE = re.compile(r"^QUESTION:\s*(precog-[A-Za-z0-9]+(?:\.[A-Za-z0-9]+)*)\.?(?:\s|$)")  # as in notify-stop.sh
 DEFAULTS = {"sessions": [], "slots": [], "inbox": [], "inbox_url": "http://localhost/", "plannotator": [],
-            "beads": [], "questions": [], "issues": {}, "git": {}, "session_names": {}}
+            "beads": [], "questions": [], "issues": {}, "git": {}, "slot_git": {}, "session_names": {}}
+LIMITS = {"max_attempts": 3, "max_attempt_hours": 4, "max_attempt_tokens": 3_000_000}  # WORKFLOW.md `limits` overrides
+LIMIT_GRACE = timedelta(minutes=15)  # after a limit-nudge, still working this long: quarantine
+QUARANTINE = "quarantined"
+OUTPUT_LINES = 40
+STOP_WAIT_S = 30
+INBOX_PROJECT = "/Users/tal/.local/share/precog/Precog agents"  # inbox-etiquette.md: every send_message names it
+TRANSIENT = ("process running in the slot", "session running")  # preflight fails that end by themselves: no flag
 
 
 class SourceError(RuntimeError):
@@ -85,9 +109,9 @@ def left():
     return remaining
 
 
-def sh(cmd, cwd=None, check=True):
+def sh(cmd, cwd=None, check=True, input=None):
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=left(), cwd=cwd)
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=left(), cwd=cwd, input=input)
     except (OSError, subprocess.TimeoutExpired) as e:
         raise SourceError(f"{os.path.basename(cmd[0])}: {e}")
     if check and p.returncode != 0:
@@ -137,13 +161,17 @@ def processes():
 def transcript_facts(sid):
     """What agents-digest.sh reads from a transcript tail, plus the file's last write."""
     paths = glob.glob(f"{HOME}/.claude/projects/*/{sid}.jsonl")
-    if not paths:
-        return {}
-    facts = {"transcript_at": datetime.fromtimestamp(os.path.getmtime(paths[0]), timezone.utc).isoformat()}
-    with open(paths[0], "rb") as f:
+    return read_transcript(paths[0]) if paths else {}
+
+
+def read_transcript(path):
+    facts = {"transcript": path,
+             "transcript_at": datetime.fromtimestamp(os.path.getmtime(path), timezone.utc).isoformat()}
+    with open(path, "rb") as f:
         f.seek(0, 2)
         f.seek(max(0, f.tell() - 400_000))
         tail = f.read().decode(errors="replace")
+    output_id, output = None, []  # the last assistant message with text; its blocks are separate lines
     for line in tail.splitlines():
         try:
             r = json.loads(line)
@@ -163,7 +191,32 @@ def transcript_facts(sid):
                 if kind == "assistant" and isinstance(content, list) else []
             if texts:
                 facts["last_message"] = texts[-1].split("\n")[0]
+                msg_id = (r.get("message") or {}).get("id")
+                output = (output if msg_id and msg_id == output_id else []) + texts
+                output_id = msg_id
+    if output:
+        facts["last_output"] = "\n".join("\n".join(output).splitlines()[-OUTPUT_LINES:])
     return facts
+
+
+def transcript_tokens(path):
+    """input + output + cache_creation tokens of the assistant messages. Every content block of a message is its own
+    line with the same message id and usage, so a message counts once."""
+    # ponytail: reads the whole file each tick for each working session; cache by (size, offset) if it gets slow
+    usage = {}
+    with open(path, errors="replace") as f:
+        for line in f:
+            if '"usage"' not in line:
+                continue
+            try:
+                m = json.loads(line).get("message") or {}
+            except ValueError:
+                continue
+            u = m.get("usage") if isinstance(m, dict) else None
+            if isinstance(u, dict) and m.get("id"):
+                usage[m["id"]] = sum(u.get(k) or 0 for k in
+                                     ("input_tokens", "output_tokens", "cache_creation_input_tokens"))
+    return sum(usage.values())
 
 
 def check_agents(rows):
@@ -197,6 +250,8 @@ def src_agents(snap):
             continue
         s = {**r, **transcript_facts(r["sessionId"])}
         s["alive"] = bool(r.get("pid")) and r["pid"] in procs  # live: a pid and the process exists
+        if r["kind"] == "background" and r.get("state") == "working" and s.get("transcript"):
+            s["tokens"] = transcript_tokens(s["transcript"])  # over-limit reads it for working sessions only
         kids, todo = {}, [r["pid"]] if s["alive"] else []
         while todo:
             parent = todo.pop()
@@ -304,6 +359,9 @@ def src_br(snap):
                              for i in issues if i["status"] == "open" and "question" in (i.get("labels") or [])]
         want = {i["id"] for i in snap["beads"]}
         want |= {i["id"] for i in issues if "reconcile-pending" in (i.get("labels") or [])}  # open intents (W11)
+        want |= {i["id"] for i in issues if QUARANTINE in (i.get("labels") or []) and i["status"] != "closed"}  # board
+        # ineligible-running: a running session's bead, whatever its status (closed, deferred).
+        want |= {m[1] for s in snap["sessions"] if running(s) and (m := BEAD_RE.match(s.get("name") or ""))}
         want |= {m[1] for s in snap["slots"] if (m := HOLDER_RE.match(s["holder"]))}
         want |= {m[1] for t in snap["inbox"] if (m := BEAD_RE.match(t["subject"]))}
         # A thread with another subject still belongs to the bead its author session is named after.
@@ -320,27 +378,54 @@ def src_br(snap):
 
 
 def attempts(issue):
-    """{n: {session, slot, branch}} from bin/bg's attempt comments."""
-    return {int(m[1]): {"session": m[2], "slot": m[3], "branch": m[4]}
+    """{n: {session, slot, branch, at, auto}} from bin/bg's attempt comments (auto: W14 marks `dispatch: auto`)."""
+    return {int(m[1]): {"session": m[2], "slot": m[3], "branch": m[4], "at": c.get("created_at"),
+                        "auto": " dispatch: auto" in c["text"]}
             for c in issue.get("comments") or [] if (m := ATTEMPT_RE.match(c.get("text") or ""))}
 
 
+def branch_state(slot, branch):
+    """pushed: `git ls-remote` has the branch at the local HEAD."""
+    head = os.path.isdir(slot) and sh(["/usr/bin/git", "-C", slot, "rev-parse", "--verify", "--quiet",
+                                       f"refs/heads/{branch}"], check=False)
+    head = head.strip() if head else None
+    remote = None
+    if head:
+        out = sh(["/usr/bin/git", "-C", slot, "ls-remote", "origin", f"refs/heads/{branch}"])
+        remote = out.split()[0] if out.strip() else None
+    return {"head": head, "remote": remote, "pushed": bool(head) and head == remote}
+
+
+def slot_state(path):
+    """Release preflight git checks: uncommitted or untracked files; a local branch with commits that no current
+    origin branch has. Origin heads come from `git ls-remote` (not cached remote-tracking refs, which may name a
+    deleted or rewritten branch); a head not in the local object store cannot cover a local commit."""
+    git = ["/usr/bin/git", "-C", path]
+    dirty = sh([*git, "status", "--porcelain"])
+    heads = "\n".join(line.split()[0] for line in sh([*git, "ls-remote", "--heads", "origin"]).splitlines() if line.strip())
+    known = [line.split()[0] for line in sh([*git, "cat-file", "--batch-check"], input=heads + "\n").splitlines()
+             if line.split()[1:2] == ["commit"]]
+    # `--not` does not reach revisions read from --stdin: each one gets its own ^
+    unpushed = sh([*git, "rev-list", "--max-count=1", "--branches", "--stdin"], input="".join(f"^{x}\n" for x in known))
+    return {"dirty": bool(dirty.strip()), "unpushed": bool(unpushed.strip())}
+
+
 def src_git(snap):
-    """pushed: `git ls-remote` has the branch at the local HEAD. Only for the latest attempt with a slot on disk."""
+    """Branch state for the latest attempt of each bead and the attempt of each bin/bg lease; slot state for
+    each bin/bg lease with a path on disk."""
     for bid, issue in snap["issues"].items():
         att = attempts(issue)
-        if not att:
+        if att:
+            n = max(att)
+            snap["git"][f"{bid}#{n}"] = branch_state(att[n]["slot"], att[n]["branch"])
+    for lease in snap["slots"]:
+        m = HOLDER_RE.match(lease["holder"])
+        a = m and attempts(snap["issues"].get(m[1]) or {}).get(int(m[2]))
+        if not a or not lease.get("path") or not os.path.isdir(lease["path"]):
             continue
-        n = max(att)
-        a = att[n]
-        head = os.path.isdir(a["slot"]) and sh(["/usr/bin/git", "-C", a["slot"], "rev-parse", "--verify", "--quiet",
-                                                 f"refs/heads/{a['branch']}"], check=False)
-        head = head.strip() if head else None
-        remote = None
-        if head:
-            out = sh(["/usr/bin/git", "-C", a["slot"], "ls-remote", "origin", f"refs/heads/{a['branch']}"])
-            remote = out.split()[0] if out.strip() else None
-        snap["git"][f"{bid}#{n}"] = {"head": head, "remote": remote, "pushed": bool(head) and head == remote}
+        snap["slot_git"][lease["slot"]] = slot_state(lease["path"])
+        if f"{m[1]}#{m[2]}" not in snap["git"]:
+            snap["git"][f"{m[1]}#{m[2]}"] = branch_state(lease["path"], a["branch"])
 
 
 # Order matters: br reads the leases and threads, git reads the issues.
@@ -367,10 +452,14 @@ def cpu_active(snap, state_dir, now):
     os.replace(f.name, path)
 
 
-def snapshot(now, sources=None, state_dir=None):
-    """Run every source; a failure lands in snap["errors"] and leaves that source's defaults."""
+def snapshot(now, sources=None, state_dir=None, only=None):
+    """Run every source (or the `only` ones); a failure lands in snap["errors"] and leaves that source's defaults.
+    snap["refresh"]() takes a new snapshot with the same sources, for checks an action repeats when it acts."""
     snap = {"at": now.isoformat(), "errors": {}, **json.loads(json.dumps(DEFAULTS))}
+    snap["refresh"] = lambda: snapshot(datetime.now(timezone.utc), sources, only=("agents", "treehouse", "br", "git"))
     for name, fn in {**SOURCES, **(sources or {})}.items():
+        if only and name not in only:
+            continue
         _deadline[0] = start = time.monotonic() + TIMEOUT_S
         try:
             fn(snap)
@@ -391,7 +480,57 @@ def snapshot(now, sources=None, state_dir=None):
 
 # --- classify: pure ---
 
-def classify_bead(bid, b, snap, now, stall_after, sessions, leases, threads):
+def running(s):
+    """The session's process runs (a live pid) or it works."""
+    return bool(s) and (bool(s.get("alive")) or s.get("state") == "working" or s.get("status") == "busy")
+
+
+def preflight(bid, b, k, lease, snap, sessions):
+    """Release preflight (spec "State machines") for the lease of attempt k: [] when it may be returned, else the
+    checks that fail."""
+    fails = []
+    g = snap["slot_git"].get(lease["slot"])
+    if g is None:
+        fails.append("no git state for the slot")
+    else:
+        fails += ["worktree not clean"] * g["dirty"] + ["local commits missing from origin"] * g["unpushed"]
+    if lease.get("live"):
+        fails.append("process running in the slot")
+    if b["status"] != "closed":
+        if not snap["git"].get(f"{bid}#{k}", {}).get("pushed"):
+            fails.append("bead not closed and branch not pushed")
+        if running(sessions.get(attempts(b)[k]["session"])):
+            fails.append("session running")
+    return fails
+
+
+def over_limit(b, n, s, now, limits):
+    """The first WORKFLOW.md limit attempt n is past: attempts, hours (since its attempt comment), tokens."""
+    lim = {**LIMITS, **(limits or {})}
+    start = parse_time(attempts(b)[n]["at"])
+    if n > lim["max_attempts"]:
+        return "attempts"
+    if start and now - start >= timedelta(hours=lim["max_attempt_hours"]):
+        return "hours"
+    if (s.get("tokens") or 0) >= lim["max_attempt_tokens"]:
+        return "tokens"
+    return None
+
+
+def limit_actions(b, n, limit, now):
+    """One limit-nudge per attempt; quarantine 15 min after it, or at once when an earlier attempt was nudged."""
+    if QUARANTINE in (b.get("labels") or []):
+        return []
+    nudged = {}
+    for c in b.get("comments") or []:
+        if m := re.match(r"reconcile: limit-nudge attempt=(\d+) ", c.get("text") or ""):
+            nudged.setdefault(int(m[1]), parse_time(c.get("created_at")) or now)
+    if n not in nudged:
+        return [f"quarantine attempt={n}"] if nudged else [f"limit-nudge attempt={n} limit={limit}"]
+    return [f"quarantine attempt={n}"] if now - nudged[n] >= LIMIT_GRACE else []
+
+
+def classify_bead(bid, b, snap, now, stall_after, sessions, leases, threads, limits=None):
     """Return (class, [action key, …]) for one bead. Predicates: spec W10 and factory-scan.md 1.4."""
     att = attempts(b)
     n = max(att, default=None)
@@ -405,6 +544,16 @@ def classify_bead(bid, b, snap, now, stall_after, sessions, leases, threads):
     s = sessions.get(att[n]["session"]) if owned else None
     a = f"attempt={n}"
     working = bool(s) and (s.get("state") == "working" or s.get("status") == "busy")
+    if owned and working and b["status"] == "in_progress" and (limit := over_limit(b, n, s, now, limits)):
+        return "over-limit", limit_actions(b, n, limit, now)
+    if owned and running(s):
+        # The session's own W9 close (reason "integrated into ...", WORKFLOW.md step 7) is followed by its FYI guide
+        # and READY line in the same turn, so that session is stopped once its turn ends; any other close at once.
+        own_close = (b.get("close_reason") or "").startswith("integrated into ")
+        why = (b["status"] == "closed" and not (working and own_close)) or b["status"] == "deferred" \
+            or (att[n]["auto"] and "auto" not in (b.get("labels") or []))
+        if why:
+            return "ineligible-running", [f"stop-session {a}"]
     if owned:
         qs = [q for q in snap["questions"] if q.get("asking") == bid]
         pending = [q for q in qs if "answered" in q["labels"] and "delivered" not in q["labels"]]
@@ -421,14 +570,21 @@ def classify_bead(bid, b, snap, now, stall_after, sessions, leases, threads):
             return "malformed-question", [f"flag-malformed {a}"]
         wrote = parse_time(s.get("transcript_at")) if s else None
         if working and wrote and now - wrote >= stall_after and s.get("cpu_active") is False:
-            return "stalled", [f"nudge {a} count=1"]
-        running = [sessions[x["session"]] for x in att.values() if x["session"] in sessions]
+            return "stalled", [f"flag-stalled {a}" if f"nudge {a} count=1" in done_keys(b) else f"nudge {a} count=1"]
+        listed = [sessions[x["session"]] for x in att.values() if x["session"] in sessions]
         if b["status"] == "in_progress" and not any(
-                r.get("state") in ("working", "blocked") or r.get("alive") for r in running):
+                r.get("state") in ("working", "blocked") or r.get("alive") for r in listed):
             pushed = snap["git"].get(f"{bid}#{n}", {}).get("pushed")
             return "zombie", [f"release {a}" if pushed else f"flag-zombie {a}"]
     if stale:
-        return "stale-lease", [f"return-lease slot={x['slot']} holder={x['holder']}" for x in stale]
+        keys = []
+        for x in stale:
+            fails = preflight(bid, b, int(HOLDER_RE.match(x["holder"])[2]), x, snap, sessions)
+            if not fails:
+                keys.append(f"return-lease slot={x['slot']} holder={x['holder']}")
+            elif not set(fails) & set(TRANSIENT):  # E10: never returned; flagged once
+                keys.append(f"flag-lease slot={x['slot']} holder={x['holder']}")
+        return "stale-lease", keys
     mine = threads.get(bid, [])
     if owned and b["status"] == "closed" and mine:
         return "closed-bead-thread", [f"resolve-thread thread={t['id']}" for t in mine]
@@ -444,7 +600,7 @@ def done_keys(issue):
             if (c.get("text") or "").startswith("reconcile: ")}
 
 
-def classify(snap, now, stall_after_min=30):
+def classify(snap, now, stall_after_min=30, limits=None):
     """{"classes": {bead: class}, "actions": [{item, class, action}]}; actions already recorded are left out."""
     sessions = {s["sessionId"]: s for s in snap["sessions"]}
     leases = {}
@@ -461,7 +617,8 @@ def classify(snap, now, stall_after_min=30):
         if snap["errors"]:
             classes[bid] = "source-error"
             continue
-        cls, keys = classify_bead(bid, b, snap, now, timedelta(minutes=stall_after_min), sessions, leases, threads)
+        cls, keys = classify_bead(bid, b, snap, now, timedelta(minutes=stall_after_min), sessions, leases, threads,
+                                  limits)
         classes[bid] = cls
         actions += [{"item": bid, "class": cls, "action": k} for k in keys if k not in done_keys(b)]
     return {"classes": classes, "actions": actions}
@@ -590,6 +747,256 @@ def set_switches(enable=None, path=None):
     return new
 
 
+# --- W12 actions: each is (visible, act) in EXECUTORS ---
+
+def key_field(a, name):
+    return re.search(rf"\b{name}=(\S+)", a["action"])[1]
+
+
+def session_of(a, snap):
+    """(attempt record, the session's row in this tick or {}) for the attempt the action names."""
+    att = attempts(snap["issues"][a["item"]])[int(key_field(a, "attempt"))]
+    return att, next((s for s in snap["sessions"] if s["sessionId"] == att["session"]), {})
+
+
+def note(a, body):
+    ledger.comment(a["item"], f"reconcile-note: {a['action']}\n{body}")
+
+
+def noted(a, snap):
+    """A flag's effect is its note."""
+    return any((c.get("text") or "").startswith(f"reconcile-note: {a['action']}\n")
+               for c in ledger.show(a["item"]).get("comments") or [])
+
+
+def save_output(a, s):
+    """Before a flag or a stop: the last 40 lines of the session's final assistant text, once per action."""
+    head = f"last-output: {a['action']} session={s.get('sessionId')}"
+    if any((c.get("text") or "").startswith(head) for c in ledger.show(a["item"]).get("comments") or []):
+        return
+    ledger.comment(a["item"], f"{head}\n````\n{s.get('last_output') or '(no assistant text in the transcript)'}\n````")
+
+
+def agent_rows():
+    return check_agents(json.loads(sh([f"{BIN}/claude", "agents", "--json", "--all"])))
+
+
+def stop_session(sid, short):
+    """claude stop, then wait until claude agents shows the session stopped or without a process."""
+    sh([f"{BIN}/claude", "stop", short or sid])
+    for _ in range(STOP_WAIT_S):
+        row = next((r for r in agent_rows() if r["sessionId"] == sid), None)
+        if row is None or row.get("state") == "stopped" or not row.get("pid"):
+            return
+        time.sleep(1)
+    raise RuntimeError(f"session {sid} still running after claude stop")
+
+
+def send(s, slot, text):
+    """Give the session a new turn with text. `claude --bg --resume` starts a copy when the process runs, so a
+    running session is stopped first. Verified: the resumed id must be this session, else the copy is stopped."""
+    if running(s):
+        stop_session(s["sessionId"], s.get("id"))
+    out = sh([f"{BIN}/claude", "--bg", "--resume", s["sessionId"], text], cwd=slot)
+    m = re.search(r"backgrounded\W+([\w-]+)", out)
+    if not m:
+        raise RuntimeError(f"claude --bg --resume printed no session id: {out.strip()[:200]}")
+    for _ in range(STOP_WAIT_S):
+        row = next((r for r in agent_rows() if r.get("id") == m[1]), None)
+        if row and row["sessionId"] != s["sessionId"]:
+            stop_session(row["sessionId"], row.get("id"))
+            raise RuntimeError(f"resume started a copy {row['sessionId']} of {s['sessionId']}; the copy is stopped")
+        if row:
+            return
+        time.sleep(1)
+    raise RuntimeError(f"resumed session {m[1]} not in claude agents after {STOP_WAIT_S}s")
+
+
+def inbox(tool, args):
+    """One Inbox MCP tool call through `plannotator inbox mcp` (IAR_INBOX_CMD overrides it, as in question.py)."""
+    msgs = [{"jsonrpc": "2.0", "id": 1, "method": "initialize",
+             "params": {"protocolVersion": "2025-03-26", "capabilities": {},
+                        "clientInfo": {"name": "iar-reconcile", "version": "1"}}},
+            {"jsonrpc": "2.0", "method": "notifications/initialized"},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": tool, "arguments": args}}]
+    p = subprocess.run(shlex.split(os.environ.get("IAR_INBOX_CMD", "plannotator inbox mcp")),
+                       input="".join(json.dumps(m) + "\n" for m in msgs), capture_output=True, text=True,
+                       timeout=TIMEOUT_S)
+    for line in p.stdout.splitlines():
+        try:
+            m = json.loads(line)
+        except ValueError:
+            continue
+        if m.get("id") == 2:
+            if m.get("error") or (m.get("result") or {}).get("isError"):
+                raise RuntimeError(f"inbox {tool}: {json.dumps(m.get('error') or m['result'])[:300]}")
+            return m["result"]
+    raise RuntimeError(f"inbox {tool}: no answer (exit {p.returncode}): {p.stderr.strip()[-200:]}")
+
+
+def still_proposed(a, snap):
+    """Classify fresh sources again: the action is still what this bead needs (its session did not resume, its
+    branch did not change)."""
+    fresh = snap["refresh"]()
+    if fresh["errors"]:
+        raise RuntimeError(f"fresh sources failed: {fresh['errors']}")
+    return any(x["item"] == a["item"] and x["action"] == a["action"]
+               for x in classify(fresh, datetime.now(timezone.utc))["actions"])
+
+
+def act_release(a, snap):
+    att, s = session_of(a, snap)
+    if not still_proposed(a, snap):
+        raise RuntimeError("no longer a zombie with a pushed branch on fresh sources")
+    ledger.update(a["item"], status="open", assignee="")
+    note(a, f"Released the claim: session {att['session']} is {s.get('state') or 'not listed'} with no process, "
+            f"and branch {att['branch']} is pushed. The bead is open again.")
+
+
+def act_flag_zombie(a, snap):
+    att, s = session_of(a, snap)
+    note(a, f"Zombie: the bead is in progress, session {att['session']} is {s.get('state') or 'not listed'} with no "
+            f"process, and branch {att['branch']} is not pushed, so the claim stays. "
+            f"Resume it: cd {att['slot']} && claude --resume {att['session']}")
+
+
+def lease_of(a, snap):
+    slot, holder = key_field(a, "slot"), key_field(a, "holder")
+    return next((x for x in snap["slots"] if x["slot"] == slot and x["holder"] == holder), None)
+
+
+def lease_fails(a, snap):
+    lease = lease_of(a, snap)
+    sessions = {s["sessionId"]: s for s in snap["sessions"]}
+    return lease, preflight(a["item"], snap["issues"][a["item"]], int(HOLDER_RE.match(lease["holder"])[2]),
+                            lease, snap, sessions)
+
+
+def act_return_lease(a, snap):
+    """E10: the preflight runs again on fresh sources right before the return."""
+    fresh = snap["refresh"]()
+    if fresh["errors"]:
+        raise RuntimeError(f"preflight sources failed: {fresh['errors']}")
+    if not lease_of(a, fresh):
+        return  # already returned
+    lease, fails = lease_fails(a, fresh)
+    if fails:
+        raise RuntimeError(f"release preflight failed: {'; '.join(fails)}")
+    sh([f"{BIN}/treehouse", "return", lease["path"], "--force", "--if-lease-holder", lease["holder"]], cwd=PRECOG)
+
+
+def act_flag_lease(a, snap):
+    lease, fails = lease_fails(a, snap)
+    note(a, f"Lease {lease['holder']} on slot {lease['slot']} ({lease.get('path')}) is not returned: "
+            f"{'; '.join(fails)}. Push or clean the slot, then the next tick returns it.")
+
+
+def act_resolve_thread(a, snap):
+    tid, b = key_field(a, "thread"), snap["issues"][a["item"]]
+    inbox("send_message", {"body": f"Landed: {a['item']} is closed ({b.get('close_reason') or 'no reason given'}).",
+                           "reply_to": tid, "idempotency_key": f"landed-{tid}", "project_path": INBOX_PROJECT})
+    inbox("resolve_message", {"message_id": tid, "resolved": True})
+
+
+NUDGES = {"nudge": "status?",
+          "limit-nudge": "You reached the {limit} limit: commit, push your branch, write a status comment, then stop."}
+
+
+def nudge_text(a):
+    verb = a["action"].split()[0]
+    return NUDGES[verb].format(limit=key_field(a, "limit")) if verb == "limit-nudge" else NUDGES[verb]
+
+
+def transcript_has(path, text, since):
+    """A user turn in the transcript at or after `since` whose content holds `text`."""
+    needle = json.dumps(text)[1:-1]
+    try:
+        with open(path, errors="replace") as f:
+            for line in f:
+                if needle not in line or '"user"' not in line:
+                    continue
+                try:
+                    r = json.loads(line)
+                except ValueError:
+                    continue
+                at = parse_time(r.get("timestamp"))
+                if r.get("type") == "user" and at and at >= since and text in json.dumps((r.get("message") or {}).get("content"), ensure_ascii=False):
+                    return True
+    except OSError:
+        pass
+    return False
+
+
+def delivered(a, snap):
+    """A nudge's effect: its note, or (a crash after the resume, before the note) the session's transcript has a
+    user turn with the nudge text after the action started. Keeps a nudge once per attempt."""
+    if noted(a, snap):
+        return True
+    starts = [parse_time(c.get("created_at")) for c in ledger.show(a["item"]).get("comments") or []
+              if (c.get("text") or "").startswith("reconcile-start: ") and c["text"].rstrip().endswith(f" {a['action']}")]
+    att, _ = session_of(a, snap)
+    path = transcript_facts(att["session"]).get("transcript")
+    return bool(starts and path and transcript_has(path, nudge_text(a), min(starts)))
+
+
+def act_nudge(a, snap):
+    att, s = session_of(a, snap)
+    if running(s):
+        save_output(a, s)  # send() stops a running session first
+    send(s, att["slot"], nudge_text(a))
+    note(a, f"Sent session {att['session']}: {nudge_text(a)}")
+
+
+def act_flag_stalled(a, snap):
+    att, s = session_of(a, snap)
+    save_output(a, s)
+    note(a, f"Stalled after one nudge: session {att['session']} works with no transcript write and no child CPU. "
+            f"Not stopped (no automatic kill). Look: claude attach {s.get('id') or att['session']}")
+
+
+def act_quarantine(a, snap):
+    att, s = session_of(a, snap)
+    save_output(a, s)
+    ledger.label(a["item"], add=[QUARANTINE, "needs-human"])
+    note(a, f"Quarantined: attempt {key_field(a, 'attempt')} still works past its limit after the limit nudge "
+            f"(or an earlier attempt was nudged too). bin/bg does not dispatch it until you remove `{QUARANTINE}`.")
+
+
+def act_stop_session(a, snap):
+    att, s = session_of(a, snap)
+    b = snap["issues"][a["item"]]
+    save_output(a, s)
+    stop_session(att["session"], s.get("id"))
+    why = b["status"] if b["status"] in ("closed", "deferred") else "no longer labelled auto"
+    note(a, f"Stopped session {att['session']}: the bead is {why}. The worktree stays; the slot is returned once "
+            f"the release preflight passes.")
+
+
+def lease_gone(a, snap):
+    return lease_of(a, snap) is None
+
+
+def released(a, snap):
+    fresh = ledger.show(a["item"])
+    holder = f"agent:{a['item']}#{key_field(a, 'attempt')}"
+    return not (fresh["status"] == "in_progress" and fresh.get("assignee") == holder)
+
+
+EXECUTORS.update({
+    "release": (released, act_release),
+    "flag-zombie": (noted, act_flag_zombie),
+    "return-lease": (lease_gone, act_return_lease),
+    "flag-lease": (noted, act_flag_lease),
+    "resolve-thread": (lambda a, snap: key_field(a, "thread") not in {t["id"] for t in snap["inbox"]},
+                       act_resolve_thread),
+    "nudge": (delivered, act_nudge),
+    "flag-stalled": (noted, act_flag_stalled),
+    "limit-nudge": (delivered, act_nudge),
+    "quarantine": (lambda a, snap: QUARANTINE in (ledger.show(a["item"]).get("labels") or []), act_quarantine),
+    "stop-session": (lambda a, snap: not running(session_of(a, snap)[1]), act_stop_session),
+})
+
+
 # --- tick ---
 
 def state_dir():
@@ -612,10 +1019,11 @@ def tick(d, dry_run, sources=None, executors=None, board=False):
             config, _ = workflow.load()
             os.environ.setdefault("BEADS_DIR", config["tracker"]["beads_dir"])
             snap = snapshot(now, sources, state_dir=d)
-            stall = config["stall_after_min"]
+            stall, limits = config["stall_after_min"], config.get("limits")
         except workflow.WorkflowError as e:
             snap, stall = {**json.loads(json.dumps(DEFAULTS)), "errors": {"workflow": str(e)}}, 30
-        result = classify(snap, now, stall)
+            limits = None
+        result = classify(snap, now, stall, limits)
         line = {"at": now.isoformat(), "dry_run": dry_run, "errors": snap["errors"], **result}
         if not dry_run:
             line["executed"] = execute(snap, result["actions"], executors)
@@ -673,7 +1081,8 @@ def self_test():
 
     live = {"pid": 1, "alive": True}
     snap = {
-        "errors": {}, "git": {"precog-zp#1": {"pushed": True}},
+        "errors": {}, "git": {"precog-zp#1": {"pushed": True}, "precog-sl#1": {"pushed": True}},
+        "slot_git": {x: {"dirty": False, "unpushed": False} for x in ("4", "6")},
         "issues": {b["id"]: b for b in [
             bead("precog-ap"), bead("precog-dl"), bead("precog-dl2"), bead("precog-mq"), bead("precog-mq2"), bead("precog-mq3"), bead("precog-st"),
             bead("precog-zm"), bead("precog-zp"), bead("precog-sl", status="open", assignee=""),
@@ -732,7 +1141,7 @@ def self_test():
         ("precog-zp", "release attempt=1"), ("precog-sl", "return-lease slot=4 holder=agent:precog-sl#1"),
         ("precog-ct", "resolve-thread thread=m-ct"),
         ("precog-c1", "deliver-answer q=precog-q6 attempt=1"), ("precog-c2", "flag-zombie attempt=2"),
-        ("precog-c3", "return-lease slot=6 holder=agent:precog-c3#1"),
+        ("precog-c3", "return-lease slot=6 holder=agent:precog-c3#1"), ("precog-ag", "flag-stalled attempt=1"),
     }, acts
     assert classify(snap, now) == got  # dry run is idempotent
 
@@ -740,7 +1149,7 @@ def self_test():
     def fake(name):
         def fill(s):
             for k in {"agents": ["sessions"], "treehouse": ["slots"], "inbox": ["inbox"], "plannotator": [],
-                      "br": ["issues", "questions"], "git": ["git"]}[name]:
+                      "br": ["issues", "questions"], "git": ["git", "slot_git"]}[name]:
                 s[k] = json.loads(json.dumps(snap[k]))
         return fill
 
@@ -826,7 +1235,286 @@ def self_test():
     assert not inbox_quiet({"id": "r", "person_seen_seq": 9}, [agent("r")], seqs, True)
     assert inbox_quiet({"id": "r", "person_read_seq": 6}, [agent("r"), agent("m2")], seqs, True)
     executor_self_test()
+    w12_classify_test()
+    w12_executor_test()
     print("reconcile self-test: ok")
+
+
+def w12_classify_test():
+    """W12 classes and their precedence, pure."""
+    now = datetime(2026, 10, 30, 12, tzinfo=timezone.utc)
+    t = lambda minutes: (now - timedelta(minutes=minutes)).isoformat()
+
+    def bead(bid, status="in_progress", n=1, labels=(), extra=(), at=10, auto=False):
+        comments = [{"text": f"attempt: {k} session: s-{bid} slot: /s/{bid} branch: b-{bid} brief: /b"
+                             + (" dispatch: auto" if auto else ""), "created_at": t(at)} for k in range(1, n + 1)]
+        comments += [{"text": x, "created_at": t(m)} for x, m in extra]
+        return {"id": bid, "status": status, "assignee": f"agent:{bid}#{n}", "labels": list(labels),
+                "comments": comments}
+
+    def sess(bid, **kw):
+        return {"sessionId": f"s-{bid}", "kind": "background", "name": f"{bid}: x", **kw}
+    work = {"state": "working", "pid": 1, "alive": True, "transcript_at": t(1)}
+    over = dict(work, tokens=4_000_000)
+    nudge1 = ("reconcile: limit-nudge attempt=1 limit=tokens", 5)
+    beads = [
+        bead("p-tok"), bead("p-hrs", at=5 * 60), bead("p-att", n=4), bead("p-grace", extra=[nudge1]),
+        bead("p-quar", extra=[(nudge1[0], 20)]), bead("p-again", n=2, extra=[nudge1]),
+        bead("p-qdone", labels=[QUARANTINE], extra=[(nudge1[0], 60)]), bead("p-olans"), bead("p-olidle"),
+        bead("p-olclosed", status="closed"),
+        bead("i-closed", status="closed"), bead("i-closedwork", status="closed"), bead("i-def", status="deferred"),
+        dict(bead("i-intwork", status="closed"), close_reason="integrated into u/tfriedman/pr/x at abc"),
+        bead("i-auto", auto=True), bead("i-autook", auto=True, labels=["auto"]), bead("i-manual"),
+        bead("i-stall", status="deferred"), bead("i-gone", status="closed"),
+        bead("l-dirty", status="closed"), bead("l-unp", status="closed"), bead("l-live", status="closed"),
+        bead("l-run", status="open"), bead("l-np", status="open"), bead("l-ok", status="closed"),
+        bead("l-flagged", status="closed", extra=[("reconcile: flag-lease slot=l7 holder=agent:l-flagged#1", 9)]),
+        bead("s-flag", extra=[("reconcile: nudge attempt=1 count=1", 40)]),
+    ]
+    for b in beads:
+        if b["id"].startswith("l-") and b["status"] == "open":
+            b["assignee"] = ""
+    stalled = dict(work, transcript_at=t(45), cpu_active=False)
+    snap = {
+        "errors": {}, "inbox": [], "git": {"l-run#1": {"pushed": True}},
+        "issues": {b["id"]: b for b in beads},
+        "questions": [{"id": "precog-qa", "asking": "p-olans", "labels": ["question", "answered"]}],
+        "sessions": [sess("p-tok", **over), sess("p-hrs", **work), sess("p-att", **work), sess("p-grace", **over),
+                     sess("p-quar", **over), sess("p-again", **over), sess("p-qdone", **over), sess("p-olans", **over),
+                     sess("p-olidle", state="blocked", tokens=4_000_000), sess("p-olclosed", **over),
+                     sess("i-closed", state="done", pid=1, alive=True), sess("i-closedwork", **work),
+                     sess("i-intwork", **work),
+                     sess("i-def", **work), sess("i-auto", **work), sess("i-autook", **work), sess("i-manual", **work),
+                     sess("i-stall", **stalled), sess("i-gone", state="done"), sess("l-run", state="done", pid=1, alive=True),
+                     sess("s-flag", **stalled)],
+        "slots": [{"slot": f"l{k}", "path": f"/p/{k}", "holder": f"agent:{bid}#1", "live": bid == "l-live"}
+                  for k, bid in enumerate(["l-dirty", "l-unp", "l-live", "l-run", "l-np", "l-ok", "l-flagged"], 1)],
+        "slot_git": {"l1": {"dirty": True, "unpushed": False}, "l2": {"dirty": False, "unpushed": True},
+                     **{f"l{k}": {"dirty": False, "unpushed": False} for k in range(3, 7)},
+                     "l7": {"dirty": True, "unpushed": False}},
+    }
+    got = classify(snap, now)
+    want = {
+        "p-tok": "over-limit", "p-hrs": "over-limit", "p-att": "over-limit", "p-grace": "over-limit",
+        "p-quar": "over-limit", "p-again": "over-limit", "p-qdone": "over-limit", "p-olans": "over-limit",
+        "p-olidle": "waiting", "p-olclosed": "ineligible-running",
+        "i-closed": "ineligible-running", "i-closedwork": "ineligible-running", "i-intwork": "working",
+        "i-def": "ineligible-running",
+        "i-auto": "ineligible-running", "i-autook": "working", "i-manual": "working", "i-stall": "ineligible-running",
+        "i-gone": "idle",
+        "l-dirty": "stale-lease", "l-unp": "stale-lease", "l-live": "stale-lease", "l-run": "stale-lease",
+        "l-np": "stale-lease", "l-ok": "stale-lease", "l-flagged": "stale-lease", "s-flag": "stalled",
+    }
+    assert got["classes"] == want, {k: (v, want.get(k)) for k, v in got["classes"].items() if want.get(k) != v}
+    acts = sorted((a["item"], a["action"]) for a in got["actions"])
+    assert acts == sorted([
+        ("p-tok", "limit-nudge attempt=1 limit=tokens"), ("p-hrs", "limit-nudge attempt=1 limit=hours"),
+        ("p-att", "limit-nudge attempt=4 limit=attempts"), ("p-quar", "quarantine attempt=1"),
+        ("p-again", "quarantine attempt=2"), ("p-olans", "limit-nudge attempt=1 limit=tokens"),
+        ("p-olclosed", "stop-session attempt=1"), ("i-closed", "stop-session attempt=1"),
+        ("i-closedwork", "stop-session attempt=1"),
+        ("i-def", "stop-session attempt=1"), ("i-auto", "stop-session attempt=1"),
+        ("i-stall", "stop-session attempt=1"),
+        ("l-dirty", "flag-lease slot=l1 holder=agent:l-dirty#1"), ("l-unp", "flag-lease slot=l2 holder=agent:l-unp#1"),
+        ("l-np", "flag-lease slot=l5 holder=agent:l-np#1"), ("l-ok", "return-lease slot=l6 holder=agent:l-ok#1"),
+        ("s-flag", "flag-stalled attempt=1"),
+    ]), acts
+    assert classify(snap, now, limits={"max_attempt_tokens": 5_000_000})["classes"]["p-tok"] == "working"
+    assert preflight("l-dirty", snap["issues"]["l-dirty"], 1, snap["slots"][0], snap, {}) == ["worktree not clean"]
+
+    # Transcript: the last assistant text (all blocks of one message), last 40 lines; tokens count a message once.
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "s.jsonl")
+        usage = {"input_tokens": 10, "output_tokens": 5, "cache_creation_input_tokens": 100, "cache_read_input_tokens": 9999}
+        rows = [{"type": "assistant", "message": {"id": "A", "usage": usage, "content": [{"type": "text", "text": "old"}]}},
+                {"type": "user", "message": {"content": "hi"}},
+                {"type": "assistant", "message": {"id": "B", "usage": usage, "content": [
+                    {"type": "text", "text": "\n".join(f"l{i}" for i in range(50))}]}},
+                {"type": "assistant", "message": {"id": "B", "usage": usage, "content": [{"type": "tool_use"}]}},
+                {"type": "assistant", "message": {"id": "B", "usage": usage, "content": [{"type": "text", "text": "end"}]}}]
+        with open(p, "w") as f:
+            f.write("\n".join(json.dumps(r) for r in rows) + "\nnot json\n")
+        out = read_transcript(p)["last_output"].splitlines()
+        assert len(out) == OUTPUT_LINES and out[-1] == "end" and out[-2] == "l49", out
+        assert transcript_tokens(p) == 2 * 115, transcript_tokens(p)
+        with open(p, "a") as f:
+            f.write(json.dumps({"type": "user", "timestamp": t(1), "message": {"content": "status?"}}) + "\n")
+        assert transcript_has(p, "status?", now - timedelta(minutes=2))
+        assert not transcript_has(p, "status?", now) and not transcript_has(p, "other", now - timedelta(minutes=2))
+
+
+def w12_executor_test():
+    """W12 actions end to end against a scratch br store, real git repos for the release preflight (E10), and fake
+    claude, treehouse and Inbox. Each action's happy path, then a second and third tick that do nothing (idempotency)."""
+    agents, slots, threads, calls = [], [], [], []
+    race = {"slot": None, "resume": None}
+    real_sh, real_inbox = sh, inbox
+
+    def fake_sh(cmd, cwd=None, check=True, input=None):
+        tool, args = os.path.basename(cmd[0]), cmd[1:]
+        if tool == "claude" and args[0] == "agents":
+            return json.dumps([{k: v for k, v in r.items() if k not in ("transcript_at", "cpu_active", "last_output",
+                                                                         "tokens")} for r in agents])
+        if tool == "claude" and args[0] == "stop":
+            calls.append(("stop", args[1]))
+            for r in agents:
+                if r["id"] == args[1]:
+                    r.update(state="stopped", pid=None)
+            return ""
+        if tool == "claude" and args[:2] == ["--bg", "--resume"]:
+            calls.append(("resume", args[2], args[3]))
+            row = next(r for r in agents if r["sessionId"] == args[2])
+            row.update(state="working", pid=1)
+            return f"backgrounded · {row['id']}\n"
+        if tool == "treehouse" and args[0] == "return":
+            calls.append(("return", args[1], args[4]))
+            slots[:] = [x for x in slots if x["path"] != args[1]]
+            return ""
+        return real_sh(cmd, cwd, check, input)
+
+    def fake_inbox(tool, args):
+        calls.append((tool, args.get("reply_to") or args.get("message_id"), args.get("body")))
+        if tool == "resolve_message":
+            threads[:] = [x for x in threads if x["id"] != args["message_id"]]
+        return {}
+
+    def src_fake_agents(s):
+        s["sessions"] = [dict(r, alive=bool(r.get("pid"))) for r in agents if r["state"] != "stopped"]
+        s["session_names"] = {r["sessionId"]: r["name"] for r in agents}
+
+    def src_race_git(s):
+        src_git(s)
+        if race["slot"]:  # the slot gets dirty after the snapshot, before the action: act-time preflight refuses
+            open(os.path.join(race["slot"], "late.txt"), "w").close()
+            race["slot"] = None
+        if race["resume"]:  # the zombie's session comes back after the snapshot: the release must not happen
+            next(r for r in agents if r["sessionId"] == race["resume"]).update(state="working", pid=1)
+            race["resume"] = None
+    fakes = {"agents": src_fake_agents, "treehouse": lambda s: s.update(slots=[dict(x) for x in slots]),
+             "inbox": lambda s: s.update(inbox=[dict(x) for x in threads]), "plannotator": lambda s: None,
+             "git": src_race_git}
+    saved_env = {k: os.environ.get(k) for k in ("IAR_WORKFLOW", "BEADS_DIR")}
+    g = globals()
+    with tempfile.TemporaryDirectory() as d:
+        git = lambda *a, cwd=d: subprocess.run(["git", *a], cwd=cwd, check=True, capture_output=True, timeout=30)
+        git("init", "--bare", "-q", "origin.git")
+        git("clone", "-q", "origin.git", "seed")
+        git("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "seed", cwd=f"{d}/seed")
+        git("push", "-q", "origin", "HEAD:refs/heads/main", cwd=f"{d}/seed")
+
+        def clone(name, branch, push=True, dirty=False, unpushed=False):
+            path = f"{d}/{name}"
+            git("clone", "-q", "origin.git", name)
+            git("checkout", "-q", "-b", branch, cwd=path)
+            git("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", name, cwd=path)
+            if push:
+                git("push", "-q", "origin", branch, cwd=path)
+            if unpushed:
+                git("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "more", cwd=path)
+            if dirty:
+                open(f"{path}/scratch.txt", "w").close()
+            return path
+
+        wf = os.path.join(d, "WORKFLOW.md")
+        with open(os.path.join(IAR, "WORKFLOW.md")) as src, open(wf, "w") as dst:
+            dst.write(src.read())
+        os.environ.update(IAR_WORKFLOW=wf, BEADS_DIR=os.path.join(d, ".beads"))
+        g["sh"], g["inbox"] = fake_sh, fake_inbox
+        try:
+            subprocess.run(["br", "init", "--prefix", "rt"], cwd=d, check=True, capture_output=True, timeout=30)
+            set_switches(None, wf)
+            for cls in ("zombie", "stale-lease", "closed-bead-thread", "stalled", "over-limit", "ineligible-running"):
+                set_switches(cls, wf)
+
+            def bead(title, status="in_progress", slot=None, branch="b-none", lease=None, session=None, extra=()):
+                bid = ledger.create(title)["id"]
+                ledger.comment(bid, f"attempt: 1 session: s-{bid} slot: {slot or '/nonexistent'} branch: {branch} brief: /b")
+                for x in extra:
+                    ledger.comment(bid, x)
+                ledger.update(bid, status="in_progress", assignee=f"agent:{bid}#1")
+                if status == "closed":
+                    ledger.close(bid, reason="integrated into pr/x at abc")
+                elif status != "in_progress":
+                    ledger.update(bid, status=status)
+                if lease:
+                    slots.append({"slot": lease, "path": slot, "holder": f"agent:{bid}#1", "live": False})
+                if session:
+                    agents.append({"sessionId": f"s-{bid}", "id": f"s-{bid}", "kind": "background", "name": f"{bid}: x",
+                                   "last_output": f"final words of {bid}", **session})
+                return bid
+            now = datetime.now(timezone.utc)
+            old = (now - timedelta(minutes=45)).isoformat()
+            zp = bead("zombie pushed", slot=clone("zp", "b-zp"), branch="b-zp", session={"state": "failed"})
+            zf = bead("zombie unpushed", session={"state": "failed"})
+            zr = bead("zombie resumes", slot=clone("zr", "b-zr"), branch="b-zr", session={"state": "failed"})
+            race["resume"] = f"s-{zr}"
+            ok = bead("closed clean", status="closed", slot=clone("ok", "b-ok"), branch="b-ok", lease="1")
+            threads.append({"id": "m-ok", "subject": f"{ok}: integrated", "session": "zz"})
+            dirty = bead("closed dirty", status="closed", slot=clone("dirty", "b-x", dirty=True), lease="2")
+            unp = bead("closed unpushed", status="closed", slot=clone("unp", "b-y", unpushed=True), lease="3")
+            rc = bead("closed race", status="closed", slot=clone("race", "b-z"), lease="4")
+            gone = bead("closed, remote branch deleted", status="closed", slot=clone("gone", "b-gone"), lease="6")
+            git("push", "-q", "origin", "--delete", "b-gone", cwd=f"{d}/seed")  # gone's origin/b-gone ref is stale
+            race["slot"] = f"{d}/race"
+            st = bead("stalled", session={"state": "working", "pid": 1, "transcript_at": old, "cpu_active": False})
+            ol = bead("over limit again", session={"state": "working", "pid": 1, "transcript_at": now.isoformat()},
+                      extra=["reconcile: limit-nudge attempt=0 limit=tokens"])
+            agents[-1]["tokens"] = 4_000_000
+            tk = bead("over limit", session={"state": "working", "pid": 1, "transcript_at": now.isoformat(),
+                                             "tokens": 4_000_000})
+            df = bead("deferred", status="deferred", session={"state": "working", "pid": 1,
+                                                                "transcript_at": now.isoformat()})
+            run = lambda: [(x["item"], x["action"].split()[0], x["outcome"])
+                           for x in tick(d, False, fakes)[1]["executed"] if x["outcome"] != "off"]
+            first = run()
+            assert sorted(first) == sorted([
+                (zp, "release", "done"), (zf, "flag-zombie", "done"), (ok, "return-lease", "done"),
+                (zr, "release", "error: RuntimeError: no longer a zombie with a pushed branch on fresh sources"),
+                (dirty, "flag-lease", "done"), (unp, "flag-lease", "done"), (gone, "flag-lease", "done"),
+                (rc, "return-lease", "error: RuntimeError: release preflight failed: worktree not clean"),
+                (st, "nudge", "done"), (ol, "quarantine", "done"), (tk, "limit-nudge", "done"),
+                (df, "stop-session", "done")]), first
+            texts = lambda bid: [c["text"] for c in ledger.show(bid).get("comments") or []]
+            z = ledger.show(zp)
+            assert z["status"] == "open" and not z.get("assignee"), z
+            assert any(f"claude --resume s-{zf}" in x for x in texts(zf)), texts(zf)
+            assert [x["slot"] for x in slots] == ["2", "3", "4", "6"]  # E10: dirty, unpushed, late-dirty, stale-ref slots stay
+            assert any("local commits missing from origin" in x for x in texts(unp))
+            assert ("stop", f"s-{st}") in calls and ("resume", f"s-{st}", "status?") in calls
+            assert any(x.startswith("last-output: nudge attempt=1") for x in texts(st))
+            assert ledger.show(ol)["labels"] and {QUARANTINE, "needs-human"} <= set(ledger.show(ol)["labels"])
+            assert any(x.startswith("last-output: quarantine attempt=1") and f"final words of {ol}" in x for x in texts(ol))
+            assert any(c[0] == "resume" and c[1] == f"s-{tk}" and "tokens limit" in c[2] for c in calls), calls
+            assert ("stop", f"s-{df}") in calls and any(x.startswith("last-output: stop-session") for x in texts(df))
+            p = subprocess.run([os.path.join(os.path.dirname(IAR), "bin", "bg"), ol, "--done-when", "true"],
+                               capture_output=True, text=True, timeout=60)
+            assert p.returncode == 1 and "quarantined" in p.stderr, (p.returncode, p.stderr)
+
+            # Second tick: the race slot is now flagged (its refused return dropped), the stalled session (still
+            # quiet) is flagged, not stopped
+            # again; the returned lease lets the closed bead's thread resolve (lease first, then thread: E9).
+            stops = sum(c[0] == "stop" for c in calls)
+            second = run()
+            assert ledger.show(zr)["status"] == "in_progress" and ledger.show(zr)["assignee"] == f"agent:{zr}#1"
+            assert sorted(second) == sorted([(rc, "flag-lease", "done"), (rc, "return-lease", "dropped"),
+                                             (zr, "release", "dropped"),
+                                             (st, "flag-stalled", "done"), (ok, "resolve-thread", "done")]), second
+            assert ("send_message", "m-ok", f"Landed: {ok} is closed (integrated into pr/x at abc).") in calls, calls
+            assert ("resolve_message", "m-ok", None) in calls and not threads
+            assert sum(c[0] == "stop" for c in calls) == stops  # no automatic kill
+            assert any(x.startswith("last-output: flag-stalled") for x in texts(st))
+            # Idempotency: nothing left to do, and no comment written.
+            count = {b: len(texts(b)) for b in (zp, zf, ok, dirty, unp, rc, gone, st, ol, tk, df)}
+            assert run() == [] and run() == []
+            assert {b: len(texts(b)) for b in count} == count
+            assert [x["slot"] for x in slots] == ["2", "3", "4", "6"] and sum(c[0] == "stop" for c in calls) == stops
+        finally:
+            g["sh"], g["inbox"] = real_sh, real_inbox
+            for k, v in saved_env.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
 
 
 def executor_self_test():
@@ -853,8 +1541,12 @@ def executor_self_test():
         if fail["source"]:
             raise SourceError("treehouse status: no answer in 30s")
         s["slots"] = [x for x in slots if x["slot"] not in returned]
-    fakes = {"agents": lambda s: None, "treehouse": treehouse, "inbox": lambda s: None, "plannotator": lambda s: None}
-    slot_of = lambda a: a["action"].split()[1][len("slot="):]
+    def git(s):  # every leased slot clean and its attempt branch pushed: the release preflight passes
+        s["slot_git"] = {x["slot"]: {"dirty": False, "unpushed": False} for x in s["slots"]}
+        s["git"] = {f"{m[1]}#{m[2]}": {"pushed": True} for x in s["slots"] if (m := HOLDER_RE.match(x["holder"]))}
+    fakes = {"agents": lambda s: None, "treehouse": treehouse, "inbox": lambda s: None, "plannotator": lambda s: None,
+             "git": git}
+    slot_of =lambda a: a["action"].split()[1][len("slot="):]
 
     def act_flag(a, snap):
         time.sleep(0.2)  # long enough for a concurrent tick to overlap

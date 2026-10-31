@@ -128,6 +128,11 @@ def classify(data, now):
             add("Stalled", f"Bead `{b['id']}`{who} in progress with no session — {clip(b['title'], 90)} · "
                 f"{ago(updated, now)} [release/close](claudego://act/bead/{b['id']})", updated)
 
+    for b in sorted(data.get("issues", {}).values(), key=lambda b: b["id"]):
+        if "quarantined" in (b.get("labels") or []) and b["status"] != "closed":
+            add("Needs you", f"Bead `{b['id']}` quarantined: past an attempt limit, not dispatched until you remove "
+                f"the label — {clip(b.get('title'), 90)}", None)
+
     for p in sorted(data["plannotator"], key=lambda p: p.get("started") or 0, reverse=True):
         target = os.path.basename(p.get("target") or "") or p.get("mode")
         owner = p.get("session") or "no session"
@@ -210,6 +215,8 @@ def self_test():
     assert sec["Loose ends"] == ["Slot 2 leased by `agent:x` with no process running [return](claudego://act/slot/2)"]
     assert not any("precog-y2" in line for line in sec["Old"])
     assert any("precog-z3" in line for line in sec["Old"]), sec["Old"]
+    data["issues"] = {"precog-q1": {"id": "precog-q1", "status": "in_progress", "title": "runaway", "labels": ["quarantined"]}}
+    assert any("`precog-q1` quarantined" in line for line in classify(data, now)["Needs you"])
     data["errors"] = {"br": "LedgerError: tracker list: no answer in 30s"}
     assert any("`br` failed" in line for line in classify(data, now)["Loose ends"])
     print("ok")

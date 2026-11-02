@@ -142,7 +142,7 @@ QUARANTINE = "quarantined"
 OUTPUT_LINES = 40
 STOP_WAIT_S = 30
 REX_APP = "/Applications/Rex Beta.app/Contents/Helpers/Rex Server.rex/Contents/MacOS/rex"  # when not on PATH
-DIALOG_RE = re.compile(r"Do you want to |^\s*❯ \d+\. ", re.M)  # a permission or AskUserQuestion dialog
+DIALOG_RE = re.compile(r"^\s*❯ \d+\. ", re.M)  # the cursor on an option: a permission or AskUserQuestion dialog
 INBOX_PROJECT = "/Users/tal/.local/share/precog/Precog agents"  # inbox-etiquette.md: every send_message names it
 TRANSIENT = ("process running in the slot", "session running")  # preflight fails that end by themselves: no flag
 
@@ -1083,13 +1083,25 @@ def rex(*args, check=True):
 
 
 def pane_state(screen):
-    """ready (empty input box), typed (text in the input box), dialog, or None (no input box yet). The input box is
-    the `❯` line right under a rule, at the bottom of the pane."""
+    """dialog, ready (empty input box), typed (text in the input box), or None (no input box yet). The input box is
+    the `❯` line right under a rule, at the bottom of the pane. A dialog wins, so no Enter goes into it."""
     tail = [x for x in screen.splitlines() if x.strip()][-12:]
+    if DIALOG_RE.search("\n".join(tail)):
+        return "dialog"
     for i in range(len(tail) - 1, 0, -1):
         if tail[i].startswith("❯") and tail[i - 1].startswith("─"):
             return "ready" if tail[i] == "❯" or not tail[i][1:].strip() else "typed"
-    return "dialog" if DIALOG_RE.search("\n".join(tail)) else None
+    return None
+
+
+def no_rex(a, e):
+    """The action fails; the bead gets one nudge-no-rex note per attempt."""
+    key = f"nudge-no-rex attempt={key_field(a, 'attempt')}"
+    if not any((c.get("text") or "").startswith(f"reconcile-note: {key}\n")
+               for c in ledger.show(a["item"]).get("comments") or []):
+        ledger.comment(a["item"], f"reconcile-note: {key}\nNo nudge: rex is not available ({e}). Start Rex; "
+                                  f"the next tick sends it.")
+    return NoRex(f"no rex: {e}")
 
 
 def send(s, slot, text, a):
@@ -1122,12 +1134,7 @@ def rex_send(s, text, a):
     try:
         rex("new", name, "--", f"{BIN}/claude", "attach", short)
     except (NoRex, SourceError) as e:
-        key = f"nudge-no-rex attempt={key_field(a, 'attempt')}"
-        if not any((c.get("text") or "").startswith(f"reconcile-note: {key}\n")
-                   for c in ledger.show(a["item"]).get("comments") or []):
-            ledger.comment(a["item"], f"reconcile-note: {key}\nNo nudge: rex is not available ({e}). Start Rex; "
-                                      f"the next tick sends it.")
-        raise NoRex(f"no rex: {e}") from e
+        raise no_rex(a, e) from e
     try:
         for _ in range(STOP_WAIT_S):
             state = pane_state(rex("capture", "-s", name, "--trim"))
@@ -1141,6 +1148,8 @@ def rex_send(s, text, a):
             raise RuntimeError(f"no Claude input box in rex session {name} after {STOP_WAIT_S}s")
         rex("send", "-s", name, text)
         rex("send-key", "-s", name, "Enter")
+    except SourceError as e:  # the rex server went away after `rex new`
+        raise no_rex(a, e) from e
     finally:
         rex("kill", name, check=False)
 
@@ -2620,8 +2629,8 @@ def w12_executor_test():
             assert any(f"claude --resume s-{zf}" in x for x in texts(zf)), texts(zf)
             assert [x["slot"] for x in slots] == ["2", "3", "4", "6"]  # E10: dirty, unpushed, late-dirty, stale-ref slots stay
             assert any("local commits missing from origin" in x for x in texts(unp))
-            sent = [c for c in calls if c[:2] == ("rex", "send")]
-            assert ("rex", "send", "-s", sent[0][3], "status?") in calls and ("rex", "kill", sent[0][3]) in calls, calls
+            name = next(c[3] for c in calls if c[:2] == ("rex", "send") and c[4] == "status?")
+            assert ("rex", "kill", name) in calls, calls
             assert not [c for c in calls if c[0] == "resume"] and ("stop", f"s-{st}") not in calls  # a nudge never stops
             assert ledger.show(ol)["labels"] and {QUARANTINE, "needs-human"} <= set(ledger.show(ol)["labels"])
             assert any(x.startswith("last-output: quarantine attempt=1") and f"final words of {ol}" in x for x in texts(ol))
@@ -2689,8 +2698,8 @@ def w12b_send_test():
             return "backgrounded · s1\n"
         if tool == "rex":
             calls.append(tuple(args[1:]))
-            if args[1] == "new" and pane[0] is None:
-                raise SourceError("rex new exit 1: server not running")
+            if (args[1] == "new" and pane[0] is None) or (args[1] == "capture" and pane[0] == "gone"):
+                raise SourceError(f"rex {args[1]} exit 1: server not running")
             return pane[0] if args[1] == "capture" else ""
         raise AssertionError(f"unexpected command {cmd}")
 
@@ -2717,7 +2726,9 @@ def w12b_send_test():
                                       ("kill", name)], calls
             dialog = "⏺ Bash(rm x)\n Do you want to proceed?\n ❯ 1. Yes\n   2. No\n"
             typed = READY_PANE.replace("❯ \n", "❯ half a message\n")
-            for screen, why in ((dialog, "a dialog"), (typed, "typed text"), ("loading\n", "no Claude input box")):
+            both = dialog + READY_PANE.split("❯ \n")[0] + "❯ \n"  # a dialog and an empty input line: no Enter
+            for screen, why in ((dialog, "a dialog"), (both, "a dialog"), (typed, "typed text"),
+                                ("loading\n", "no Claude input box")):
                 e = try_send("working", screen)
                 assert e and why in str(e), (why, e)
                 assert not [c for c in calls if c[0] in ("send", "send-key")] and calls[-1][0] == "kill", calls
@@ -2728,6 +2739,9 @@ def w12b_send_test():
                 os.environ["PATH"] = path
                 e = try_send("working", None)
                 assert isinstance(e, NoRex) and not [c for c in calls if c[0] in ("send", "kill")], (e, calls)
+            os.environ["PATH"] = fake_rex(d)
+            e = try_send("working", "gone")  # the server goes away after `rex new`: no Enter, killed, same note
+            assert isinstance(e, NoRex) and calls[-1][0] == "kill" and ("send-key",) not in [c[:1] for c in calls]
             assert [t.split("\n")[0] for t in comments] == ["reconcile-note: nudge-no-rex attempt=1"], comments
             assert try_send("stopped", READY_PANE, alive=False) is None and calls == [("resume", "s1")], calls
         finally:

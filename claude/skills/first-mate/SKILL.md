@@ -25,4 +25,4 @@ Rex shows work on the connected server, not all processes on the computer. When 
 - **Relay an answer:** read the Inbox thread first. Send only the answer Tal gave, to the intended agent. Capture the target before typing; a permission dialog or existing draft requires Tal's attention, not a blind Enter. Verify that the agent received the message. Reading a terminal never grants approval.
 - **Clean up:** show the worktree, branch, task and remaining changes. Follow `rex-worktree` release checks. An idle session is not a cleanup request.
 
-Keep this control session in Tal's home folder. Do implementation in the task's own worktree session. Firstmate needs no private task registry: recover the current picture from Rex, Linear, Git and the Inbox on each request.
+Keep this control session in an already trusted folder; its working directory does not authorize implementation there. Do implementation in the task's own worktree session. Firstmate needs no private task registry: recover the current picture from Rex, Linear, Git and the Inbox on each request.

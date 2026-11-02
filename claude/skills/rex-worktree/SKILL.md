@@ -27,7 +27,7 @@ One worktree has one Rex session. Each tab is an interactive agent or a tool in 
 
 If the current session already owns the intended worktree, continue there. If a new tab starts an unrelated task, acquire its worktree and create a new Rex session before implementation. Pass a short handoff brief to a new interactive agent and show Tal that session. Leave the original chat intact: changing directory in a tool does not relocate a running conversation, and this workflow has no automatic tab-move hook.
 
-The firstmate control session may stay in `/Users/tal` without an implementation worktree. Shell, test and log tabs within a task session use that task's worktree.
+The firstmate control session uses an already trusted folder without an implementation worktree. Keep its work read-only there; trust settings stay under Tal’s control. Shell, test and log tabs within a task session use that task's worktree.
 
 ## Another agent or review
 

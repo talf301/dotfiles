@@ -1151,7 +1151,7 @@ def rex_send(s, text, a):
     except SourceError as e:  # the rex server went away after `rex new`
         raise no_rex(a, e) from e
     finally:
-        rex("kill", name, check=False)
+        rex("kill", name)  # a failed close fails the action
 
 
 def inbox(tool, args):
@@ -1291,9 +1291,19 @@ def got_since(sid, text, since):
     return bool(path and transcript_has(path, text, since))
 
 
+def wait_turn(sid, text, since):
+    """Wait until the session's transcript has the user turn with text; else fail, so the action stays pending."""
+    for _ in range(STOP_WAIT_S):
+        if got_since(sid, text, since):
+            return
+        time.sleep(1)
+    raise RuntimeError(f"session {sid} shows no turn with the text after {STOP_WAIT_S}s")
+
+
 def act_nudge(a, snap):
     att, s = session_of(a, snap)
     send(s, att["slot"], nudge_text(a), a)
+    wait_turn(att["session"], nudge_text(a), started_at(a))
     note(a, f"Sent session {att['session']}: {nudge_text(a)}")
 
 
@@ -1391,12 +1401,7 @@ def act_deliver(a, snap):
     since = started_at(a)
     if "delivered" not in (q.get("labels") or []) and not got_since(att["session"], text, since):
         send(s or {"sessionId": att["session"]}, att["slot"], text, a)
-        for _ in range(STOP_WAIT_S):
-            if got_since(att["session"], text, since):
-                break
-            time.sleep(1)
-        else:
-            raise RuntimeError(f"session {att['session']} shows no turn with the answer after {STOP_WAIT_S}s")
+        wait_turn(att["session"], text, since)
     ledger.label(qid, add=["delivered"])
     ledger.close(qid, reason=f"delivered to {a['item']}#{key_field(a, 'attempt')}")
 
@@ -2492,8 +2497,8 @@ def w12_executor_test():
     """W12 actions end to end against a scratch br store, real git repos for the release preflight (E10), and fake
     claude, treehouse and Inbox. Each action's happy path, then a second and third tick that do nothing (idempotency)."""
     agents, slots, threads, calls = [], [], [], []
-    race = {"slot": None, "resume": None}
-    real_sh, real_inbox = sh, inbox
+    race = {"slot": None, "resume": None, "tdir": None}
+    real_sh, real_inbox, real_facts = sh, inbox, transcript_facts
 
     def fake_sh(cmd, cwd=None, check=True, input=None):
         tool, args = os.path.basename(cmd[0]), cmd[1:]
@@ -2511,8 +2516,14 @@ def w12_executor_test():
             row = next(r for r in agents if r["sessionId"] == args[2])
             row.update(state="working", pid=1)
             return f"backgrounded · {row['id']}\n"
-        if tool == "rex":  # a ready Claude pane; the text joins the session's turn, nothing stops
+        if tool == "rex":  # a ready Claude pane; Enter adds the typed text as a user turn, nothing stops
             calls.append(("rex", *args[1:]))
+            if args[1] == "send-key":
+                sid = next(c[-1] for c in calls if c[:3] == ("rex", "new", args[3]))
+                typed = next(c[-1] for c in reversed(calls) if c[:2] == ("rex", "send") and c[3] == args[3])
+                with open(f"{race['tdir']}/{sid}.jsonl", "a") as f:
+                    f.write(json.dumps({"type": "user", "timestamp": datetime.now(timezone.utc).isoformat(),
+                                        "message": {"content": typed}}) + "\n")
             return READY_PANE if args[1] == "capture" else ""
         if tool == "treehouse" and args[0] == "return":
             calls.append(("return", args[1], args[4]))
@@ -2545,6 +2556,7 @@ def w12_executor_test():
     g = globals()
     with tempfile.TemporaryDirectory() as d:
         os.environ["PATH"] = fake_rex(d)
+        race["tdir"] = d
         git = lambda *a, cwd=d: subprocess.run(["git", *a], cwd=cwd, check=True, capture_output=True, timeout=30)
         git("init", "--bare", "-q", "origin.git")
         git("clone", "-q", "origin.git", "seed")
@@ -2569,6 +2581,7 @@ def w12_executor_test():
             dst.write(src.read())
         os.environ.update(IAR_WORKFLOW=wf, BEADS_DIR=os.path.join(d, ".beads"))
         g["sh"], g["inbox"] = fake_sh, fake_inbox
+        g["transcript_facts"] = lambda sid: {"transcript": f"{d}/{sid}.jsonl"}
         try:
             subprocess.run(["br", "init", "--prefix", "rt"], cwd=d, check=True, capture_output=True, timeout=30)
             set_switches(None, wf)
@@ -2659,7 +2672,7 @@ def w12_executor_test():
             assert {b: len(texts(b)) for b in count} == count
             assert [x["slot"] for x in slots] == ["2", "3", "4", "6"] and sum(c[0] == "stop" for c in calls) == stops
         finally:
-            g["sh"], g["inbox"] = real_sh, real_inbox
+            g["sh"], g["inbox"], g["transcript_facts"] = real_sh, real_inbox, real_facts
             for k, v in saved_env.items():
                 if v is None:
                     os.environ.pop(k, None)
@@ -2698,7 +2711,8 @@ def w12b_send_test():
             return "backgrounded · s1\n"
         if tool == "rex":
             calls.append(tuple(args[1:]))
-            if (args[1] == "new" and pane[0] is None) or (args[1] == "capture" and pane[0] == "gone"):
+            if (args[1] == "new" and pane[0] is None) or (args[1] == "capture" and pane[0] == "gone") \
+                    or (args[1] == "kill" and pane[0] == "nokill"):
                 raise SourceError(f"rex {args[1]} exit 1: server not running")
             return pane[0] if args[1] == "capture" else ""
         raise AssertionError(f"unexpected command {cmd}")
@@ -2742,6 +2756,8 @@ def w12b_send_test():
             os.environ["PATH"] = fake_rex(d)
             e = try_send("working", "gone")  # the server goes away after `rex new`: no Enter, killed, same note
             assert isinstance(e, NoRex) and calls[-1][0] == "kill" and ("send-key",) not in [c[:1] for c in calls]
+            e = try_send("working", "nokill")  # a failed close fails the action (no input box shown either)
+            assert e and "rex kill" in str(e), e
             assert [t.split("\n")[0] for t in comments] == ["reconcile-note: nudge-no-rex attempt=1"], comments
             assert try_send("stopped", READY_PANE, alive=False) is None and calls == [("resume", "s1")], calls
         finally:

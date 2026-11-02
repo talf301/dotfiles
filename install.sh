@@ -27,27 +27,20 @@ link() {  # link <src-in-repo | /absolute/src> <dest>
   ln -s "$src" "$dest"; echo "LINK  $dest -> $src"
 }
 
-# --- swarm tooling: every executable in bin/ → ~/.local/bin/ ---
+# --- agent tools: every executable in bin/ → ~/.local/bin/ ---
 for f in "$REPO"/bin/*; do link "bin/$(basename "$f")" "$HOME/.local/bin/$(basename "$f")"; done
 
 # --- Rex CLI (ships inside the app bundle) → ~/.local/bin/rex ---
 # Migration note (W20–W22): Rex replaces herdr. Nothing here calls herdr; its binary stays installed until Tal removes it.
 link "/Applications/Rex Beta.app/Contents/Helpers/Rex Server.rex/Contents/MacOS/rex" "$HOME/.local/bin/rex"
 
-# --- IAR skill: cross-agent chain  ~/.claude → ~/.agents → this repo ---
-link "claude/skills/implement-and-review" "$HOME/.agents/skills/implement-and-review"
-# .claude points at the .agents copy (matches the existing cross-agent convention)
-_claude="$HOME/.claude/skills/implement-and-review"
-if [ "$(readlink "$_claude" 2>/dev/null)" != "$HOME/.agents/skills/implement-and-review" ]; then
-  if [ $DRY = 1 ]; then echo "LINK  $_claude -> ~/.agents/skills/implement-and-review"
-  else mkdir -p "$HOME/.claude/skills"
-       [ -e "$_claude" ] || [ -L "$_claude" ] && mv "$_claude" "$_claude.bak_0" 2>/dev/null || true
-       ln -s "$HOME/.agents/skills/implement-and-review" "$_claude"; echo "LINK  $_claude -> ~/.agents/skills/implement-and-review"
-  fi
-else echo "ok    $_claude"; fi
+# --- shared agent skills: Claude and Codex use ~/.agents/skills ---
+for skill in implement-and-review first-mate rex-worktree digest dispatch-bead next-bead; do
+  link "claude/skills/$skill" "$HOME/.agents/skills/$skill"
+  link "$HOME/.agents/skills/$skill" "$HOME/.claude/skills/$skill"
+done
 
-# --- session board: launchd writes ~/…/vault/board.md every minute (load: launchctl bootstrap gui/$UID <plist>) ---
-link "iar/local.session-board.plist" "$HOME/Library/LaunchAgents/local.session-board.plist"
+# The retired session-board timer is not installed by the Rex workflow.
 
 # --- ClaudeGo.app: opens claudego://<sessionId> links from board.md via iar/go.sh ---
 if [ $DRY = 1 ]; then echo "BUILD ~/Applications/ClaudeGo.app"
@@ -59,20 +52,6 @@ else
   codesign -f -s - "$HOME/Applications/ClaudeGo.app"
   /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$HOME/Applications/ClaudeGo.app"
   echo "BUILD ~/Applications/ClaudeGo.app"
-fi
-
-# --- BoardRefresh.app: launchd's every-minute board.md refresh (an app bundle may write into iCloud Drive) ---
-if [ $DRY = 1 ]; then echo "BUILD ~/Applications/BoardRefresh.app"
-else
-  _br="$HOME/Applications/BoardRefresh.app/Contents"
-  mkdir -p "$_br/MacOS" && clang -O2 -o "$_br/MacOS/board-refresh" "$REPO/iar/board-refresh.c"
-  [ -f "$_br/Info.plist" ] || plutil -create xml1 "$_br/Info.plist"
-  for kv in CFBundleIdentifier=local.boardrefresh CFBundleExecutable=board-refresh CFBundleName=BoardRefresh CFBundlePackageType=APPL; do
-    plutil -replace "${kv%%=*}" -string "${kv#*=}" "$_br/Info.plist"
-  done
-  plutil -replace LSBackgroundOnly -bool true "$_br/Info.plist"
-  codesign -f -s - "$HOME/Applications/BoardRefresh.app"
-  echo "BUILD ~/Applications/BoardRefresh.app"
 fi
 
 # --- macOS UI configs (these tools don't read nikud's XDG_CONFIG_HOME) ---

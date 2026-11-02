@@ -1,5 +1,5 @@
 // BoardRefresh.app's executable: runs `python3 <args>` (default: board.py) as a child and waits. launchd starts it
-// every minute with `reconcile.py --dry-run --board` (see local.session-board.plist). macOS lets an app bundle, not a bare launchd job, write board.md into iCloud Drive;
+// every minute with `reconcile.py --board` (see local.session-board.plist). macOS lets an app bundle, not a bare launchd job, write board.md into iCloud Drive;
 // the child inherits this app as its responsible process.
 #include <spawn.h>
 #include <stdio.h>

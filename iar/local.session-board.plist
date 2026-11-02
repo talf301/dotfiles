@@ -8,7 +8,6 @@
 	<array>
 		<string>/Users/tal/Applications/BoardRefresh.app/Contents/MacOS/board-refresh</string>
 		<string>/Users/tal/dotfiles/iar/reconcile.py</string>
-		<string>--dry-run</string>
 		<string>--board</string>
 	</array>
 	<key>StartInterval</key>

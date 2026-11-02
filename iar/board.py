@@ -3,7 +3,7 @@
 
 Renders the reconciler's snapshot (reconcile.py: Claude sessions, beads, treehouse slots, open Plannotator
 sessions, Inbox threads) without a model, and adds a Stalled section for work that went quiet without a READY:,
-a QUESTION: or an Inbox post. launchd runs `reconcile.py --dry-run --board` every minute, which writes this board
+a QUESTION: or an Inbox post. launchd runs `reconcile.py --board` every minute, which writes this board
 from its tick's snapshot; the file is rewritten only when its content changes, so Obsidian refreshes and iCloud
 syncs only on real changes.
 

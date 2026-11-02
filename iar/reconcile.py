@@ -76,11 +76,14 @@ W14 (dispatch, class `dispatch`, after the other actions of the tick):
                       limits.max_starts_per_tick (default 2) per tick. Files that overlap an in_progress bead or a
                       running session's bead: wait. After n `attempt-failed:` comments: wait 10 s * 2^(n-1), at most
                       max_retry_backoff_ms. All state is in bead comments, so a lost $IAR_STATE_DIR repeats nothing (E12)
-A flag is a `reconcile-note: <key>` comment. Before a nudge that stops a running session, flag-stalled, quarantine
-or stop-session, the tick saves the
+A flag is a `reconcile-note: <key>` comment. Before flag-stalled, quarantine or stop-session, the tick saves the
 last 40 lines of the session's final assistant text (`last-output: <key>`).
-A nudge is `claude --bg --resume <sid> <text>`. That CLI starts a copy when the session process runs, so a running
-session is stopped first (verified); conversation, attempt, slot and branch stay (Inbox msg_01M67Q4XVNNV1H27VZA6YGZVXT).
+A nudge (and an answer delivery) never stops a session (precog-6j1m). A running session gets the text through rex: a
+new rex session runs `claude attach <id>`, the text is typed into the Claude input box and Enter sent, then the rex
+session is killed (the Claude session keeps running). No Enter when `claude agents` shows the session waiting or the
+pane shows a dialog or typed text: the action fails and the next tick tries again. No rex (binary missing, server not
+reachable): the action fails and the bead gets `reconcile-note: nudge-no-rex attempt=<n>` once. A session with no
+process gets `claude --bg --resume <sid> <text>`.
 Exit 75: another tick holds $IAR_STATE_DIR/reconcile.lock.
 """
 
@@ -93,6 +96,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -137,6 +141,8 @@ LIMIT_GRACE = timedelta(minutes=15)  # after a limit-nudge, still working this l
 QUARANTINE = "quarantined"
 OUTPUT_LINES = 40
 STOP_WAIT_S = 30
+REX_APP = "/Applications/Rex Beta.app/Contents/Helpers/Rex Server.rex/Contents/MacOS/rex"  # when not on PATH
+DIALOG_RE = re.compile(r"Do you want to |^\s*❯ \d+\. ", re.M)  # a permission or AskUserQuestion dialog
 INBOX_PROJECT = "/Users/tal/.local/share/precog/Precog agents"  # inbox-etiquette.md: every send_message names it
 TRANSIENT = ("process running in the slot", "session running")  # preflight fails that end by themselves: no flag
 
@@ -1064,11 +1070,33 @@ def stop_session(sid, short):
     raise RuntimeError(f"session {sid} still running after claude stop")
 
 
-def send(s, slot, text):
-    """Give the session a new turn with text. `claude --bg --resume` starts a copy when the process runs, so a
-    running session is stopped first. Verified: the resumed id must be this session, else the copy is stopped."""
+class NoRex(RuntimeError):
+    pass
+
+
+def rex(*args, check=True):
+    """One rex call; never starts a rex server. NoRex when the binary is missing."""
+    path = shutil.which("rex") or (REX_APP if os.path.exists(REX_APP) else None)
+    if not path:
+        raise NoRex("rex not found on PATH or in Rex Beta.app")
+    return sh([path, "--autostart=false", *args], check=check)
+
+
+def pane_state(screen):
+    """ready (empty input box), typed (text in the input box), dialog, or None (no input box yet). The input box is
+    the `❯` line right under a rule, at the bottom of the pane."""
+    tail = [x for x in screen.splitlines() if x.strip()][-12:]
+    for i in range(len(tail) - 1, 0, -1):
+        if tail[i].startswith("❯") and tail[i - 1].startswith("─"):
+            return "ready" if tail[i] == "❯" or not tail[i][1:].strip() else "typed"
+    return "dialog" if DIALOG_RE.search("\n".join(tail)) else None
+
+
+def send(s, slot, text, a):
+    """Give the session text as a user turn; never stop it. A running session: through rex (module docstring). A
+    session with no process: `claude --bg --resume`; the resumed id must be this session, else the copy is stopped."""
     if running(s):
-        stop_session(s["sessionId"], s.get("id"))
+        return rex_send(s, text, a)
     out = sh([f"{BIN}/claude", "--bg", "--resume", s["sessionId"], text], cwd=slot)
     m = re.search(r"backgrounded\W+([\w-]+)", out)
     if not m:
@@ -1082,6 +1110,39 @@ def send(s, slot, text):
             return
         time.sleep(1)
     raise RuntimeError(f"resumed session {m[1]} not in claude agents after {STOP_WAIT_S}s")
+
+
+def rex_send(s, text, a):
+    """Attach in a new rex session, check the pane, type text and Enter, and always kill the rex session."""
+    sid, short = s["sessionId"], s.get("id") or s["sessionId"]
+    row = next((r for r in agent_rows() if r["sessionId"] == sid), {})
+    if row.get("state") in ("blocked", "waiting") or row.get("status") == "waiting":
+        raise RuntimeError(f"session {sid} waits on a dialog; no text sent")
+    name = f"iar-nudge-{short}-{time.time_ns()}"
+    try:
+        rex("new", name, "--", f"{BIN}/claude", "attach", short)
+    except (NoRex, SourceError) as e:
+        key = f"nudge-no-rex attempt={key_field(a, 'attempt')}"
+        if not any((c.get("text") or "").startswith(f"reconcile-note: {key}\n")
+                   for c in ledger.show(a["item"]).get("comments") or []):
+            ledger.comment(a["item"], f"reconcile-note: {key}\nNo nudge: rex is not available ({e}). Start Rex; "
+                                      f"the next tick sends it.")
+        raise NoRex(f"no rex: {e}") from e
+    try:
+        for _ in range(STOP_WAIT_S):
+            state = pane_state(rex("capture", "-s", name, "--trim"))
+            if state == "ready":
+                break
+            if state:
+                raise RuntimeError(f"session {sid} shows {'a dialog' if state == 'dialog' else 'typed text'}; "
+                                   "no text sent")
+            time.sleep(1)
+        else:
+            raise RuntimeError(f"no Claude input box in rex session {name} after {STOP_WAIT_S}s")
+        rex("send", "-s", name, text)
+        rex("send-key", "-s", name, "Enter")
+    finally:
+        rex("kill", name, check=False)
 
 
 def inbox(tool, args):
@@ -1223,9 +1284,7 @@ def got_since(sid, text, since):
 
 def act_nudge(a, snap):
     att, s = session_of(a, snap)
-    if running(s):
-        save_output(a, s)  # send() stops a running session first
-    send(s, att["slot"], nudge_text(a))
+    send(s, att["slot"], nudge_text(a), a)
     note(a, f"Sent session {att['session']}: {nudge_text(a)}")
 
 
@@ -1322,9 +1381,7 @@ def act_deliver(a, snap):
     att, s = session_of(a, snap)
     since = started_at(a)
     if "delivered" not in (q.get("labels") or []) and not got_since(att["session"], text, since):
-        if running(s):
-            save_output(a, s)  # send() stops a running session first
-        send(s or {"sessionId": att["session"]}, att["slot"], text)
+        send(s or {"sessionId": att["session"]}, att["slot"], text, a)
         for _ in range(STOP_WAIT_S):
             if got_since(att["session"], text, since):
                 break
@@ -1681,6 +1738,7 @@ def self_test():
     executor_self_test()
     w12_classify_test()
     w12_executor_test()
+    w12b_send_test()
     w13_test()
     w14_plan_test()
     w9b_stack_test()
@@ -2444,6 +2502,9 @@ def w12_executor_test():
             row = next(r for r in agents if r["sessionId"] == args[2])
             row.update(state="working", pid=1)
             return f"backgrounded · {row['id']}\n"
+        if tool == "rex":  # a ready Claude pane; the text joins the session's turn, nothing stops
+            calls.append(("rex", *args[1:]))
+            return READY_PANE if args[1] == "capture" else ""
         if tool == "treehouse" and args[0] == "return":
             calls.append(("return", args[1], args[4]))
             slots[:] = [x for x in slots if x["path"] != args[1]]
@@ -2471,9 +2532,10 @@ def w12_executor_test():
     fakes = {"agents": src_fake_agents, "treehouse": lambda s: s.update(slots=[dict(x) for x in slots]),
              "inbox": lambda s: s.update(inbox=[dict(x) for x in threads]), "plannotator": lambda s: None,
              "git": src_race_git}
-    saved_env = {k: os.environ.get(k) for k in ("IAR_WORKFLOW", "BEADS_DIR")}
+    saved_env = {k: os.environ.get(k) for k in ("IAR_WORKFLOW", "BEADS_DIR", "PATH")}
     g = globals()
     with tempfile.TemporaryDirectory() as d:
+        os.environ["PATH"] = fake_rex(d)
         git = lambda *a, cwd=d: subprocess.run(["git", *a], cwd=cwd, check=True, capture_output=True, timeout=30)
         git("init", "--bare", "-q", "origin.git")
         git("clone", "-q", "origin.git", "seed")
@@ -2558,11 +2620,12 @@ def w12_executor_test():
             assert any(f"claude --resume s-{zf}" in x for x in texts(zf)), texts(zf)
             assert [x["slot"] for x in slots] == ["2", "3", "4", "6"]  # E10: dirty, unpushed, late-dirty, stale-ref slots stay
             assert any("local commits missing from origin" in x for x in texts(unp))
-            assert ("stop", f"s-{st}") in calls and ("resume", f"s-{st}", "status?") in calls
-            assert any(x.startswith("last-output: nudge attempt=1") for x in texts(st))
+            sent = [c for c in calls if c[:2] == ("rex", "send")]
+            assert ("rex", "send", "-s", sent[0][3], "status?") in calls and ("rex", "kill", sent[0][3]) in calls, calls
+            assert not [c for c in calls if c[0] == "resume"] and ("stop", f"s-{st}") not in calls  # a nudge never stops
             assert ledger.show(ol)["labels"] and {QUARANTINE, "needs-human"} <= set(ledger.show(ol)["labels"])
             assert any(x.startswith("last-output: quarantine attempt=1") and f"final words of {ol}" in x for x in texts(ol))
-            assert any(c[0] == "resume" and c[1] == f"s-{tk}" and "tokens limit" in c[2] for c in calls), calls
+            assert any(c[:2] == ("rex", "send") and "tokens limit" in c[4] for c in calls), calls
             assert ("stop", f"s-{df}") in calls and any(x.startswith("last-output: stop-session") for x in texts(df))
             p = subprocess.run([os.path.join(os.path.dirname(IAR), "bin", "bg"), ol, "--done-when", "true"],
                                capture_output=True, text=True, timeout=60)
@@ -2588,6 +2651,88 @@ def w12_executor_test():
             assert [x["slot"] for x in slots] == ["2", "3", "4", "6"] and sum(c[0] == "stop" for c in calls) == stops
         finally:
             g["sh"], g["inbox"] = real_sh, real_inbox
+            for k, v in saved_env.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+
+READY_PANE = "⏺ done\n\n──── x ─\n❯ \n────\n  x  Haiku\n  ⏵⏵ auto mode on\n"
+
+
+def fake_rex(d):
+    """A fake rex on PATH (fake_sh answers its calls); returns the new PATH."""
+    os.makedirs(f"{d}/fakebin", exist_ok=True)
+    with open(f"{d}/fakebin/rex", "w") as f:
+        f.write("#!/bin/sh\nexit 1\n")
+    os.chmod(f"{d}/fakebin/rex", 0o755)
+    return f"{d}/fakebin:{os.environ.get('PATH', '/usr/bin:/bin')}"
+
+
+def w12b_send_test():
+    """precog-6j1m: send() through a fake rex and claude. Idle and busy sessions get the text and Enter; a waiting
+    session, a dialog, typed text and no input box get no Enter and raise; no rex flags nudge-no-rex once; a stopped
+    session is resumed; the rex session is killed on every path that opened one; no path stops a session."""
+    g = globals()
+    saved = {k: g[k] for k in ("sh", "REX_APP", "STOP_WAIT_S")}
+    saved_env = {k: os.environ.get(k) for k in ("PATH",)}
+    saved_ledger = ledger.show, ledger.comment
+    calls, comments, rows, pane = [], [], [], [READY_PANE]
+
+    def fake_sh(cmd, cwd=None, check=True, input=None):
+        tool, args = os.path.basename(cmd[0]), cmd[1:]
+        if tool == "claude" and args[0] == "agents":
+            return json.dumps(rows)
+        if tool == "claude" and args[:2] == ["--bg", "--resume"]:
+            calls.append(("resume", args[2]))
+            return "backgrounded · s1\n"
+        if tool == "rex":
+            calls.append(tuple(args[1:]))
+            if args[1] == "new" and pane[0] is None:
+                raise SourceError("rex new exit 1: server not running")
+            return pane[0] if args[1] == "capture" else ""
+        raise AssertionError(f"unexpected command {cmd}")
+
+    def try_send(state, screen, alive=True):
+        calls.clear()
+        rows[:] = [{"sessionId": "s1", "id": "s1", "kind": "background", "state": state, "pid": 1 if alive else None}]
+        pane[0] = screen
+        try:
+            send(dict(rows[0], alive=alive), "/slot", "status?", {"item": "b1", "action": "nudge attempt=1 count=1"})
+            return None
+        except RuntimeError as e:
+            return e
+    with tempfile.TemporaryDirectory() as d:
+        g.update(sh=fake_sh, REX_APP=f"{d}/no-rex", STOP_WAIT_S=2)
+        ledger.show = lambda bid: {"comments": [{"text": t} for t in comments]}
+        ledger.comment = lambda bid, text, author=None: comments.append(text)
+        os.environ["PATH"] = fake_rex(d)
+        try:
+            for state in ("done", "working"):  # idle and busy: the text, then Enter, then kill
+                assert try_send(state, READY_PANE) is None
+                name = calls[0][1]
+                assert calls[0] == ("new", name, "--", f"{BIN}/claude", "attach", "s1"), calls
+                assert calls[-3:] == [("send", "-s", name, "status?"), ("send-key", "-s", name, "Enter"),
+                                      ("kill", name)], calls
+            dialog = "⏺ Bash(rm x)\n Do you want to proceed?\n ❯ 1. Yes\n   2. No\n"
+            typed = READY_PANE.replace("❯ \n", "❯ half a message\n")
+            for screen, why in ((dialog, "a dialog"), (typed, "typed text"), ("loading\n", "no Claude input box")):
+                e = try_send("working", screen)
+                assert e and why in str(e), (why, e)
+                assert not [c for c in calls if c[0] in ("send", "send-key")] and calls[-1][0] == "kill", calls
+            e = try_send("blocked", READY_PANE)  # claude agents: waiting
+            assert e and "waits" in str(e) and calls == [], calls
+            pane[0] = None  # rex server not reachable, then the binary missing
+            for path in (os.environ["PATH"], "/usr/bin:/bin"):
+                os.environ["PATH"] = path
+                e = try_send("working", None)
+                assert isinstance(e, NoRex) and not [c for c in calls if c[0] in ("send", "kill")], (e, calls)
+            assert [t.split("\n")[0] for t in comments] == ["reconcile-note: nudge-no-rex attempt=1"], comments
+            assert try_send("stopped", READY_PANE, alive=False) is None and calls == [("resume", "s1")], calls
+        finally:
+            g.update(saved)
+            ledger.show, ledger.comment = saved_ledger
             for k, v in saved_env.items():
                 if v is None:
                     os.environ.pop(k, None)

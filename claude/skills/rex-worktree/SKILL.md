@@ -41,6 +41,10 @@ Use the review system the task or repository requires. The command above is the 
 
 Stabilize the diff before review. The reviewer reads; the implementer fixes. Run the checks, fix actionable findings and review the changed result. Keep a human diff review in Plannotator when the task or repo requires it. These reviews do not authorize a merge or broaden the user's permission.
 
+## Linear access
+
+Use connected Linear tools when available. This machine also has Tal's personal API key in `~/.linear_key` (or the file named by `LINEAR_KEY_FILE`). Use a standard HTTP client with `https://api.linear.app/graphql`; read the credential in the process and keep it out of command arguments, output and task notes. The private TAL team ID is `c2a9d57a-f287-4779-a6d5-e75d9e079dab`. Resolve state IDs from that team and verify an issue belongs to it before any write. Use [Linear's API documentation](https://linear.app/developers/graphql) or schema introspection for unfamiliar fields. If access fails, report it; do not silently switch trackers.
+
 ## Task state and Inbox
 
 Write progress, decisions, test evidence and links to the Linear issue. Use In Review when implementation and checks are ready for review. Mark Done after the task's acceptance and delivery conditions are met, not when a terminal becomes idle.

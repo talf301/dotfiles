@@ -28,7 +28,7 @@
     "stale-lease": false,
     "closed-bead-thread": false,
     "dispatch": false,
-    "linear-mirror": true
+    "linear-mirror": false
   }
 }
 ---

@@ -12,6 +12,7 @@ from types import SimpleNamespace
 from pathlib import Path
 
 from delegate import delegate_claude
+from delegate import MODEL_SCHEMA
 from router import decide, open_database
 
 
@@ -62,6 +63,13 @@ class RouterTests(unittest.TestCase):
         result = decide(self.db, request(1), invalid)
         self.assertEqual(result["status"], "error")
         self.assertNotEqual(result["status"], "needs_human")
+
+    def test_claude_provider_schema_has_no_unsupported_root_union(self):
+        schema = json.loads(MODEL_SCHEMA)
+        self.assertNotIn("oneOf", schema)
+        self.assertNotIn("allOf", schema)
+        self.assertNotIn("anyOf", schema)
+        self.assertEqual(schema["properties"]["action"]["type"], ["string", "null"])
 
     def test_revision_payload_is_immutable(self):
         decide(self.db, request(), proposal())

@@ -27,10 +27,8 @@ MODEL_SCHEMA = json.dumps(
             "reason": {"type": "string"},
             "provenance": {"type": "object", "required": ["source"], "properties": {"source": {"const": "claude"}}, "additionalProperties": True},
         },
-        "oneOf": [
-            {"properties": {"status": {"const": "answer"}, "action": {"type": "string"}}},
-            {"properties": {"status": {"enum": ["need_evidence", "needs_human"]}, "action": {"type": "null"}}},
-        ],
+        # Claude's native tool API rejects oneOf/allOf/anyOf at the root. Keep this
+        # provider schema simple; router.py performs the status/action cross-field gate.
     },
     separators=(",", ":"),
 )

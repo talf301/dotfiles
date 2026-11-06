@@ -1,0 +1,81 @@
+#!/usr/bin/env python3
+"""Read or write a Linear issue description through the raw GraphQL API.
+
+Usage:
+  linear-description get <ISSUE-ID>          print the stored Markdown
+  linear-description set <ISSUE-ID> <file>   save <file> as the description
+
+Use this instead of the Linear MCP save_issue: its patch mode can return
+success and change nothing, and a full save can rewrite links elsewhere in
+the description. `set` reads the description back and fails if the stored
+text differs from <file> (ignoring Linear's `](<url>)` link form).
+
+The API key comes from $LINEAR_KEY_FILE or ~/.linear_key. It is never printed.
+"""
+
+import json
+import os
+import re
+import sys
+import urllib.request
+
+API = "https://api.linear.app/graphql"
+
+
+def call(query: str, variables: dict) -> dict:
+    key_file = os.environ.get("LINEAR_KEY_FILE", os.path.expanduser("~/.linear_key"))
+    with open(key_file) as f:
+        key = f.read().strip()
+    req = urllib.request.Request(
+        API,
+        data=json.dumps({"query": query, "variables": variables}).encode(),
+        headers={"Content-Type": "application/json", "Authorization": key},
+    )
+    with urllib.request.urlopen(req, timeout=30) as r:
+        resp = json.load(r)
+    if resp.get("errors"):
+        raise ValueError(resp["errors"])
+    return resp["data"]
+
+
+def get(issue: str) -> str:
+    q = "query($id:String!){issue(id:$id){description}}"
+    return call(q, {"id": issue})["issue"]["description"] or ""
+
+
+def norm(text: str) -> str:
+    # Linear stores link targets as `](<url>)`; both forms render the same.
+    return re.sub(r"\]\(<([^>\s]*)>\)", r"](\1)", text)
+
+
+def main() -> int:
+    args = sys.argv[1:]
+    if len(args) == 2 and args[0] == "get":
+        sys.stdout.write(get(args[1]))
+        return 0
+    if len(args) == 3 and args[0] == "set":
+        with open(args[2]) as f:
+            text = f.read()
+        m = "mutation($id:String!,$d:String!){issueUpdate(id:$id,input:{description:$d}){success}}"
+        if not call(m, {"id": args[1], "d": text})["issueUpdate"]["success"]:
+            print("linear-description: issueUpdate failed", file=sys.stderr)
+            return 1
+        if norm(get(args[1])) != norm(text):
+            print(
+                "linear-description: saved, but Linear stored different text; "
+                "run `get` and compare",
+                file=sys.stderr,
+            )
+            return 1
+        print(f"saved {args[1]}")
+        return 0
+    print(__doc__.strip(), file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        print(f"linear-description: {type(e).__name__}: {e}", file=sys.stderr)
+        sys.exit(1)

@@ -1,0 +1,151 @@
+import json
+import subprocess
+import sys
+import tempfile
+import threading
+import unittest
+from pathlib import Path
+
+from router import decide, open_database
+
+
+def request(revision=0):
+    return {
+        "request_id": "r1",
+        "revision": revision,
+        "session_id": "session-1",
+        "task_id": "task-1",
+        "objective": "Keep the experiment moving",
+        "question": "May the supervisor continue?",
+        "options": ["continue", "request_input"],
+        "evidence": [{"id": "e1", "text": "worker is idle", "provenance": {"source": "fixture"}}],
+        "grants": [],
+    }
+
+
+def proposal(**changes):
+    value = {"status": "answer", "action": "continue", "evidence_ids": ["e1"], "provenance": {"source": "fixture"}}
+    value.update(changes)
+    return value
+
+
+class RouterTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db = open_database(Path(self.tmp.name) / "router.sqlite")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_fixture_answer_is_durable_and_idempotent(self):
+        first = decide(self.db, request(), proposal())
+        second = decide(self.db, request(), proposal(action="request_input"))
+        self.assertEqual(first, second)
+        self.assertEqual(first["status"], "answer")
+        self.assertTrue(first["supervisor_authored"])
+
+    def test_no_proposal_needs_evidence(self):
+        result = decide(self.db, request())
+        self.assertEqual(result["status"], "need_evidence")
+        self.assertEqual(result["reason"], "supervisor_proposal_required")
+
+    def test_revision_payload_is_immutable(self):
+        decide(self.db, request(), proposal())
+        changed = request()
+        changed["question"] = "different"
+        with self.assertRaises(ValueError):
+            decide(self.db, changed, proposal())
+        decide(self.db, request(1), proposal())
+        with self.assertRaises(ValueError):
+            decide(self.db, request(0), proposal())
+
+    def test_malformed_proposal_fails_closed_and_keeps_evidence(self):
+        result = decide(self.db, request(), {"status": "answer", "action": "shell"})
+        self.assertEqual(result["status"], "needs_human")
+        self.assertEqual(result["reason"], "malformed_proposal")
+        self.assertIsNone(result["effect_id"])
+
+    def test_unhashable_proposal_fields_fail_closed(self):
+        result = decide(self.db, request(), {"status": [], "evidence_ids": [[], []]})
+        self.assertEqual(result["status"], "needs_human")
+        self.assertEqual(result["reason"], "malformed_proposal")
+        raw = self.db.execute("SELECT proposal FROM requests").fetchone()[0]
+        self.assertEqual(json.loads(raw), {"status": [], "evidence_ids": [[], []]})
+
+    def test_duplicate_evidence_ids_are_rejected(self):
+        duplicate = request()
+        duplicate["evidence"] = [duplicate["evidence"][0], duplicate["evidence"][0]]
+        with self.assertRaises(ValueError):
+            decide(self.db, duplicate, proposal())
+
+    def test_answer_without_evidence_needs_evidence(self):
+        result = decide(self.db, request(), proposal(evidence_ids=[]))
+        self.assertEqual(result["status"], "need_evidence")
+
+    def test_stale_revision_cannot_return_cached_answer(self):
+        decide(self.db, request(0), proposal())
+        decide(self.db, request(1), proposal())
+        with self.assertRaises(ValueError):
+            decide(self.db, request(0), proposal())
+
+    def test_human_grant_cannot_be_created_by_proposal(self):
+        result = decide(self.db, request(), proposal(provenance={"source": "fixture", "grants": [{"actor": "human"}]}))
+        self.assertEqual(result["status"], "answer")
+        self.assertNotIn("grants", result)
+
+    def test_cli_round_trip(self):
+        root = Path(__file__).parent
+        with tempfile.TemporaryDirectory() as directory:
+            db = Path(directory) / "db.sqlite"
+            completed = subprocess.run(
+                [sys.executable, str(root / "cli.py"), "--db", str(db)],
+                input=json.dumps(request()),
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+            result = json.loads(completed.stdout)
+            self.assertEqual(result["status"], "need_evidence")
+            self.assertEqual(result["reason"], "supervisor_proposal_required")
+
+    def test_cli_rejects_bad_evidence_types(self):
+        root = Path(__file__).parent
+        with tempfile.TemporaryDirectory() as directory:
+            db = Path(directory) / "db.sqlite"
+            bad = request()
+            bad["evidence"][0]["id"] = 3
+            completed = subprocess.run(
+                [sys.executable, str(root / "cli.py"), "--db", str(db)],
+                input=json.dumps(bad), text=True, capture_output=True
+            )
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertEqual(json.loads(completed.stdout)["status"], "error")
+
+    def test_restart_reopens_ledger_and_concurrent_identical_request_is_safe(self):
+        path = Path(self.tmp.name) / "restart.sqlite"
+        first = open_database(path)
+        expected = decide(first, request(), proposal())
+        first.close()
+        reopened = open_database(path)
+        self.assertEqual(decide(reopened, request(), proposal(action="request_input")), expected)
+        results, errors = [], []
+
+        def worker():
+            try:
+                connection = open_database(path)
+                results.append(decide(connection, request(), proposal(action="request_input")))
+                connection.close()
+            except Exception as exc:  # pragma: no cover - assertion below reports unexpected races
+                errors.append(exc)
+
+        threads = [threading.Thread(target=worker) for _ in range(4)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertFalse(errors)
+        self.assertEqual(results, [expected] * 4)
+
+
+if __name__ == "__main__":
+    unittest.main()

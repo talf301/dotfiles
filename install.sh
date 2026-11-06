@@ -27,32 +27,19 @@ link() {  # link <src-in-repo | /absolute/src> <dest>
   ln -s "$src" "$dest"; echo "LINK  $dest -> $src"
 }
 
-# --- agent tools: every executable in bin/ → ~/.local/bin/ ---
-for f in "$REPO"/bin/*; do link "bin/$(basename "$f")" "$HOME/.local/bin/$(basename "$f")"; done
-
-# --- Rex CLI (ships inside the app bundle) → ~/.local/bin/rex ---
-# Migration note (W20–W22): Rex replaces herdr. Nothing here calls herdr; its binary stays installed until Tal removes it.
-link "/Applications/Rex Beta.app/Contents/Helpers/Rex Server.rex/Contents/MacOS/rex" "$HOME/.local/bin/rex"
-
-# --- shared agent skills: Claude and Codex use ~/.agents/skills ---
-for skill in implement-and-review first-mate rex-worktree digest dispatch-bead next-bead; do
-  link "claude/skills/$skill" "$HOME/.agents/skills/$skill"
-  link "$HOME/.agents/skills/$skill" "$HOME/.claude/skills/$skill"
+# --- retained agent tools ---
+for tool in cc_usage.py linear-description linear-upload; do
+  link "bin/$tool" "$HOME/.local/bin/$tool"
 done
 
-# The retired session-board timer is not installed by the Rex workflow.
-
-# --- ClaudeGo.app: opens claudego://<sessionId> links from board.md via iar/go.sh ---
-if [ $DRY = 1 ]; then echo "BUILD ~/Applications/ClaudeGo.app"
-else
-  osacompile -o "$HOME/Applications/ClaudeGo.app" "$REPO/iar/ClaudeGo.applescript"
-  plutil -replace CFBundleIdentifier -string local.claudego "$HOME/Applications/ClaudeGo.app/Contents/Info.plist"
-  plutil -replace LSBackgroundOnly -bool true "$HOME/Applications/ClaudeGo.app/Contents/Info.plist"
-  plutil -replace CFBundleURLTypes -json '[{"CFBundleURLName":"claudego","CFBundleURLSchemes":["claudego"]}]' "$HOME/Applications/ClaudeGo.app/Contents/Info.plist"
-  codesign -f -s - "$HOME/Applications/ClaudeGo.app"
-  /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$HOME/Applications/ClaudeGo.app"
-  echo "BUILD ~/Applications/ClaudeGo.app"
-fi
+# --- shared instructions and three personal core skills ---
+link "agents/AGENTS.md" "$HOME/AGENTS.md"
+link "$HOME/AGENTS.md" "$HOME/.claude/CLAUDE.md"
+link "$HOME/AGENTS.md" "$HOME/.codex/AGENTS.md"
+for skill in work review plannotator; do
+  link "agents/skills/$skill" "$HOME/.agents/skills/$skill"
+  link "agents/skills/$skill" "$HOME/.claude/skills/$skill"
+done
 
 # --- macOS UI configs (these tools don't read nikud's XDG_CONFIG_HOME) ---
 link "sketchybar"     "$HOME/.config/sketchybar"

@@ -10,8 +10,10 @@ Run a fixture-only call:
 cd agents/attention-router
 python3 -m unittest -v
 printf '%s\n' '{"request_id":"r1","revision":0,"session_id":"s1","task_id":"t1","objective":"x","question":"y","options":["continue"],"evidence":[{"id":"e1","provenance":{"source":"fixture"}}],"grants":[]}' \
-  | python3 cli.py --db /tmp/attention-router.sqlite
+  | python3 cli.py --db "$HOME/.local/state/attention-router/router.sqlite"
 ```
+
+The database path must be inside an existing owner-only (`0700`) directory. The ledger and SQLite WAL sidecars are created with mode `0600`; symlinks and foreign-owned ledger files are refused. The caller must create the private parent directory before invoking the CLI.
 
 The same `(request_id, revision)` is idempotent only when the payload hash matches. Later revisions must increase and are retained separately; stale revisions return a machine error before a cached answer can be used. A malformed proposal is stored as `needs_human`; it is not retried or replaced with a guessed answer, and its raw JSON is retained for review. Evidence provenance is copied into the request ledger, while returned answers are always marked `supervisor_authored`; a proposal cannot create a human grant.
 

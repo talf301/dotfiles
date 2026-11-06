@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sqlite3
+import stat
 from pathlib import Path
 from typing import Any
 
@@ -89,7 +91,24 @@ def _proposal_or_fail_closed(request: dict[str, Any], proposal: Any) -> dict[str
 
 
 def open_database(path: str | Path) -> sqlite3.Connection:
-    connection = sqlite3.connect(path)
+    ledger = os.path.abspath(os.fspath(path))
+    parent = os.path.dirname(ledger)
+    parent_info = os.stat(parent, follow_symlinks=False)
+    if not stat.S_ISDIR(parent_info.st_mode) or parent_info.st_uid != os.getuid() or parent_info.st_mode & 0o077:
+        raise ValueError("ledger parent must be an existing owner-only directory")
+    try:
+        ledger_info = os.lstat(ledger)
+    except FileNotFoundError:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(ledger, flags, 0o600)
+        os.close(descriptor)
+    else:
+        if not stat.S_ISREG(ledger_info.st_mode) or ledger_info.st_uid != os.getuid():
+            raise ValueError("ledger must be an owner-owned regular file")
+        os.chmod(ledger, 0o600)
+    connection = sqlite3.connect(ledger)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys=ON")
     connection.execute("PRAGMA journal_mode=WAL")

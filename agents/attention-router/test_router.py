@@ -1,4 +1,6 @@
 import json
+import os
+import stat
 import subprocess
 import sys
 import tempfile
@@ -145,6 +147,22 @@ class RouterTests(unittest.TestCase):
             thread.join()
         self.assertFalse(errors)
         self.assertEqual(results, [expected] * 4)
+
+    def test_ledger_and_wal_sidecars_are_private(self):
+        path = Path(self.tmp.name) / "private.sqlite"
+        connection = open_database(path)
+        decide(connection, request(), proposal())
+        for sibling in (path, Path(str(path) + "-wal"), Path(str(path) + "-shm")):
+            if sibling.exists():
+                self.assertEqual(stat.S_IMODE(os.stat(sibling).st_mode), 0o600)
+        connection.close()
+
+    def test_broadly_readable_parent_is_rejected(self):
+        parent = Path(self.tmp.name) / "public"
+        parent.mkdir(mode=0o755)
+        os.chmod(parent, 0o755)
+        with self.assertRaises(ValueError):
+            open_database(parent / "router.sqlite")
 
 
 if __name__ == "__main__":

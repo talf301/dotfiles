@@ -110,6 +110,27 @@ class RouterTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             decide(self.db, request(0), proposal())
 
+    def test_older_decision_cannot_finalize_while_newer_model_call_is_reserved(self):
+        newer = request(1)
+        self.db.execute(
+            "INSERT INTO model_calls(request_id, revision, payload_hash, payload, status, raw_response, terminal_error, metadata) VALUES (?,?,?,?,?,?,?,?)",
+            (newer["request_id"], 1, "newer-hash", json.dumps(newer), "unknown", "partial raw receipt", "claude_timeout", "{}"),
+        )
+        self.db.commit()
+        with self.assertRaises(ValueError):
+            decide(self.db, request(0), proposal())
+        self.assertIsNone(self.db.execute("SELECT result FROM requests WHERE request_id='r1' AND revision=0").fetchone())
+        self.assertEqual(self.db.execute("SELECT raw_response FROM model_calls WHERE revision=1").fetchone()[0], "partial raw receipt")
+
+    def test_offline_proposal_cannot_replace_same_revision_model_payload(self):
+        self.db.execute(
+            "INSERT INTO model_calls(request_id, revision, payload_hash, payload, status) VALUES (?,?,?,?,?)",
+            ("r1", 0, "different", "{}", "unknown"),
+        )
+        self.db.commit()
+        with self.assertRaises(ValueError):
+            decide(self.db, request(), proposal())
+
     def test_human_grant_cannot_be_created_by_proposal(self):
         result = decide(self.db, request(), proposal(provenance={"source": "fixture", "grants": [{"actor": "human"}]}))
         self.assertEqual(result["status"], "answer")

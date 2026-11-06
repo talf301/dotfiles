@@ -136,7 +136,14 @@ def decide(connection: sqlite3.Connection, request: dict[str, Any], proposal: An
     request_id, revision = request["request_id"], request["revision"]
     connection.execute("BEGIN IMMEDIATE")
     try:
-        latest = connection.execute("SELECT MAX(revision) FROM requests WHERE request_id=?", (request_id,)).fetchone()[0]
+        latest_request = connection.execute("SELECT MAX(revision) FROM requests WHERE request_id=?", (request_id,)).fetchone()[0]
+        latest_call = connection.execute("SELECT MAX(revision) FROM model_calls WHERE request_id=?", (request_id,)).fetchone()[0]
+        latest = max(x for x in (latest_request, latest_call) if x is not None) if latest_request is not None or latest_call is not None else None
+        call_identity = connection.execute(
+            "SELECT payload_hash FROM model_calls WHERE request_id=? AND revision=?", (request_id, revision)
+        ).fetchone()
+        if call_identity and call_identity["payload_hash"] != payload_hash:
+            raise _fail("model call payload does not match immutable request revision")
         if latest is not None and revision < latest:
             raise _fail("stale revision cannot replace a newer request")
         existing = connection.execute(
@@ -147,7 +154,7 @@ def decide(connection: sqlite3.Connection, request: dict[str, Any], proposal: An
                 raise _fail("request revision is immutable and payload does not match")
             connection.commit()
             return json.loads(existing["result"])
-        if latest is not None and revision <= latest:
+        if latest_request is not None and revision <= latest_request:
             raise _fail("revision must increase for an existing request_id")
         answer = _proposal_or_fail_closed(request, proposal)
         result = {

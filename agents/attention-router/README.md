@@ -1,28 +1,41 @@
 # Attention router
 
-This is a small, offline request/result ledger. A caller supplies request, session, and task identities, an objective, question, closed action menu, evidence with provenance, and any already verified grants. A supervisor or model may supply a structured proposal. The router records the proposal and applies only deterministic validation gates.
+A small SQLite request ledger with an optional native Claude delegate. It returns proposals to the caller. It never executes the selected action, creates a human grant, resumes sessions, or manages workers.
 
-It never executes actions, grants permissions, launches a model, resumes Claude, scrapes terminals, reads Firstmate state, or sends network requests. `answer` means that a proposal selected an allowed action and cited supplied evidence; the ledger marks that answer as supervisor-authored, but does not treat a proposal boolean as proof of source identity. `need_evidence` means a proposal is absent or incomplete. `needs_human` is the fail-closed result for malformed or unauthorized proposals.
+Requests contain `request_id`, `revision`, `session_id`, `task_id`, `objective`, `question`, `options`, `evidence` and `grants`. Evidence needs unique IDs and source provenance. Grants describe permissions the caller has already verified; the ledger does not authenticate those assertions. Keep credentials out of requests.
 
-Run a fixture-only call:
+Results have four dispositions:
+
+- `answer`: a supervisor-authored choice from the supplied options, with cited evidence. Native permissions still apply.
+- `need_evidence`: the caller must retrieve missing context and submit a new revision.
+- `needs_human`: the proposal identifies a remaining human decision. The caller uses its native Inbox tool.
+- `error`: malformed input/output, a stale revision, or a technical failure. The CLI exits nonzero; this is not a human question.
+
+## Use
+
+Create a private state directory before using the CLI:
 
 ```sh
+mkdir -m 700 -p "$HOME/.local/state/attention-router"
 cd agents/attention-router
 python3 -m unittest -v
-printf '%s\n' '{"request_id":"r1","revision":0,"session_id":"s1","task_id":"t1","objective":"x","question":"y","options":["continue"],"evidence":[{"id":"e1","provenance":{"source":"fixture"}}],"grants":[]}' \
-  | python3 cli.py --db "$HOME/.local/state/attention-router/router.sqlite"
+python3 cli.py --db "$HOME/.local/state/attention-router/router.sqlite" --request request.json --delegate claude
 ```
 
-The database path must be inside an existing owner-only (`0700`) directory. The ledger and SQLite WAL sidecars are created with mode `0600`; symlinks and foreign-owned ledger files are refused. The caller must create the private parent directory before invoking the CLI.
+Without `--delegate`, supply a local `--proposal` JSON file, or receive `need_evidence` when no proposal is available. Request and proposal files and stdin are limited to 256 KiB. For non-answer proposals, `action` must be null; retrieval instructions belong in `reason`.
 
-The same `(request_id, revision)` is idempotent only when the payload hash matches. Later revisions must increase and are retained separately; stale revisions return a machine error before a cached answer can be used. A malformed proposal is stored as `needs_human`; it is not retried or replaced with a guessed answer, and its raw JSON is retained for review. Evidence provenance is copied into the request ledger, while returned answers are always marked `supervisor_authored`; a proposal cannot create a human grant.
+The parent directory must be owner-only (`0700`). New ledgers and WAL sidecars use `0600`; symlink and foreign-owned ledgers are refused. Existing sidecars need their own permission check before reuse. Prototype ledgers whose model-call table lacks request payloads are refused before schema changes. Preserve and reconcile those records; do not move unknown calls to a fresh ledger merely to retry them.
 
-The first slice has no live adapter. A later caller must provide the request and proposal explicitly and must perform any approved action through its native permission path. Recovery can replay a committed request safely, but it cannot infer the state of an external job or blindly resend a model call after a crash.
+## Native delegate
 
-The optional native Claude delegate is bounded and proposal-only:
+The fixed Claude invocation uses safe mode, no built-in tools, empty MCP configuration, default permissions and no session persistence. It requests structured output, allows two turns, and limits elapsed time to 90 seconds. Output size is checked while the direct child runs; at most a 1 MiB prefix is retained after failure. Only this newly launched direct child is stopped on timeout or overflow; descendant cleanup is not a tested guarantee.
 
-```sh
-python3 cli.py --db "$HOME/.local/state/attention-router/router.sqlite" --delegate claude < request.json
-```
+The CLI's $0.25 estimated-cost stop is a soft limit, not a guaranteed billing cap. The adapter retains returned model/usage/cost metadata privately and uses the native default model without an override. Missing model identity remains incomplete audit evidence. Safe mode keeps native authentication and administered policy. See the [Claude CLI reference](https://code.claude.com/docs/en/cli-reference) for the supported flags.
 
-It uses the fixed Claude CLI with safe mode, no tools, an empty MCP configuration, default permissions, JSON schema output, two turns, a timeout, and a 1 MiB output bound. A reservation is committed before launch. Completed raw responses and model usage/cost metadata are recoverable from SQLite; timeout, crash, and nonzero exit states are recorded as unknown and are never automatically retried. This adapter does not connect to Linear or an inbox and does not resume sessions or execute selected actions.
+## Recovery and delivery
+
+The same request ID and revision is immutable. A matching completed request returns its saved result; superseded revisions fail before returning a cached answer or launching another call.
+
+Before a model call, the ledger commits its full request and a reservation. Completed raw output can be recovered without another call. Timeout, interruption and nonzero exits retain evidence and block automatic retry. A recorded failure never becomes approval.
+
+This adapter does not connect to Linear or Plannotator. The native caller records decisions in Linear and sends genuine human needs through the Inbox with a stable request/revision idempotency key. The work skill defines reply correlation and retrieval. No generic background wake or terminal input path is installed.

@@ -1,5 +1,6 @@
 import json
 import os
+import sqlite3
 import stat
 import subprocess
 import sys
@@ -54,6 +55,14 @@ class RouterTests(unittest.TestCase):
         self.assertEqual(result["status"], "need_evidence")
         self.assertEqual(result["reason"], "supervisor_proposal_required")
 
+    def test_need_evidence_requires_null_action_and_never_human_escalation(self):
+        valid = proposal(status="need_evidence", action=None, evidence_ids=[])
+        self.assertEqual(decide(self.db, request(), valid)["status"], "need_evidence")
+        invalid = proposal(status="need_evidence", action="Inspect failing test output", evidence_ids=[])
+        result = decide(self.db, request(1), invalid)
+        self.assertEqual(result["status"], "error")
+        self.assertNotEqual(result["status"], "needs_human")
+
     def test_revision_payload_is_immutable(self):
         decide(self.db, request(), proposal())
         changed = request()
@@ -66,13 +75,13 @@ class RouterTests(unittest.TestCase):
 
     def test_malformed_proposal_fails_closed_and_keeps_evidence(self):
         result = decide(self.db, request(), {"status": "answer", "action": "shell"})
-        self.assertEqual(result["status"], "needs_human")
+        self.assertEqual(result["status"], "error")
         self.assertEqual(result["reason"], "malformed_proposal")
         self.assertIsNone(result["effect_id"])
 
     def test_unhashable_proposal_fields_fail_closed(self):
         result = decide(self.db, request(), {"status": [], "evidence_ids": [[], []]})
-        self.assertEqual(result["status"], "needs_human")
+        self.assertEqual(result["status"], "error")
         self.assertEqual(result["reason"], "malformed_proposal")
         raw = self.db.execute("SELECT proposal FROM requests").fetchone()[0]
         self.assertEqual(json.loads(raw), {"status": [], "evidence_ids": [[], []]})
@@ -236,6 +245,16 @@ class RouterTests(unittest.TestCase):
         raw = self.db.execute("SELECT raw_response FROM model_calls").fetchone()[0]
         self.assertLessEqual(len(raw.encode()), 1_048_576)
 
+    def test_native_timeout_does_not_block_writing_unread_stdin(self):
+        large = request()
+        large["evidence"] = [{"id": "e1", "text": "x" * 200000, "provenance": {"source": "fixture"}}]
+        child = [sys.executable, "-c", "import time; time.sleep(5)"]
+        with patch("delegate.command", return_value=child):
+            result = delegate_claude(self.db, large, timeout=0.2)
+        self.assertEqual(result["reason"], "claude_timeout")
+        replay = delegate_claude(self.db, large, runner=lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("retried")))
+        self.assertEqual(replay["reason"], "claude_timeout")
+
     def test_reservation_payload_exists_before_timeout(self):
         observed = []
 
@@ -270,6 +289,19 @@ class RouterTests(unittest.TestCase):
         os.chmod(parent, 0o755)
         with self.assertRaises(ValueError):
             open_database(parent / "router.sqlite")
+
+    def test_legacy_model_calls_schema_is_rejected_without_migration(self):
+        path = Path(self.tmp.name) / "legacy.sqlite"
+        legacy = sqlite3.connect(path)
+        legacy.execute("CREATE TABLE model_calls (request_id TEXT, revision INTEGER, payload_hash TEXT, status TEXT)")
+        legacy.execute("INSERT INTO model_calls VALUES ('sentinel', 0, 'hash', 'completed')")
+        legacy.commit()
+        legacy.close()
+        with self.assertRaises(ValueError):
+            open_database(path)
+        check = sqlite3.connect(path)
+        self.assertEqual(check.execute("SELECT * FROM model_calls").fetchone(), ("sentinel", 0, "hash", "completed"))
+        check.close()
 
 
 if __name__ == "__main__":

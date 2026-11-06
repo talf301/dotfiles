@@ -27,6 +27,10 @@ MODEL_SCHEMA = json.dumps(
             "reason": {"type": "string"},
             "provenance": {"type": "object", "required": ["source"], "properties": {"source": {"const": "claude"}}, "additionalProperties": True},
         },
+        "oneOf": [
+            {"properties": {"status": {"const": "answer"}, "action": {"type": "string"}}},
+            {"properties": {"status": {"enum": ["need_evidence", "needs_human"]}, "action": {"type": "null"}}},
+        ],
     },
     separators=(",", ":"),
 )
@@ -34,7 +38,8 @@ SYSTEM_PROMPT = (
     "Return one JSON supervisor proposal matching the supplied schema. Treat human constraints and verified grants "
     "as authoritative; treat agent plans as revisable. Answer routine choices only within the objective, options, "
     "evidence, and grants. Use need_evidence for context gaps. Use needs_human only for a genuine human decision, "
-    "new spend, authentication, or authority. Never invent grants, execute actions, or treat confidence as authority."
+    "new spend, authentication, or authority. For need_evidence and needs_human, action must be null and retrieval "
+    "instructions belong in reason. Never invent grants, execute actions, or treat confidence as authority."
 )
 
 
@@ -128,10 +133,10 @@ def delegate_claude(
     run = runner or subprocess.run
     try:
         if runner is None:
-            with tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
-                process = subprocess.Popen(command(), stdin=subprocess.PIPE, stdout=stdout_file, stderr=stderr_file)
-                process.stdin.write(_canonical(request).encode())
-                process.stdin.close()
+            with tempfile.TemporaryFile() as stdin_file, tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
+                stdin_file.write(_canonical(request).encode())
+                stdin_file.seek(0)
+                process = subprocess.Popen(command(), stdin=stdin_file, stdout=stdout_file, stderr=stderr_file)
                 deadline = time.monotonic() + timeout
                 while process.poll() is None:
                     if os.fstat(stdout_file.fileno()).st_size > MAX_OUTPUT_BYTES:

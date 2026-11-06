@@ -65,20 +65,20 @@ def _proposal_or_fail_closed(request: dict[str, Any], proposal: Any) -> dict[str
     if proposal is None:
         return {"status": "need_evidence", "reason": "supervisor_proposal_required", "supervisor_authored": True}
     if not isinstance(proposal, dict) or set(proposal) - PROPOSAL_FIELDS:
-        return {"status": "needs_human", "reason": "malformed_proposal", "supervisor_authored": True}
+        return {"status": "error", "reason": "malformed_proposal", "supervisor_authored": True}
     status = proposal.get("status")
     provenance = proposal.get("provenance")
     if not isinstance(status, str) or status not in STATUSES or not isinstance(provenance, dict) or not isinstance(provenance.get("source"), str) or not provenance["source"]:
-        return {"status": "needs_human", "reason": "malformed_proposal", "supervisor_authored": True}
+        return {"status": "error", "reason": "malformed_proposal", "supervisor_authored": True}
     evidence_ids = proposal.get("evidence_ids", [])
     valid_ids = {item["id"] for item in request["evidence"]}
     if not isinstance(evidence_ids, list) or any(not isinstance(x, str) or x not in valid_ids for x in evidence_ids):
-        return {"status": "needs_human", "reason": "unknown_evidence", "supervisor_authored": True}
+        return {"status": "error", "reason": "unknown_evidence", "supervisor_authored": True}
     action = proposal.get("action")
     if status == "answer" and (not isinstance(action, str) or action not in request["options"]):
-        return {"status": "needs_human", "reason": "unauthorized_action", "supervisor_authored": True}
+        return {"status": "error", "reason": "unauthorized_action", "supervisor_authored": True}
     if status != "answer" and action is not None:
-        return {"status": "needs_human", "reason": "malformed_proposal", "supervisor_authored": True}
+        return {"status": "error", "reason": "malformed_proposal", "supervisor_authored": True}
     if status == "answer" and not evidence_ids:
         return {"status": "need_evidence", "reason": "answer_without_evidence", "supervisor_authored": True}
     result = {"status": status, "supervisor_authored": True, "evidence_ids": evidence_ids}
@@ -110,6 +110,10 @@ def open_database(path: str | Path) -> sqlite3.Connection:
         os.chmod(ledger, 0o600)
     connection = sqlite3.connect(ledger)
     connection.row_factory = sqlite3.Row
+    model_columns = {row[1] for row in connection.execute("PRAGMA table_info(model_calls)")}
+    if model_columns and "payload" not in model_columns:
+        connection.close()
+        raise ValueError("legacy model_calls ledger lacks immutable request payload; refusing migration")
     connection.execute("PRAGMA foreign_keys=ON")
     connection.execute("PRAGMA journal_mode=WAL")
     with connection:

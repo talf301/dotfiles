@@ -18,3 +18,11 @@ The database path must be inside an existing owner-only (`0700`) directory. The 
 The same `(request_id, revision)` is idempotent only when the payload hash matches. Later revisions must increase and are retained separately; stale revisions return a machine error before a cached answer can be used. A malformed proposal is stored as `needs_human`; it is not retried or replaced with a guessed answer, and its raw JSON is retained for review. Evidence provenance is copied into the request ledger, while returned answers are always marked `supervisor_authored`; a proposal cannot create a human grant.
 
 The first slice has no live adapter. A later caller must provide the request and proposal explicitly and must perform any approved action through its native permission path. Recovery can replay a committed request safely, but it cannot infer the state of an external job or blindly resend a model call after a crash.
+
+The optional native Claude delegate is bounded and proposal-only:
+
+```sh
+python3 cli.py --db "$HOME/.local/state/attention-router/router.sqlite" --delegate claude < request.json
+```
+
+It uses the fixed Claude CLI with safe mode, no tools, an empty MCP configuration, default permissions, JSON schema output, two turns, a timeout, and a 1 MiB output bound. A reservation is committed before launch. Completed raw responses and model usage/cost metadata are recoverable from SQLite; timeout, crash, and nonzero exit states are recorded as unknown and are never automatically retried. This adapter does not connect to Linear or an inbox and does not resume sessions or execute selected actions.

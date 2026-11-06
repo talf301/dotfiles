@@ -118,6 +118,11 @@ def open_database(path: str | Path) -> sqlite3.Connection:
             "payload_hash TEXT NOT NULL, payload TEXT NOT NULL, proposal TEXT NOT NULL, result TEXT NOT NULL, "
             "PRIMARY KEY (request_id, revision))"
         )
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS model_calls (request_id TEXT NOT NULL, revision INTEGER NOT NULL, "
+            "payload_hash TEXT NOT NULL, status TEXT NOT NULL, raw_response TEXT, terminal_error TEXT, "
+            "metadata TEXT, PRIMARY KEY (request_id, revision))"
+        )
     return connection
 
 

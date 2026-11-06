@@ -36,7 +36,13 @@ When asking the attention router, submit:
 - evidence already checked, with source provenance;
 - existing grants and the consequence of delay.
 
-Treat `answer` as a delegated agent answer. Treat `need_evidence` as a retrieval task. Treat `needs_human` as a concrete question for the person. A router answer never grants permission.
+Treat `answer` as a delegated agent answer. Treat `need_evidence` as a bounded retrieval task: inspect the requested source, then submit a new revision with the added evidence. Treat `needs_human` as a concrete remaining question for the person. A router answer never grants permission.
+
+Use the router's explicit CLI when it is installed: `python3 ~/dotfiles/agents/attention-router/cli.py --db <private-ledger> --request <request.json> --delegate claude`. The ledger parent must already be an owner-only directory. This starts one tool-free native delegate call; it does not execute the selected action.
+
+Send a remaining human question through the native Plannotator Inbox tool with a stable idempotency key derived from the request ID and revision. Record the returned message ID, task and request revision in Linear. Use the actual person reply to that exact message; a later task revision can make an older answer stale. Read and reconcile the existing thread after interruption before sending again.
+
+Treat a nonzero exit or `status: error` as a technical failure, not as a request for human judgment. An in-flight or unknown model call must be reconciled from its existing record; do not change IDs to retry it automatically. Until a supported wake path is verified, the caller returns the result in its own active session; no terminal injection or generic background resume is part of this workflow.
 
 ## Experiments
 

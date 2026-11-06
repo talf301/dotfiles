@@ -6,8 +6,10 @@ import sys
 import tempfile
 import threading
 import unittest
+from types import SimpleNamespace
 from pathlib import Path
 
+from delegate import delegate_claude
 from router import decide, open_database
 
 
@@ -123,6 +125,17 @@ class RouterTests(unittest.TestCase):
             self.assertNotEqual(completed.returncode, 0)
             self.assertEqual(json.loads(completed.stdout)["status"], "error")
 
+    def test_cli_error_result_has_nonzero_exit(self):
+        root = Path(__file__).parent
+        with tempfile.TemporaryDirectory() as directory:
+            db = Path(directory) / "db.sqlite"
+            completed = subprocess.run(
+                [sys.executable, str(root / "cli.py"), "--db", str(db), "--proposal", "missing.json", "--delegate", "claude"],
+                input=json.dumps(request()), text=True, capture_output=True
+            )
+            self.assertEqual(completed.returncode, 2)
+            self.assertEqual(json.loads(completed.stdout)["status"], "error")
+
     def test_restart_reopens_ledger_and_concurrent_identical_request_is_safe(self):
         path = Path(self.tmp.name) / "restart.sqlite"
         first = open_database(path)
@@ -147,6 +160,72 @@ class RouterTests(unittest.TestCase):
             thread.join()
         self.assertFalse(errors)
         self.assertEqual(results, [expected] * 4)
+
+    def test_claude_delegate_caches_completed_response_and_metadata(self):
+        calls = []
+
+        def runner(args, **kwargs):
+            calls.append((args, kwargs))
+            model_proposal = proposal(provenance={"source": "claude"})
+            return SimpleNamespace(returncode=0, stdout=json.dumps({"structured_output": model_proposal, "model": "fixture", "modelUsage": {"inputTokens": 1}, "total_cost_usd": 0}).encode(), stderr=b"")
+
+        first = delegate_claude(self.db, request(), runner=runner)
+        second = delegate_claude(self.db, request(), runner=lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("retried")))
+        self.assertEqual(first, second)
+        self.assertEqual(len(calls), 1)
+        row = self.db.execute("SELECT status, metadata FROM model_calls").fetchone()
+        self.assertEqual(row["status"], "completed")
+        self.assertIn("total_cost_usd", row["metadata"])
+        self.assertIn("modelUsage", row["metadata"])
+        self.assertIn("--safe-mode", calls[0][0])
+        self.assertIn("--tools", calls[0][0])
+        self.assertEqual(calls[0][1]["input"], json.dumps(request(), sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode())
+
+    def test_claude_delegate_malformed_response_is_recoverable_without_retry(self):
+        calls = []
+
+        def runner(*args, **kwargs):
+            calls.append(1)
+            return SimpleNamespace(returncode=0, stdout=b"not json", stderr=b"")
+
+        first = delegate_claude(self.db, request(), runner=runner)
+        second = delegate_claude(self.db, request(), runner=lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("retried")))
+        self.assertEqual(first, second)
+        self.assertEqual(first["status"], "error")
+        self.assertEqual(first["reason"], "malformed_model_response")
+        self.assertEqual(calls, [1])
+
+    def test_claude_delegate_timeout_is_unknown_and_not_retried(self):
+        calls = []
+
+        def runner(*args, **kwargs):
+            calls.append(1)
+            raise subprocess.TimeoutExpired(args[0], kwargs["timeout"], output=b"partial")
+
+        first = delegate_claude(self.db, request(), runner=runner, timeout=1)
+        second = delegate_claude(self.db, request(), runner=lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("retried")))
+        self.assertEqual(first["reason"], "claude_timeout")
+        self.assertEqual(second["reason"], "claude_timeout")
+        self.assertEqual(calls, [1])
+
+    def test_delegate_does_not_call_for_final_or_stale_request(self):
+        calls = []
+        runner = lambda *args, **kwargs: (calls.append(1) or SimpleNamespace(returncode=0, stdout=json.dumps({"structured_output": proposal(provenance={"source": "claude"})}).encode(), stderr=b""))
+        newer = request(1)
+        self.assertEqual(delegate_claude(self.db, newer, runner=runner)["status"], "answer")
+        with self.assertRaises(ValueError):
+            delegate_claude(self.db, request(), runner=runner)
+        self.assertEqual(calls, [1])
+
+    def test_oversized_model_output_is_bounded_and_not_retried(self):
+        output = b"x" * (1_048_576 + 1)
+        runner = lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout=output, stderr=b"")
+        first = delegate_claude(self.db, request(), runner=runner)
+        second = delegate_claude(self.db, request(), runner=lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("retried")))
+        self.assertEqual(first["reason"], "claude_output_too_large")
+        self.assertEqual(second["reason"], "claude_output_too_large")
+        raw = self.db.execute("SELECT raw_response FROM model_calls").fetchone()[0]
+        self.assertLessEqual(len(raw.encode()), 1_048_576)
 
     def test_ledger_and_wal_sidecars_are_private(self):
         path = Path(self.tmp.name) / "private.sqlite"

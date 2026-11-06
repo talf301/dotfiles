@@ -1,4 +1,5 @@
 import json
+import hashlib
 import os
 import sqlite3
 import stat
@@ -130,6 +131,20 @@ class RouterTests(unittest.TestCase):
         self.db.commit()
         with self.assertRaises(ValueError):
             decide(self.db, request(), proposal())
+
+    def test_offline_proposal_cannot_finalize_running_or_unknown_call(self):
+        for status in ("running", "unknown"):
+            connection = open_database(Path(self.tmp.name) / f"{status}.sqlite")
+            current = request()
+            payload = json.dumps(current, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+            connection.execute(
+                "INSERT INTO model_calls(request_id, revision, payload_hash, payload, status) VALUES (?,?,?,?,?)",
+                ("r1", 0, hashlib.sha256(payload.encode()).hexdigest(), payload, status),
+            )
+            connection.commit()
+            with self.assertRaises(ValueError):
+                decide(connection, current, proposal())
+            self.assertIsNone(connection.execute("SELECT result FROM requests").fetchone())
 
     def test_human_grant_cannot_be_created_by_proposal(self):
         result = decide(self.db, request(), proposal(provenance={"source": "fixture", "grants": [{"actor": "human"}]}))

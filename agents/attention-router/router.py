@@ -140,10 +140,13 @@ def decide(connection: sqlite3.Connection, request: dict[str, Any], proposal: An
         latest_call = connection.execute("SELECT MAX(revision) FROM model_calls WHERE request_id=?", (request_id,)).fetchone()[0]
         latest = max(x for x in (latest_request, latest_call) if x is not None) if latest_request is not None or latest_call is not None else None
         call_identity = connection.execute(
-            "SELECT payload_hash FROM model_calls WHERE request_id=? AND revision=?", (request_id, revision)
+            "SELECT payload_hash, status FROM model_calls WHERE request_id=? AND revision=?", (request_id, revision)
         ).fetchone()
-        if call_identity and call_identity["payload_hash"] != payload_hash:
-            raise _fail("model call payload does not match immutable request revision")
+        if call_identity:
+            if call_identity["payload_hash"] != payload_hash:
+                raise _fail("model call payload does not match immutable request revision")
+            if call_identity["status"] in ("running", "unknown"):
+                raise _fail("model call outcome requires reconciliation before finalization")
         if latest is not None and revision < latest:
             raise _fail("stale revision cannot replace a newer request")
         existing = connection.execute(

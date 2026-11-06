@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import subprocess
+import time
 from collections.abc import Callable
 from typing import Any
 
@@ -89,6 +91,12 @@ def delegate_claude(
     payload_hash = _hash(request)
     request_id, revision = request["request_id"], request["revision"]
     connection.execute("BEGIN IMMEDIATE")
+    latest_request = connection.execute("SELECT MAX(revision) FROM requests WHERE request_id=?", (request_id,)).fetchone()[0]
+    latest_call = connection.execute("SELECT MAX(revision) FROM model_calls WHERE request_id=?", (request_id,)).fetchone()[0]
+    latest = max(x for x in (latest_request, latest_call) if x is not None) if latest_request is not None or latest_call is not None else None
+    if latest is not None and revision < latest:
+        connection.rollback()
+        raise ValueError("stale revision cannot launch a model call")
     existing_request = connection.execute("SELECT payload_hash, result FROM requests WHERE request_id=? AND revision=?", (request_id, revision)).fetchone()
     if existing_request:
         if existing_request["payload_hash"] != payload_hash:
@@ -112,21 +120,9 @@ def delegate_claude(
         except (UnicodeError, ValueError, json.JSONDecodeError, RuntimeError):
             return {"status": "error", "reason": "malformed_model_response", "request_id": request_id, "revision": revision}
         return decide(connection, request, proposal)
-    latest_request = connection.execute("SELECT MAX(revision) FROM requests WHERE request_id=?", (request_id,)).fetchone()[0]
-    latest_call = connection.execute("SELECT MAX(revision) FROM model_calls WHERE request_id=?", (request_id,)).fetchone()[0]
-    latest = max(x for x in (latest_request, latest_call) if x is not None) if latest_request is not None or latest_call is not None else None
-    if latest is not None and revision < latest:
-        connection.rollback()
-        raise ValueError("stale revision cannot launch a model call")
-    if existing_request:
-        if existing_request["payload_hash"] != payload_hash:
-            connection.rollback()
-            raise ValueError("request payload does not match immutable revision")
-        connection.commit()
-        return json.loads(existing_request["result"])
     connection.execute(
-        "INSERT INTO model_calls(request_id, revision, payload_hash, status) VALUES (?,?,?,?)",
-        (request_id, revision, payload_hash, "running"),
+        "INSERT INTO model_calls(request_id, revision, payload_hash, payload, status) VALUES (?,?,?,?,?)",
+        (request_id, revision, payload_hash, _canonical(request), "running"),
     )
     connection.commit()
     run = runner or subprocess.run
@@ -134,13 +130,28 @@ def delegate_claude(
         if runner is None:
             with tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
                 process = subprocess.Popen(command(), stdin=subprocess.PIPE, stdout=stdout_file, stderr=stderr_file)
-                try:
-                    process.communicate(_canonical(request).encode(), timeout=timeout)
-                except subprocess.TimeoutExpired:
+                process.stdin.write(_canonical(request).encode())
+                process.stdin.close()
+                deadline = time.monotonic() + timeout
+                while process.poll() is None:
+                    if os.fstat(stdout_file.fileno()).st_size > MAX_OUTPUT_BYTES:
+                        process.kill()
+                        process.wait()
+                        stdout_file.seek(0)
+                        return _error(connection, request, payload_hash, "completed", "claude_output_too_large", stdout_file.read(MAX_OUTPUT_BYTES).decode("utf-8", "replace"))
+                    if os.fstat(stderr_file.fileno()).st_size > MAX_OUTPUT_BYTES:
+                        process.kill()
+                        process.wait()
+                        stderr_file.seek(0)
+                        return _error(connection, request, payload_hash, "completed", "claude_error_output_too_large", stderr_file.read(MAX_OUTPUT_BYTES).decode("utf-8", "replace"))
+                    if time.monotonic() >= deadline:
+                        process.kill()
+                        process.wait()
+                        stdout_file.seek(0)
+                        return _error(connection, request, payload_hash, "unknown", "claude_timeout", stdout_file.read(MAX_OUTPUT_BYTES).decode("utf-8", "replace"))
+                    time.sleep(0.02)
+                if process.returncode is None:
                     process.kill()
-                    process.communicate()
-                    stdout_file.seek(0)
-                    return _error(connection, request, payload_hash, "unknown", "claude_timeout", stdout_file.read(MAX_OUTPUT_BYTES).decode("utf-8", "replace"))
                 stdout_file.seek(0)
                 stdout = stdout_file.read(MAX_OUTPUT_BYTES + 1)
                 stderr_file.seek(0)

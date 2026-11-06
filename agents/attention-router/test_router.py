@@ -5,6 +5,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+from unittest.mock import patch
 import unittest
 from types import SimpleNamespace
 from pathlib import Path
@@ -226,6 +227,33 @@ class RouterTests(unittest.TestCase):
         self.assertEqual(second["reason"], "claude_output_too_large")
         raw = self.db.execute("SELECT raw_response FROM model_calls").fetchone()[0]
         self.assertLessEqual(len(raw.encode()), 1_048_576)
+
+    def test_real_child_output_cap_kills_only_that_child(self):
+        child = [sys.executable, "-c", "import sys,time; sys.stdout.write('x' * 1100000); sys.stdout.flush(); time.sleep(5)"]
+        with patch("delegate.command", return_value=child):
+            result = delegate_claude(self.db, request(), timeout=2)
+        self.assertEqual(result["reason"], "claude_output_too_large")
+        raw = self.db.execute("SELECT raw_response FROM model_calls").fetchone()[0]
+        self.assertLessEqual(len(raw.encode()), 1_048_576)
+
+    def test_reservation_payload_exists_before_timeout(self):
+        observed = []
+
+        def runner(*args, **kwargs):
+            observed.append(self.db.execute("SELECT payload FROM model_calls").fetchone()[0])
+            raise subprocess.TimeoutExpired(args[0], kwargs["timeout"])
+
+        delegate_claude(self.db, request(), runner=runner, timeout=1)
+        self.assertEqual(json.loads(observed[0]), request())
+
+    def test_stale_delegate_replay_never_calls_runner(self):
+        calls = []
+        runner = lambda *args, **kwargs: (calls.append(1) or SimpleNamespace(returncode=0, stdout=json.dumps({"structured_output": proposal(provenance={"source": "claude"})}).encode(), stderr=b""))
+        delegate_claude(self.db, request(), runner=runner)
+        delegate_claude(self.db, request(1), runner=runner)
+        with self.assertRaises(ValueError):
+            delegate_claude(self.db, request(), runner=runner)
+        self.assertEqual(calls, [1, 1])
 
     def test_ledger_and_wal_sidecars_are_private(self):
         path = Path(self.tmp.name) / "private.sqlite"

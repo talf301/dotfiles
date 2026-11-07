@@ -6,7 +6,7 @@ description: Execute a scoped task with native tools, Linear, CASS, Plannotator,
 # Work
 
 1. Read the request and repository-local instructions. State the deliverable and the completion condition.
-2. Search CASS before repeating relevant work. Inspect current source and record evidence.
+2. Search CASS before repeating relevant work. Inspect current source and record evidence. Filter Codex history with `cass search --agent codex`; `cass sessions` has no `--agent` flag. Omit `--no-maintenance` for normal searches so lexical maintenance can run.
 3. Check Linear when the work needs durable scope, decisions, or status. Keep the task record current.
 4. Make routine reversible choices within the objective and existing grants. If the installed attention router is available, use it before asking the person when a bounded delegated answer may be enough.
 5. Use the current conversation for questions and handoffs; do not use Plannotator Inbox. Use Plannotator for reviewing plans, diffs, or artifacts when useful.

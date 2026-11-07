@@ -26,6 +26,17 @@ For substantive work, complete this loop on the latest revision and requested ar
 
 Completion requires passing relevant checks, resolved blocking findings, and an independent verdict on the latest substantive revision and final artifacts. Explain disputed findings with evidence. New substantive changes after acceptance need review of the changed range. The review is read-only; the implementer owns fixes. Do not merge, auto-merge, or approve Tal's pull request.
 
+## Linear closeout
+
+Before marking a ticket Done, leave one concise Markdown completion comment that stands on its own:
+
+- **Summary:** one or two sentences describing the outcome and why it matters.
+- **Delivered:** link the PR, commits, results, or artifacts; distinguish local work from pushed, merged, or deployed work.
+- **Validation:** summarize the checks and independent review actually performed, including material limits.
+- **Remaining:** include caveats or follow-up only when something remains; keep the ticket open if required work is incomplete.
+
+Update an existing completion comment when revising the same deliverable. Keep raw logs and machine inventories out of the writeup.
+
 ## Router request
 
 When asking the attention router, submit:

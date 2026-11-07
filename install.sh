@@ -32,13 +32,18 @@ for tool in cc_usage.py linear-description linear-upload; do
   link "bin/$tool" "$HOME/.local/bin/$tool"
 done
 
-# --- shared instructions and three personal core skills ---
+# --- shared instructions and personal work/review skills ---
 link "agents/AGENTS.md" "$HOME/AGENTS.md"
 link "$HOME/AGENTS.md" "$HOME/.claude/CLAUDE.md"
 link "$HOME/AGENTS.md" "$HOME/.codex/AGENTS.md"
-for skill in work review plannotator; do
+for skill in work review; do
   link "agents/skills/$skill" "$HOME/.agents/skills/$skill"
   link "agents/skills/$skill" "$HOME/.claude/skills/$skill"
+done
+
+# Use the vendor-maintained Plannotator reference instead of copying it here.
+for registry in .agents .claude; do
+  link "$HOME/.claude/plugins/marketplaces/plannotator/apps/skills/core/plannotator" "$HOME/$registry/skills/plannotator"
 done
 
 # --- macOS UI configs (these tools don't read nikud's XDG_CONFIG_HOME) ---

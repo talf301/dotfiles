@@ -8,7 +8,7 @@ Results have four dispositions:
 
 - `answer`: a supervisor-authored choice from the supplied options, with cited evidence. Native permissions still apply.
 - `need_evidence`: the caller must retrieve missing context and submit a new revision.
-- `needs_human`: the proposal identifies a remaining human decision. The caller uses its native Inbox tool.
+- `needs_human`: the proposal identifies a remaining human decision. The caller asks the person in the current conversation.
 - `error`: malformed input/output, a stale revision, or a technical failure. The CLI exits nonzero; this is not a human question.
 
 ## Use
@@ -38,4 +38,4 @@ The same request ID and revision is immutable. A matching completed request retu
 
 Before a model call, the ledger commits its full request and a reservation. Completed raw output can be recovered without another call. Timeout, interruption and nonzero exits retain evidence and block automatic retry. A recorded failure never becomes approval.
 
-This adapter does not connect to Linear or Plannotator. The native caller records decisions in Linear and sends genuine human needs through the Inbox with a stable request/revision idempotency key. The work skill defines reply correlation and retrieval. No generic background wake or terminal input path is installed.
+This adapter does not connect to Linear or Plannotator. The native caller records decisions in Linear and asks genuine human questions in the current conversation, correlated to the task and request revision. The work skill defines reply correlation and retrieval. No generic background wake or terminal input path is installed.

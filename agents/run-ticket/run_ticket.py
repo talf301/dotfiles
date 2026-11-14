@@ -44,10 +44,8 @@ Your Codex thread id is {thread}.
 3. Launch any experiment only with `experiment-run run <spec> -- <command>`, passing
    `--provider codex --thread {thread}` so the monitor wakes this thread. Never resubmit a
    launch whose outcome is uncertain; reconcile it first.
-4. While a launched run is in progress, do not poll or sleep. Mark the goal blocked and end
-   your turn with a final line `WAITING: <run registration id>`. The experiment-run monitor
-   queues a message to this thread when the run's state changes. This replaces the
-   "Own the wait" section of the experiment-execution skill: do not run wait_experiment.py.
+4. While a launched run is in progress, wait as the experiment-execution skill describes:
+   mark the goal blocked and end your turn with `WAITING: <run registration id>`.
 5. If you need a decision only Tal can make, post one comment on {ticket} starting
    "Question for Tal:" with the question, the options, and your recommendation. Then mark the
    goal blocked and end your turn with a final line `NEEDS INPUT: <one-line question>`.

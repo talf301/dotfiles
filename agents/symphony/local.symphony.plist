@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Symphony service. Tal loads it by hand (see README.md); agents never load it. -->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>local.symphony</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/opt/homebrew/bin/uv</string>
+		<string>run</string>
+		<string>--project</string>
+		<string>/Users/tal/dotfiles/agents/symphony</string>
+		<string>symphony</string>
+		<string>run</string>
+		<string>--workflow</string>
+		<string>/Users/tal/dotfiles/agents/symphony/WORKFLOW.md</string>
+	</array>
+	<key>WorkingDirectory</key>
+	<string>/Users/tal/dotfiles/agents/symphony</string>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>/Users/tal/nikud/xdg_config_home/nvm/versions/node/v24.17.0/bin:/Users/tal/.local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+		<key>SYMPHONY_STATE_DIR</key>
+		<string>/Users/tal/.local/state/symphony</string>
+	</dict>
+	<key>KeepAlive</key>
+	<true/>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>ThrottleInterval</key>
+	<integer>30</integer>
+	<key>ProcessType</key>
+	<string>Background</string>
+	<key>StandardOutPath</key>
+	<string>/Users/tal/.local/state/symphony/launchd.out</string>
+	<key>StandardErrorPath</key>
+	<string>/Users/tal/.local/state/symphony/launchd.err</string>
+</dict>
+</plist>

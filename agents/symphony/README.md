@@ -65,7 +65,7 @@ SIGINT/SIGTERM interrupt running turns (a restart resumes the same threads) and 
 | `symphony ls` | Ticket, Linear state, claim (running, parking, retry n in Xs), thread id, tokens, last event; from `status.json`, flagged STALE if old or the service pid is gone. |
 | `symphony open TICKET` | Opens (or reuses) the ticket's tab in the hidden Rex session `symphony`, running `codex resume <thread>`, and shows it in the connected Rex app. |
 | `symphony logs TICKET [-n N]` | The ticket's JSONL log lines (default last 50; `-n 0` all). |
-| `symphony login [--port N]` | One-time browser OAuth to Linear's MCP server; token to Keychain `symphony-linear-mcp`. Starts from an empty record each time. |
+| `symphony login [--port N]` | One-time browser OAuth to Linear's MCP server; token to Keychain `symphony-linear-mcp`. Starts from an empty record each time. With a browser on another machine (for example over Rex), the 127.0.0.1 page it lands on won't load: paste that page's address at the prompt. |
 | `symphony bridge-event --issue TAL-N --json -` | Used by the experiment-run bridge. Reads `{"run", "status"}` and/or `{"event_id", "event"}` on stdin; creates or edits the run's status comment and posts the event comment unless one with that event ID exists. Prints a JSON result. Exit 0 written or already there, 2 bad input, 3 not logged in, 1 other failure (retry is safe). |
 
 State lives in `~/.local/state/symphony/` (`$SYMPHONY_STATE_DIR` overrides):

@@ -437,6 +437,22 @@ class CallbackServer:
         self._thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self._thread.start()
 
+    def submit(self, pasted: str) -> bool:
+        """Accept the redirect address pasted by hand, for a browser on another machine.
+        Returns False (and changes nothing) if the text holds no authorization code."""
+        text = pasted.strip().strip("'\"")
+        parsed = urllib.parse.urlparse(text)
+        query = parsed.query if parsed.scheme else text.lstrip("?")
+        if parsed.scheme and parsed.path != CALLBACK_PATH:
+            return False
+        q = {k: v[0] for k, v in urllib.parse.parse_qs(query).items() if v}
+        if "code" not in q and "error" not in q:
+            return False
+        if not self._done.is_set():
+            self.result = q
+            self._done.set()
+        return True
+
     def wait(self, timeout_s: float) -> dict:
         if not self._done.wait(timeout_s):
             raise LoginRequired("timed out waiting for the browser authorization")
@@ -450,18 +466,38 @@ class CallbackServer:
 def login(*, url: str = MCP_URL, keychain: Keychain | None = None, port: int = REDIRECT_PORT,
           open_browser: Callable[[str], Any] = webbrowser.open,
           session_factory: Callable[..., McpSession] = McpSession,
-          timeout_s: float = LOGIN_TIMEOUT_S, out: Callable[[str], None] = print) -> list[str]:
+          timeout_s: float = LOGIN_TIMEOUT_S, out: Callable[[str], None] = print,
+          paste_input: Callable[[], str] | None = None) -> list[str]:
     """Register Symphony as an OAuth client, authorize in the browser, store the tokens in the
-    Keychain, then list the server's tools. Starts from an empty record each time."""
+    Keychain, then list the server's tools. Starts from an empty record each time.
+
+    With `paste_input` (for example `input` on a terminal), the redirect address can also be
+    pasted back by hand, for a browser on another machine that cannot reach 127.0.0.1 here.
+    Whichever arrives first, the local redirect or the paste, completes the login."""
     keychain = keychain or Keychain()
     keychain.delete()
     storage = KeychainTokenStorage(keychain)
     callback = CallbackServer(port)
 
+    def read_pastes() -> None:
+        while True:
+            try:
+                line = paste_input()
+            except (EOFError, OSError):
+                return
+            if callback.submit(line):
+                return
+            out("That doesn't contain an authorization code. Paste the whole address that "
+                f"starts with http://127.0.0.1:{callback.port}{CALLBACK_PATH}?code=")
+
     async def redirect(auth_url: str) -> None:
         out("Opening the browser to authorize Symphony in Linear. If it does not open, visit:")
         out(auth_url)
         open_browser(auth_url)
+        if paste_input is not None:
+            out("If your browser is on another machine, the page it lands on after you approve "
+                "won't load. Copy that page's whole address and paste it here, then press Enter:")
+            threading.Thread(target=read_pastes, daemon=True).start()
 
     async def wait_callback() -> AuthorizationCodeResult:
         q = await asyncio.to_thread(callback.wait, timeout_s)

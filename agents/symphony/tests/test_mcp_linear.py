@@ -9,6 +9,7 @@ import asyncio
 import base64
 import hashlib
 import json
+import queue
 import socket
 import threading
 import time
@@ -203,6 +204,39 @@ def test_login_registers_public_client_with_pkce_and_stores_tokens():
     assert rec["metadata"]["token_endpoint"] == f"{BASE}/token"
     assert rec["expires_at"] > time.time() + 3000
     assert not any("rt-1" in line or "at-1" in line for line in out)
+
+
+def test_login_completes_from_pasted_redirect_when_browser_is_remote():
+    oauth, kc = FakeOAuth(), FakeKeychain()
+    seen = {}
+    pasted = queue.Queue()
+
+    def remote_browser(auth_url):  # approves, but the 127.0.0.1 redirect never reaches us
+        q = dict(urllib.parse.parse_qsl(urllib.parse.urlparse(auth_url).query))
+        oauth.authorize = q
+        seen["redirect"] = f"{q['redirect_uri']}?code=the-code&state={q['state']}"
+        pasted.put("not an address")  # rejected, prompts again
+        pasted.put(f"  '{seen['redirect']}'  ")  # pasted with quotes and spaces
+
+    out = []
+    tools = mcp_linear.login(url=MCP, keychain=kc, port=0, open_browser=remote_browser,
+                             session_factory=MockSession(oauth), timeout_s=10,
+                             out=out.append, paste_input=lambda: pasted.get(timeout=5))
+    assert tools == ["get_issue", "list_issues", "save_comment"]
+    assert kc.record["refresh_token"] == "rt-1"
+    assert any("paste it here" in line for line in out)
+    assert any("doesn't contain an authorization code" in line for line in out)
+
+
+def test_callback_submit_ignores_text_without_a_code():
+    cb = mcp_linear.CallbackServer(0)
+    try:
+        assert not cb.submit("hello")
+        assert not cb.submit("https://example.com/other?code=x")
+        assert cb.submit(f"http://127.0.0.1:{cb.port}/callback?code=c1&state=s1")
+        assert cb.wait(1) == {"code": "c1", "state": "s1"}
+    finally:
+        cb.close()
 
 
 def stored_record(oauth: FakeOAuth, *, expired: bool) -> dict:

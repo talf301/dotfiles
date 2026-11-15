@@ -315,7 +315,12 @@ def cmd_login(*, port: int, login=None) -> int:
     from . import mcp_linear
 
     try:
-        tools = (login or mcp_linear.login)(port=port)
+        kwargs = {"port": port}
+        if login is None:  # real run: print at once and accept a pasted redirect on a terminal
+            kwargs["out"] = lambda s: print(s, flush=True)
+            if sys.stdin.isatty():
+                kwargs["paste_input"] = input
+        tools = (login or mcp_linear.login)(**kwargs)
     except SymphonyError as e:
         _err(f"login failed: {e}")
         return 1

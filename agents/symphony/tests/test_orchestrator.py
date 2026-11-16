@@ -749,3 +749,70 @@ def test_woken_ticket_over_budget_escalates_once(make_orch, tracker, clock, tmp_
             e.worker.join(5)
         orch.drain_inbox(0)
     assert len(wt.called("escalate")) == 1
+
+
+@pytest.mark.parametrize("startup", [False, True])
+def test_archive_posts_destination_once(make_orch, tracker, startup):
+    from pathlib import Path
+    import yaml
+    from symphony.workflow import load_workflow
+
+    hook = load_workflow(Path(__file__).parents[1] / "WORKFLOW.md").config["hooks"]["before_remove"]
+    orch = make_orch(workflow(yaml.safe_dump({"hooks": {"before_remove": hook}})))
+    issue = make_issue("TAL-1", state="Done")
+    tracker.set_issue(issue)
+    ws = orch.workspaces.ensure(issue).path
+    (ws / "report.md").write_text("result")
+    if startup:
+        orch.startup()
+    else:
+        orch._remove_workspace(issue)
+    archives = list((ws.parent / ".archive").iterdir())
+    assert len(archives) == 1
+    assert (archives[0] / "report.md").read_text() == "result"
+    assert not ws.exists()
+    assert tracker.called("post_note") == [
+        (issue.id, f"Workspace archived to `{archives[0]}`")]
+    orch._remove_workspace(issue)
+    orch.startup()
+    assert len(tracker.called("post_note")) == 1
+
+
+@pytest.mark.parametrize("kind", ["empty", "missing", "git"])
+def test_non_archived_workspace_posts_nothing(make_orch, tracker, tmp_path, kind):
+    from pathlib import Path
+    import subprocess
+    import yaml
+    from symphony.workflow import load_workflow
+
+    hook = load_workflow(Path(__file__).parents[1] / "WORKFLOW.md").config["hooks"]["before_remove"]
+    orch = make_orch(workflow(yaml.safe_dump({"hooks": {"before_remove": hook}})))
+    issue = make_issue("TAL-1", state="Done")
+    ws = orch.workspaces.path_for(issue.identifier)
+    if kind == "git":
+        repo = tmp_path / "repo"
+        def git(*args):
+            subprocess.run(["git", *args], check=True, capture_output=True)
+        git("init", str(repo))
+        git("-C", str(repo), "-c", "user.name=Test", "-c", "user.email=test@example.com",
+            "commit", "--allow-empty", "-m", "init")
+        git("-C", str(repo), "worktree", "add", "-b", "u/tfriedman/test", str(ws))
+    elif kind == "empty":
+        orch.workspaces.ensure(issue)
+    orch._remove_workspace(issue)
+    assert not ws.exists()
+    assert not (ws.parent / ".archive").exists()
+    assert tracker.called("post_note") == []
+
+
+def test_archive_note_failure_does_not_report_workspace_kept(make_orch, tracker, notifier):
+    hook = 'echo "SYMPHONY_WORKSPACE_ARCHIVED=/archive/report"'
+    orch = make_orch(workflow(f"hooks:\n  before_remove: '{hook}'\n"))
+    issue = make_issue("TAL-1", state="Done")
+    ws = orch.workspaces.ensure(issue).path
+    tracker.fail_next("post_note")
+    orch._remove_workspace(issue)
+    assert not ws.exists()
+    assert notifier.sent == []
+    orch._remove_workspace(issue)
+    assert len(tracker.called("post_note")) == 1

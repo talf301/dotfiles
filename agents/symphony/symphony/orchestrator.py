@@ -213,7 +213,7 @@ class Orchestrator:
                 log("tracker_build_failed", "error", error=str(e), category=e.category)
         strip = self.tracker.secret_environment_names() if self.tracker else []
         self.workspaces = WorkspaceManager(cfg.workspace_root, cfg.hooks, repos=cfg.ext.repos,
-                                           strip_env=strip)
+                                           strip_env=strip, on_archive=self._workspace_archived)
 
     def reload(self) -> bool:
         """Apply a changed WORKFLOW.md. Invalid files keep the last good config."""
@@ -612,6 +612,15 @@ class Orchestrator:
             self.on_retry_due(issue_id)
 
     # -- helpers -----------------------------------------------------------------------------
+
+    def _workspace_archived(self, issue: Issue, destination: str) -> None:
+        try:
+            self.tracker.post_note(issue, f"Workspace archived to `{destination}`")
+        except SymphonyError as e:
+            # The move has already succeeded; do not claim the workspace was kept or
+            # retry an uncertain comment submission. Preserve the destination in logs.
+            log("workspace_archive_note_failed", "warning", issue_id=issue.id,
+                issue_identifier=issue.identifier, archive=destination, error=str(e))
 
     def _remove_workspace(self, issue: Issue) -> None:
         try:

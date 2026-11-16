@@ -49,7 +49,7 @@ hooks:
   # Worktree workspaces are removed with git, never --force: a dirty worktree makes this fail,
   # and Symphony then keeps the workspace and notifies (deviation 2). A plain workspace with
   # any content (reports, results, nested clones) is moved to <root>/.archive instead of
-  # being deleted.
+  # being deleted. A successful move reports its destination for a signed ticket comment.
   before_remove: |
     set -euo pipefail
     if [ -f .git ]; then
@@ -58,7 +58,9 @@ hooks:
     elif [ -n "$(ls -A)" ]; then
       archive="$(dirname "$PWD")/.archive"
       mkdir -p "$archive"
-      mv "$PWD" "$archive/$(basename "$PWD")-$(date +%Y%m%dT%H%M%S)"
+      destination="$archive/$(basename "$PWD")-$(date +%Y%m%dT%H%M%S)"
+      mv "$PWD" "$destination"
+      printf 'SYMPHONY_WORKSPACE_ARCHIVED=%s\n' "$destination"
     fi
 
 agent:

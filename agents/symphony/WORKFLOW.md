@@ -73,6 +73,11 @@ codex:
   approval_policy: on-request
   approvals_reviewer: auto_review
   thread_sandbox: workspace-write
+  # Per-turn sandbox: workspace writes only, but with network. Without network, `claude -p`
+  # (independent review) fails as "Not logged in", and experiment launches can't reach Flyte/S3.
+  turn_sandbox_policy:
+    type: workspaceWrite
+    networkAccess: true
   turn_timeout_ms: 3600000
   read_timeout_ms: 5000
   stall_timeout_ms: 300000
@@ -104,6 +109,9 @@ exactly:
 🤖 agent (Codex, {{ issue.identifier }})
 
 A comment without that line is read as Tal's and wakes this ticket.
+
+Post a new comment for each milestone, question and the final result. Don't edit earlier
+comments to add results: edits are easy to miss, especially on Tal's phone.
 
 ## Steps
 

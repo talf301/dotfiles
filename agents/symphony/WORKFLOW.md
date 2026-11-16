@@ -153,6 +153,9 @@ comments to add results: edits are easy to miss, especially on Tal's phone.
 10. Finishing:
     - Code changes end at In Review, never Done: post a final comment (what changed,
       branch, checks, review result, open questions) and move the ticket to In Review.
+      A code change means a change to an existing repository. Scripts, configs and
+      contracts written in this workspace only to run an experiment or analysis are not
+      code changes, even if you commit them locally.
     - Other work may move to Done only when the definition of done is met, the evidence is in
       a comment (what was done, paths, run ids, metrics, open questions), and no runs are in
       flight.

@@ -152,8 +152,9 @@ comments to add results: edits are easy to miss, especially on Tal's phone.
 8. Comment at milestones: plan, launch or PR, result.
 9. Substantive changes and analyses get an independent Claude review before Done or In
    Review: follow the review skill and run Claude headless and read-only,
-   `claude -p --permission-mode plan`, with the fixed revision, the objective and the
-   evidence. Post the review summary as a comment that names the reviewer (Claude).
+   `claude -p --model claude-opus-5-5 --permission-mode plan`, with the fixed revision, the
+   objective and the evidence. The reviewer must be Opus; do not change or drop `--model`.
+   Post the review summary as a comment that names the reviewer (Claude Opus 5.5).
 10. Finishing: move the ticket to Done when the definition of done is met, the evidence is
     in a final comment, and no runs are in flight. Done means you finished the ticket's goals;
     Tal reviews later and reopens the ticket if needed. The final comment lists what was done,

@@ -336,8 +336,9 @@ def test_real_workflow_loads_validates_and_renders(monkeypatch):
     issue = make_issue("TAL-42", url="https://linear.app/x/TAL-42", labels=("agent", "repo:x"))
     text = render_prompt(defn.prompt_template, issue, None, turn_number=1, max_turns=20)
     for part in ("🤖 agent (Codex, TAL-42)", "--provider linear --issue TAL-42",
-                 "claude -p --permission-mode plan", "In Review", "`waiting` label",
-                 "AWS or Baseten", "Never merge, approve, or push to main",
+                 "claude -p --model claude-opus-5-5 --permission-mode plan", "In Review",
+                 "`waiting` label",
+                 "AWS or Baseten", "Never merge, approve, force-push, or push",
                  "Do not publish claude.ai artifacts", "https://linear.app/x/TAL-42"):
         assert part in text
 

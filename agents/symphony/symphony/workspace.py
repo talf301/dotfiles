@@ -9,7 +9,7 @@ import re
 import shutil
 import subprocess
 import tempfile
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime
 from pathlib import Path
 
@@ -20,6 +20,7 @@ from .models import Issue, ThreadRecord, Workspace
 
 STATE_DIRNAME = ".symphony"
 HOOK_OUTPUT_LOG_LIMIT = 2048
+ARCHIVE_OUTPUT_PREFIX = "SYMPHONY_WORKSPACE_ARCHIVED="
 HOOK_NAMES = ("after_create", "before_run", "after_run", "before_remove")
 
 _UNSAFE = re.compile(r"[^A-Za-z0-9._-]")
@@ -44,12 +45,14 @@ def _bare_issue(identifier: str) -> Issue:
 
 class WorkspaceManager:
     def __init__(self, root: Path, hooks: HooksConfig, *, repos: Mapping[str, Path],
-                 strip_env: Sequence[str], run=subprocess.run):
+                 strip_env: Sequence[str], run=subprocess.run,
+                 on_archive: Callable[[Issue, str], None] | None = None):
         self.root = root
         self.hooks = hooks
         self.repos = repos
         self.strip_env = tuple(strip_env)
         self._run = run
+        self.on_archive = on_archive
         self.threads = ThreadStore(root)
 
     def _root(self) -> Path:
@@ -94,11 +97,11 @@ class WorkspaceManager:
                 raise
         return Workspace(path=path, workspace_key=key, created_now=created_now)
 
-    def run_hook(self, name: str, issue: Issue, workspace: Path) -> None:
-        """`bash -lc <script>` in the workspace with hook_env(); raises HookError."""
+    def run_hook(self, name: str, issue: Issue, workspace: Path) -> str:
+        """Run with hook_env(); return output on success, otherwise raise HookError."""
         script = getattr(self.hooks, name)
         if not script:
-            return
+            return ""
         timeout_s = self.hooks.timeout_ms / 1000
         fields = dict(hook=name, issue_id=issue.id, issue_identifier=issue.identifier)
         log("hook_started", **fields)
@@ -114,7 +117,8 @@ class WorkspaceManager:
                 log("hook_failed", level="error", error=str(e), **fields)
                 raise HookError("hook_failed", f"{name}: {e}", hook=name) from e
             out.seek(0)
-            output = _truncate(out.read().decode("utf-8", errors="replace"))
+            raw_output = out.read().decode("utf-8", errors="replace")
+            output = _truncate(raw_output)
         if code is None:
             log("hook_timeout", level="error", timeout_ms=self.hooks.timeout_ms,
                 output=output, **fields)
@@ -124,6 +128,7 @@ class WorkspaceManager:
             log("hook_failed", level="error", exit_code=code, output=output, **fields)
             raise HookError("hook_failed", f"{name} exited {code}", hook=name, exit_code=code)
         log("hook_completed", output=output, **fields)
+        return raw_output
 
     def run_hook_best_effort(self, name: str, issue: Issue, workspace: Path) -> bool:
         """Run a hook; log and swallow failure. Returns True on success or no hook."""
@@ -143,7 +148,7 @@ class WorkspaceManager:
         path = self.path_for(issue.identifier)
         if path.is_dir():
             try:
-                self.run_hook("before_remove", issue, path)
+                output = self.run_hook("before_remove", issue, path)
             except HookError as e:
                 log("workspace_remove_skipped", level="warning", issue_id=issue.id,
                     issue_identifier=issue.identifier, workspace=str(path), error=str(e))
@@ -152,6 +157,13 @@ class WorkspaceManager:
                 shutil.rmtree(path)
             log("workspace_removed", issue_id=issue.id, issue_identifier=issue.identifier,
                 workspace=str(path))
+            if self.on_archive:
+                for line in output.splitlines():
+                    if line.startswith(ARCHIVE_OUTPUT_PREFIX):
+                        destination = line[len(ARCHIVE_OUTPUT_PREFIX):]
+                        if destination:
+                            self.on_archive(issue, destination)
+                            break
         elif path.exists() or path.is_symlink():
             path.unlink()
         self.threads.delete(issue.identifier)

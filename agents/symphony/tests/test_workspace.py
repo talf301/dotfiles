@@ -374,3 +374,18 @@ def test_thread_store_dir_never_collides_with_workspace(root):
     m = manager(root)
     w = m.ensure(make_issue(".symphony"))
     assert w.path != root.resolve() / ".symphony"
+
+
+@pytest.mark.parametrize("exit_code", [0, 1])
+def test_archive_marker_requires_success_and_survives_log_truncation(root, exit_code):
+    archived = []
+    hook = ("echo SYMPHONY_WORKSPACE_ARCHIVED=/archive/report; "
+            "echo SYMPHONY_WORKSPACE_ARCHIVED=/archive/duplicate; "
+            "head -c 10000 /dev/zero | tr '\\0' a; "
+            f"exit {exit_code}")
+    m = WorkspaceManager(root, HooksConfig(before_remove=hook), repos={}, strip_env=(),
+                         on_archive=lambda issue, path: archived.append((issue.id, path)))
+    issue = make_issue("TAL-1")
+    m.ensure(issue)
+    assert m.remove(issue) is (exit_code == 0)
+    assert archived == ([(issue.id, "/archive/report")] if exit_code == 0 else [])

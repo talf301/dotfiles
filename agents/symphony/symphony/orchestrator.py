@@ -615,6 +615,8 @@ class Orchestrator:
 
     def _workspace_archived(self, issue: Issue, destination: str) -> None:
         try:
+            if self.tracker is None:
+                raise SymphonyError("tracker_unavailable", "cannot post archive destination")
             self.tracker.post_note(issue, f"Workspace archived to `{destination}`")
         except SymphonyError as e:
             # The move has already succeeded; do not claim the workspace was kept or

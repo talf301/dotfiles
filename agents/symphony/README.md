@@ -141,7 +141,11 @@ notify him.
    logged (`workspace_remove_skipped`) and Tal is notified. `before_remove` runs
    `git worktree remove` without `--force`, so a dirty worktree is never deleted. A plain
    (non-worktree) workspace with any content is moved to `<workspace.root>/.archive/` instead.
-3. **Orchestrator writes to Linear (§11.5):** escalations (comment + In Review) and, when a
+   The hook emits `SYMPHONY_WORKSPACE_ARCHIVED=<path>` after the move; Symphony posts the
+   destination as a signed ticket comment. Failed submissions are logged with the path,
+   without automatic retries.
+3. **Orchestrator writes to Linear (§11.5):** archive destination comments, escalations
+   (comment + In Review) and, when a
    woken ticket is dispatched, removing its `waiting` label or moving it from In Review to In
    Progress. All other writes come from the agent or from the bridge (through
    `symphony bridge-event`).

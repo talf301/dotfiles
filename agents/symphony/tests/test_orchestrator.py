@@ -816,3 +816,19 @@ def test_archive_note_failure_does_not_report_workspace_kept(make_orch, tracker,
     assert notifier.sent == []
     orch._remove_workspace(issue)
     assert len(tracker.called("post_note")) == 1
+
+
+def test_archive_without_tracker_logs_path_and_clears_thread(make_orch, monkeypatch):
+    records = []
+    monkeypatch.setattr("symphony.orchestrator.log", lambda *a, **kw: records.append((a, kw)))
+    hook = 'echo "SYMPHONY_WORKSPACE_ARCHIVED=/archive/report"'
+    orch = make_orch(workflow(f"hooks:\n  before_remove: '{hook}'\n"))
+    issue = make_issue("TAL-1", state="Done")
+    ws = orch.workspaces.ensure(issue).path
+    orch.threads.write(issue.identifier, ThreadRecord("thread", EPOCH))
+    orch.tracker = None  # tracker rebuild failed while a worker was draining
+    orch._remove_workspace(issue)
+    assert not ws.exists()
+    assert orch.threads.read(issue.identifier) is None
+    failures = [kw for a, kw in records if a[0] == "workspace_archive_note_failed"]
+    assert len(failures) == 1 and failures[0]["archive"] == "/archive/report"

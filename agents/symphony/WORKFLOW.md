@@ -30,7 +30,9 @@ workspace:
   # repo label the workspace is a plain directory. Fill in before tagging code tickets, e.g.
   #   dotfiles: ~/dotfiles
   #   precog: ~/code/precog
-  repos: {}
+  repos:
+    # Symphony itself, until it merges to dotfiles master.
+    symphony: ~/.worktrees/dotfiles-symphony
 
 hooks:
   timeout_ms: 120000
@@ -75,9 +77,11 @@ codex:
   thread_sandbox: workspace-write
   # Per-turn sandbox: workspace writes only, but with network. Without network, `claude -p`
   # (independent review) fails as "Not logged in", and experiment launches can't reach Flyte/S3.
+  # experiment-run keeps its registrations and launch intents under ~/.local/state/experiment-status.
   turn_sandbox_policy:
     type: workspaceWrite
     networkAccess: true
+    writableRoots: [/Users/tal/.local/state/experiment-status]
   turn_timeout_ms: 3600000
   read_timeout_ms: 5000
   stall_timeout_ms: 300000

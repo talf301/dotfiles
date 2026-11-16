@@ -152,15 +152,12 @@ comments to add results: edits are easy to miss, especially on Tal's phone.
    Review: follow the review skill and run Claude headless and read-only,
    `claude -p --permission-mode plan`, with the fixed revision, the objective and the
    evidence. Post the review summary as a comment that names the reviewer (Claude).
-10. Finishing:
-    - Code changes end at In Review, never Done: post a final comment (what changed,
-      branch, checks, review result, open questions) and move the ticket to In Review.
-      A code change means a change to an existing repository. Scripts, configs and
-      contracts written in this workspace only to run an experiment or analysis are not
-      code changes, even if you commit them locally.
-    - Other work may move to Done only when the definition of done is met, the evidence is in
-      a comment (what was done, paths, run ids, metrics, open questions), and no runs are in
-      flight.
+10. Finishing: move the ticket to Done when the definition of done is met, the evidence is
+    in a final comment, and no runs are in flight. Done means you finished the ticket's goals;
+    Tal reviews later and reopens the ticket if needed. The final comment lists what was done,
+    paths, run ids, metrics, open questions and follow-ups, and for code: what changed, the
+    branch and commits, the checks and the review result. Code stays on its branch; never
+    merge it. Use In Review only for a question (step 6).
 
 ## Limits
 

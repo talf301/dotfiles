@@ -82,7 +82,7 @@ def test_tick_only_refreshes_ticket_directories(make_orch, tracker, tmp_path):
     orch = make_orch()
     root = orch.workspaces.root
     root.mkdir(parents=True, exist_ok=True)
-    for name in (".symphony", ".archive", "notes", "TAL-99"):
+    for name in (".symphony", ".archive", "notes", "TAL-99", "ENG-99"):
         (root / name).mkdir()
     (root / "TAL-98").write_text("file")
     (root / "TAL-97").symlink_to(tmp_path, target_is_directory=True)
@@ -113,8 +113,14 @@ def test_tick_cleanup_hook_failure_keeps_workspace_and_notifies(make_orch, track
     tracker.set_issue(issue)
     ws = orch.workspaces.ensure(issue).path
     orch.tick()
+    orch.tick()
     assert ws.is_dir()
     assert [title for title, _ in notifier.sent] == ["TAL-1: workspace kept"]
+    tracker.set_state(issue.id, "In Review", dispatchable=False)
+    orch.tick()
+    tracker.set_state(issue.id, "Done")
+    orch.tick()
+    assert len(notifier.sent) == 2  # a later terminal transition deserves a new notice
 
 
 @pytest.mark.parametrize("state", ["Todo", "Done", "Backlog"])
@@ -267,7 +273,9 @@ def test_startup_cleanup_fetch_failure_continues(make_orch, tracker):
 def test_startup_cleanup_skipped_removal_notifies(make_orch, tracker, notifier, tmp_path):
     (tmp_path / "workspaces" / "TAL-1").mkdir(parents=True)
     tracker.set_issue(make_issue("TAL-1", state="Done"))
-    make_orch(workflow("hooks:\n  before_remove: exit 1\n"))
+    orch = make_orch(workflow("hooks:\n  before_remove: exit 1\n"))
+    orch.tick()
+    assert len(notifier.sent) == 1
     assert (tmp_path / "workspaces" / "TAL-1").is_dir()
     assert notifier.sent and notifier.sent[0][0] == "TAL-1: workspace kept"
     assert notifier.sent[0][1].endswith("(symphony open TAL-1)")
@@ -888,8 +896,14 @@ def test_non_archived_workspace_posts_nothing(make_orch, tracker, notifier, tmp_
         orch.workspaces.ensure(issue)
     orch.tick()
     if kind == "dirty_git":
+        orch.tick()
         assert (ws / "report.md").read_text() == "uncommitted result"
         assert [title for title, _ in notifier.sent] == ["TAL-1: workspace kept"]
+        git("-C", str(ws), "add", "report.md")
+        git("-C", str(ws), "-c", "user.name=Test", "-c", "user.email=test@example.com",
+            "commit", "-m", "save result")
+        orch.tick()
+        assert not ws.exists()  # notification deduplication must not prevent recovery
     else:
         assert not ws.exists()
     assert not (ws.parent / ".archive").exists()

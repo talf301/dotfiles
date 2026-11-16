@@ -180,6 +180,7 @@ class Orchestrator:
         self._token_base_pending: dict[str, int] = {}
         self._parking: set[str] = set()          # running issues told to stop after the turn
         self._state_notified: set[str] = set()   # running issues already notified for state
+        self._workspace_kept_notified: set[str] = set()
 
     # -- config ------------------------------------------------------------------------------
 
@@ -245,6 +246,7 @@ class Orchestrator:
         skipped = cleanup_terminal_workspaces(self.workspaces, self.tracker,
                                               cfg.tracker.terminal_states)
         for issue in skipped:
+            self._workspace_kept_notified.add(issue.identifier)
             self._notify(issue.identifier, "workspace kept",
                          "before_remove failed, so the workspace was not deleted")
         self._next_tick_ms = self.clock_ms()
@@ -352,16 +354,19 @@ class Orchestrator:
         owned = {entry.identifier for entry in self.state.running.values()}
         owned.update(identifier for _, _, identifier in self.draining.values())
         root = Path(self.workspaces.root).expanduser()
+        team = re.escape(self.config.tracker.provider["team_key"])
         try:
-            identifiers = sorted(path.name for path in root.iterdir()
-                                 if re.fullmatch(r"[A-Za-z][A-Za-z0-9]*-[0-9]+", path.name)
-                                 and path.name not in owned
-                                 and not path.is_symlink() and path.is_dir())
+            present = {path.name for path in root.iterdir()
+                       if re.fullmatch(rf"{team}-[0-9]+", path.name, re.IGNORECASE)
+                       and not path.is_symlink() and path.is_dir()}
         except FileNotFoundError:
+            self._workspace_kept_notified.clear()
             return
         except OSError as e:
             log("workspace_scan_failed", "warning", error=str(e))
             return
+        self._workspace_kept_notified.intersection_update(present)
+        identifiers = sorted(present - owned)
         if not identifiers:
             return
         try:
@@ -370,6 +375,8 @@ class Orchestrator:
             log("workspace_refresh_failed", "warning", error=str(e), category=e.category)
             return
         for issue in issues:
+            if state_key(issue.state) not in self._terminal():
+                self._workspace_kept_notified.discard(issue.identifier)
             if (issue.identifier in identifiers and issue.identifier not in owned
                     and issue.id not in self.state.running and issue.id not in self.draining
                     and state_key(issue.state) in self._terminal()):
@@ -666,7 +673,10 @@ class Orchestrator:
             log("workspace_remove_failed", "warning",
                 **_fields(issue.id, issue.identifier, error=str(e)))
             removed = False
-        if not removed:
+        if removed:
+            self._workspace_kept_notified.discard(issue.identifier)
+        elif issue.identifier not in self._workspace_kept_notified:
+            self._workspace_kept_notified.add(issue.identifier)
             self._notify(issue.identifier, "workspace kept",
                          "before_remove failed, so the workspace was not deleted")
 

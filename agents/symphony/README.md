@@ -107,8 +107,8 @@ notify him.
 - **Budget:** `max_turns` 20 per dispatch; per-ticket token cap 3M (label `budget:<n>k`
   overrides). Hitting the cap posts a question and moves the ticket to In Review.
 - **Prompt rules** (in `WORKFLOW.md`): compute only as the ticket authorizes; any new AWS or
-  Baseten resource needs a question every time; never merge, approve or push to main; park
-  with the `waiting` label; finished work (code included, left on its branch) moves to Done
+  Baseten resource needs a question every time; never merge, approve, force-push or push to main; park
+  with the `waiting` label; finished work (code included, pushed to its branch, no PR) moves to Done
   with evidence and no runs in flight, and Tal reviews later; In Review only for questions; Claude review via the
   `review` skill with `claude -p --permission-mode plan`; no claude.ai artifact publishing.
 

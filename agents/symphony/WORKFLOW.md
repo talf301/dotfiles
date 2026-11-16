@@ -145,8 +145,10 @@ comments to add results: edits are easy to miss, especially on Tal's phone.
    and end your turn. Make routine, reversible decisions yourself and record them in a
    comment as agent decisions.
 7. Code changes go in this workspace's git worktree on its `u/tfriedman/` branch, with tests;
-   run the repository's relevant checks. Push or open a draft PR only if the ticket asks for
-   one. Never merge, approve, or push to main.
+   run the repository's relevant checks. When you finish (step 10), push the branch to
+   `origin` (`git push -u origin <branch>`) and name the pushed branch in the final comment.
+   Open a draft PR only if the ticket asks for one. Never merge, approve, force-push, or push
+   to main or master.
 8. Comment at milestones: plan, launch or PR, result.
 9. Substantive changes and analyses get an independent Claude review before Done or In
    Review: follow the review skill and run Claude headless and read-only,
@@ -156,8 +158,8 @@ comments to add results: edits are easy to miss, especially on Tal's phone.
     in a final comment, and no runs are in flight. Done means you finished the ticket's goals;
     Tal reviews later and reopens the ticket if needed. The final comment lists what was done,
     paths, run ids, metrics, open questions and follow-ups, and for code: what changed, the
-    branch and commits, the checks and the review result. Code stays on its branch; never
-    merge it. Use In Review only for a question (step 6).
+    pushed branch and commits, the checks and the review result. Code stays on its branch;
+    never merge it. Use In Review only for a question (step 6).
 
 ## Limits
 

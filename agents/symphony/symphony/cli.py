@@ -110,7 +110,7 @@ def _service_lock():
 
 
 def _run_locked(path: Path, *, stop: threading.Event | None, factories: dict) -> int:
-    from .notify import MacNotifier
+    from .notify import default_notifier
     from .orchestrator import Orchestrator, thread_worker_factory
 
     store = WorkflowStore(path)
@@ -122,7 +122,7 @@ def _run_locked(path: Path, *, stop: threading.Event | None, factories: dict) ->
         return 1
     kwargs = {"tracker_factory": factories["tracker"]} if factories.get("tracker") else {}
     orch = Orchestrator(store, worker_factory=factories.get("worker") or thread_worker_factory,
-                        notifier=factories.get("notifier") or MacNotifier(),
+                        notifier=factories.get("notifier") or default_notifier(),
                         status_path=status_path(), **kwargs)
     if stop is None:
         stop = threading.Event()

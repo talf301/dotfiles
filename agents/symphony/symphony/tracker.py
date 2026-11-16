@@ -17,7 +17,7 @@ class Tracker(Protocol):
         ...
 
     def fetch_issues_by_ids(self, issue_ids: Sequence[str]) -> list[Issue]:
-        """§11.1 ID refresh. Empty input -> [] without a request. Raises TrackerError."""
+        """§11.1 refresh by UUID or ticket identifier. Empty -> []; raises TrackerError."""
         ...
 
     def prepare_dispatch(self, issue: Issue) -> Issue:

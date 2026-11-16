@@ -52,9 +52,21 @@ hooks:
   # and Symphony then keeps the workspace and notifies (deviation 2). A plain workspace with
   # any content (reports, results, nested clones) is moved to <root>/.archive instead of
   # being deleted. A successful move reports its destination for a signed ticket comment.
+  # Standing instruction from Tal: when a ticket reaches Done, Symphony (not the sandboxed
+  # agent) pushes its u/tfriedman/ branch to origin if it has commits origin lacks. Never
+  # force, never another branch. A failed push keeps the worktree and notifies.
   before_remove: |
     set -euo pipefail
     if [ -f .git ]; then
+      branch="$(git symbolic-ref --quiet --short HEAD || true)"
+      case "$branch" in u/tfriedman/*) ok=1 ;; *) ok=0 ;; esac
+      if [ "${SYMPHONY_ISSUE_STATE:-}" = Done ] && [ "$ok" = 1 ] \
+          && git remote get-url origin >/dev/null 2>&1 \
+          && [ -n "$(git rev-list -n1 HEAD --not --remotes=origin)" ]; then
+        git push -u origin "refs/heads/$branch:refs/heads/$branch"
+        printf 'SYMPHONY_NOTE=Pushed branch `%s` to origin at `%s`.\n' \
+          "$branch" "$(git rev-parse --short HEAD)"
+      fi
       common="$(git rev-parse --path-format=absolute --git-common-dir)"
       git -C "$(dirname "$common")" worktree remove "$PWD"
     elif [ -n "$(ls -A)" ]; then
@@ -145,10 +157,10 @@ comments to add results: edits are easy to miss, especially on Tal's phone.
    and end your turn. Make routine, reversible decisions yourself and record them in a
    comment as agent decisions.
 7. Code changes go in this workspace's git worktree on its `u/tfriedman/` branch, with tests;
-   run the repository's relevant checks. When you finish (step 10), push the branch to
-   `origin` (`git push -u origin <branch>`) and name the pushed branch in the final comment.
-   Open a draft PR only if the ticket asks for one. Never merge, approve, force-push, or push
-   to main or master.
+   run the repository's relevant checks and commit. Do not push: when you move the ticket to
+   Done, Symphony pushes the branch to `origin` and comments that it did (Tal's standing
+   instruction). Name the branch in the final comment. Open a draft PR only if the ticket
+   asks for one. Never merge, approve, force-push, or push to main or master.
 8. Comment at milestones: plan, launch or PR, result.
 9. Substantive changes and analyses get an independent Claude review before Done or In
    Review: follow the review skill and run Claude headless and read-only,
@@ -159,7 +171,7 @@ comments to add results: edits are easy to miss, especially on Tal's phone.
     in a final comment, and no runs are in flight. Done means you finished the ticket's goals;
     Tal reviews later and reopens the ticket if needed. The final comment lists what was done,
     paths, run ids, metrics, open questions and follow-ups, and for code: what changed, the
-    pushed branch and commits, the checks and the review result. Code stays on its branch;
+    branch and commits, the checks and the review result. Code stays on its branch;
     never merge it. Use In Review only for a question (step 6).
 
 ## Limits

@@ -21,6 +21,9 @@ from .models import Issue, ThreadRecord, Workspace
 STATE_DIRNAME = ".symphony"
 HOOK_OUTPUT_LOG_LIMIT = 2048
 ARCHIVE_OUTPUT_PREFIX = "SYMPHONY_WORKSPACE_ARCHIVED="
+# A successful before_remove may print SYMPHONY_NOTE=<text> lines; each is posted as a
+# signed ticket comment (e.g. "Pushed branch ...").
+NOTE_OUTPUT_PREFIX = "SYMPHONY_NOTE="
 HOOK_NAMES = ("after_create", "before_run", "after_run", "before_remove")
 
 _UNSAFE = re.compile(r"[^A-Za-z0-9._-]")
@@ -46,13 +49,15 @@ def _bare_issue(identifier: str) -> Issue:
 class WorkspaceManager:
     def __init__(self, root: Path, hooks: HooksConfig, *, repos: Mapping[str, Path],
                  strip_env: Sequence[str], run=subprocess.run,
-                 on_archive: Callable[[Issue, str], None] | None = None):
+                 on_archive: Callable[[Issue, str], None] | None = None,
+                 on_note: Callable[[Issue, str], None] | None = None):
         self.root = root
         self.hooks = hooks
         self.repos = repos
         self.strip_env = tuple(strip_env)
         self._run = run
         self.on_archive = on_archive
+        self.on_note = on_note
         self.threads = ThreadStore(root)
 
     def _root(self) -> Path:
@@ -164,6 +169,10 @@ class WorkspaceManager:
                         if destination:
                             self.on_archive(issue, destination)
                             break
+            if self.on_note:
+                for line in output.splitlines():
+                    if line.startswith(NOTE_OUTPUT_PREFIX) and line[len(NOTE_OUTPUT_PREFIX):].strip():
+                        self.on_note(issue, line[len(NOTE_OUTPUT_PREFIX):].strip())
         elif path.exists() or path.is_symlink():
             path.unlink()
         self.threads.delete(issue.identifier)
@@ -186,6 +195,7 @@ class WorkspaceManager:
             SYMPHONY_WORKSPACE=str(workspace),
             SYMPHONY_ISSUE_IDENTIFIER=issue.identifier,
             SYMPHONY_ISSUE_ID=issue.id,
+            SYMPHONY_ISSUE_STATE=issue.state,
             SYMPHONY_ISSUE_LABELS=",".join(issue.labels),
             SYMPHONY_REPO=self.repo_for(issue),
         )

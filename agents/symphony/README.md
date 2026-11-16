@@ -108,8 +108,10 @@ notify him.
   overrides). Hitting the cap posts a question and moves the ticket to In Review.
 - **Prompt rules** (in `WORKFLOW.md`): compute only as the ticket authorizes; any new AWS or
   Baseten resource needs a question every time; never merge, approve, force-push or push to main; park
-  with the `waiting` label; finished work (code included, pushed to its branch, no PR) moves to Done
-  with evidence and no runs in flight, and Tal reviews later; In Review only for questions; Claude review via the
+  with the `waiting` label; finished work (code included, committed to its branch, no PR) moves to Done
+  with evidence and no runs in flight, and Tal reviews later; on Done, Symphony's `before_remove`
+  hook pushes the `u/tfriedman/` branch to origin (Tal's standing instruction; Codex's sandbox
+  reviewer refuses agent pushes); In Review only for questions; Claude review via the
   `review` skill with `claude -p --model claude-opus-5-5 --permission-mode plan`; no claude.ai artifact publishing.
 
 ## Linear adapter profile (spec §11.2)

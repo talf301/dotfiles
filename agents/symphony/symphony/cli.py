@@ -7,6 +7,9 @@
   symphony ls                           tickets the running service holds (from status.json)
   symphony open TICKET                  show the ticket's Rex tab (codex resume <thread>)
   symphony logs TICKET [-n N]           the ticket's structured log lines
+  symphony board                        agent tickets by state from Linear; In Review first
+  symphony show TICKET [-n N]           description and the last N comments (0 = all)
+  symphony reply TICKET TEXT|-          comment as Tal (wakes a parked ticket); - reads stdin
   symphony login [--port N]             one-time browser OAuth to Linear's MCP server; tokens
                                         go to the Keychain (service symphony-linear-mcp)
   symphony bridge-event --issue TAL-N   experiment-run bridge: JSON event on stdin; upserts the
@@ -39,7 +42,8 @@ from .log import log, setup_logging, state_dir
 from .workflow import WorkflowStore, resolve_workflow_path
 from .workspace import ThreadStore, workspace_key
 
-SUBCOMMANDS = ("run", "ls", "open", "logs", "check", "login", "bridge-event")
+SUBCOMMANDS = ("run", "ls", "open", "logs", "check", "login", "bridge-event", "board", "show",
+               "reply")
 BRIDGE_EXIT_INPUT = 2
 BRIDGE_EXIT_LOGIN = 3
 STALE_MIN_S = 120
@@ -363,6 +367,36 @@ def cmd_bridge_event(issue: str, *, tools=None, stdin=None) -> int:
     return 0
 
 
+# -- board / show / reply --------------------------------------------------------------------
+
+def _board_tools(path: Path, tools):
+    """(tracker config, tools, session to close or None)."""
+    from . import mcp_linear
+
+    cfg = _load_config(path)
+    if tools is not None:
+        return cfg.tracker, tools, None
+    p = cfg.tracker.provider
+    session = mcp_linear.service_session(
+        url=p.get("endpoint") or mcp_linear.MCP_URL,
+        keychain_service=p.get("keychain_service") or mcp_linear.KEYCHAIN_SERVICE)
+    return cfg.tracker, session, session
+
+
+def cmd_board(path: Path, *, tools=None, action: Callable | None = None) -> int:
+    session = None
+    try:
+        tracker_cfg, tools, session = _board_tools(path, tools)
+        print(action(tracker_cfg, tools))
+    except (OSError, SymphonyError, ValueError) as e:
+        _err(str(e))
+        return 1
+    finally:
+        if session is not None:
+            session.close()
+    return 0
+
+
 # -- main -------------------------------------------------------------------------------------
 
 def _parser() -> argparse.ArgumentParser:
@@ -383,6 +417,15 @@ def _parser() -> argparse.ArgumentParser:
     li = sub.add_parser("login")
     li.add_argument("--port", type=int, default=None,
                     help="localhost redirect port (default 47615)")
+    for name in ("board", "show", "reply"):
+        b = sub.add_parser(name)
+        if name != "board":
+            b.add_argument("ticket")
+        if name == "show":
+            b.add_argument("-n", type=int, default=10, help="last N comments (0 = all)")
+        if name == "reply":
+            b.add_argument("text", nargs="+", help="reply text, or - to read stdin")
+        b.add_argument("--workflow")
     be = sub.add_parser("bridge-event")
     be.add_argument("--issue", required=True, help="Linear issue identifier, e.g. TAL-171")
     be.add_argument("--json", default="-", choices=["-"], help="event source (stdin)")
@@ -414,6 +457,26 @@ def main(argv: list[str] | None = None, *, stop: threading.Event | None = None,
         return cmd_login(port=args.port or REDIRECT_PORT, login=login)
     if args.cmd == "bridge-event":
         return cmd_bridge_event(args.issue.upper(), tools=tools, stdin=stdin)
+    if args.cmd in ("board", "show", "reply"):
+        from . import board
+
+        path = _workflow_path(args.workflow, from_status=True)
+        if args.cmd == "board":
+            st = _read_status() or {}
+            running = [r.get("issue_identifier") for r in st.get("running", [])
+                       if r.get("issue_identifier")]
+            return cmd_board(path, tools=tools, action=lambda c, t: board.render_board(
+                t, c, running=running))
+        ticket = args.ticket.upper()
+        if args.cmd == "show":
+            return cmd_board(path, tools=tools,
+                             action=lambda c, t: board.render_issue(t, ticket, last=args.n))
+        text = (stdin or sys.stdin).read() if args.text == ["-"] else " ".join(args.text)
+
+        def post(c, t):
+            board.reply(t, ticket, text)
+            return f"{ticket}: reply posted"
+        return cmd_board(path, tools=tools, action=post)
     if args.cmd == "open":
         return cmd_open(args.ticket.upper(), _workflow_path(args.workflow, from_status=True),
                         rex=rex)

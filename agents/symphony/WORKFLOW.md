@@ -153,7 +153,10 @@ comments to add results: edits are easy to miss, especially on Tal's phone.
    prep). Only when you have nothing to do until a run changes state: post a short comment
    naming the runs you wait on, add the `waiting` label (leave the state In Progress), and
    end your turn. A run outcome or a reply from Tal resumes this thread; Symphony removes the
-   label when it does. Never remove the `agent` label.
+   label when it does. Never remove the `agent` label. Park only on runs registered with
+   `experiment-run`: their outcomes post the comment that wakes you. Local work (a Claude
+   review, tests, build checks, a local script) never wakes a parked ticket, so wait for it
+   within your turn, checking its output, however long it takes.
 6. If you need a decision only Tal can make, post one comment starting "Question for Tal:"
    with the question, the options and your recommendation, move the ticket to In Review,
    and end your turn. Make routine, reversible decisions yourself and record them in a

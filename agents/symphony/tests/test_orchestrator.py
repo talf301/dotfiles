@@ -51,6 +51,93 @@ def ev(event: str, **kw) -> AgentEvent:
 
 # -- selection -------------------------------------------------------------------------------
 
+
+@pytest.mark.parametrize("terminal", ["Done", "Canceled", "Duplicate"])
+def test_tick_cleans_ticket_closed_while_parked(make_orch, tracker, terminal):
+    issue = make_issue(state="In Review", dispatchable=False)
+    tracker.set_issue(issue)
+    orch = make_orch()
+    ws = orch.workspaces.ensure(issue).path
+    orch.tick()
+    assert ws.is_dir()
+    tracker.set_state(issue.id, terminal)
+    tracker.calls.clear()
+    orch.tick()
+    assert not ws.exists()
+    assert tracker.called("fetch_issues_by_ids") == [(issue.identifier,)]
+    assert tracker.called("fetch_issues_by_states") == [tuple(orch.config.tracker.active_states)]
+
+
+def test_tick_leaves_nonterminal_workspace(make_orch, tracker):
+    issue = make_issue(state="In Review", dispatchable=False)
+    tracker.set_issue(issue)
+    orch = make_orch()
+    ws = orch.workspaces.ensure(issue).path
+    orch.tick()
+    assert ws.is_dir()
+    assert not orch.state.running
+
+
+def test_tick_only_refreshes_ticket_directories(make_orch, tracker, tmp_path):
+    orch = make_orch()
+    root = orch.workspaces.root
+    root.mkdir(parents=True, exist_ok=True)
+    for name in (".symphony", ".archive", "notes", "TAL-99", "ENG-99"):
+        (root / name).mkdir()
+    (root / "TAL-98").write_text("file")
+    (root / "TAL-97").symlink_to(tmp_path, target_is_directory=True)
+    tracker.calls.clear()
+    orch.tick()
+    assert tracker.called("fetch_issues_by_ids") == [("TAL-99",)]
+    assert (root / "TAL-99").is_dir()  # missing tracker issue is left alone
+
+
+def test_tick_cleanup_refresh_failure_preserves_workspace_and_dispatches(make_orch, tracker):
+    orch = make_orch()
+    closed = make_issue(state="Done")
+    tracker.set_issue(closed)
+    active = make_issue("TAL-2")
+    tracker.set_issue(active)
+    ws = orch.workspaces.ensure(closed).path
+    tracker.fail_next("fetch_issues_by_ids")
+    orch.tick()
+    assert ws.is_dir()
+    assert active.id in orch.state.running
+    orch.tick()
+    assert not ws.exists()
+
+
+def test_tick_cleanup_hook_failure_keeps_workspace_and_notifies(make_orch, tracker, notifier):
+    orch = make_orch(workflow("hooks:\n  before_remove: exit 1\n"))
+    issue = make_issue(state="Done")
+    tracker.set_issue(issue)
+    ws = orch.workspaces.ensure(issue).path
+    orch.tick()
+    orch.tick()
+    assert ws.is_dir()
+    assert [title for title, _ in notifier.sent] == ["TAL-1: workspace kept"]
+    tracker.set_state(issue.id, "In Review", dispatchable=False)
+    orch.tick()
+    tracker.set_state(issue.id, "Done")
+    orch.tick()
+    assert len(notifier.sent) == 2  # a later terminal transition deserves a new notice
+
+
+@pytest.mark.parametrize("state", ["Todo", "Done", "Backlog"])
+def test_tick_leaves_running_and_draining_workspaces(make_orch, tracker, state):
+    issue = make_issue()
+    tracker.set_issue(issue)
+    orch = make_orch()
+    ws = orch.workspaces.ensure(issue).path
+    orch.dispatch(issue, None)
+    tracker.set_state(issue.id, state)
+    tracker.calls.clear()
+    orch.tick()
+    orch.tick()
+    assert ws.is_dir()
+    assert all(issue.identifier not in refs
+               for refs in tracker.called("fetch_issues_by_ids"))
+
 def test_sort_priority_then_oldest_then_identifier():
     t0 = EPOCH
     issues = [
@@ -186,7 +273,9 @@ def test_startup_cleanup_fetch_failure_continues(make_orch, tracker):
 def test_startup_cleanup_skipped_removal_notifies(make_orch, tracker, notifier, tmp_path):
     (tmp_path / "workspaces" / "TAL-1").mkdir(parents=True)
     tracker.set_issue(make_issue("TAL-1", state="Done"))
-    make_orch(workflow("hooks:\n  before_remove: exit 1\n"))
+    orch = make_orch(workflow("hooks:\n  before_remove: exit 1\n"))
+    orch.tick()
+    assert len(notifier.sent) == 1
     assert (tmp_path / "workspaces" / "TAL-1").is_dir()
     assert notifier.sent and notifier.sent[0][0] == "TAL-1: workspace kept"
     assert notifier.sent[0][1].endswith("(symphony open TAL-1)")
@@ -751,8 +840,8 @@ def test_woken_ticket_over_budget_escalates_once(make_orch, tracker, clock, tmp_
     assert len(wt.called("escalate")) == 1
 
 
-@pytest.mark.parametrize("startup", [False, True])
-def test_archive_posts_destination_once(make_orch, tracker, startup):
+@pytest.mark.parametrize("cleanup", ["direct", "startup", "tick"])
+def test_archive_posts_destination_once(make_orch, tracker, cleanup):
     from pathlib import Path
     import yaml
     from symphony.workflow import load_workflow
@@ -763,8 +852,10 @@ def test_archive_posts_destination_once(make_orch, tracker, startup):
     tracker.set_issue(issue)
     ws = orch.workspaces.ensure(issue).path
     (ws / "report.md").write_text("result")
-    if startup:
+    if cleanup == "startup":
         orch.startup()
+    elif cleanup == "tick":
+        orch.tick()
     else:
         orch._remove_workspace(issue)
     archives = list((ws.parent / ".archive").iterdir())
@@ -774,12 +865,13 @@ def test_archive_posts_destination_once(make_orch, tracker, startup):
     assert tracker.called("post_note") == [
         (issue.id, f"Workspace archived to `{archives[0]}`")]
     orch._remove_workspace(issue)
+    orch.tick()
     orch.startup()
     assert len(tracker.called("post_note")) == 1
 
 
-@pytest.mark.parametrize("kind", ["empty", "missing", "git"])
-def test_non_archived_workspace_posts_nothing(make_orch, tracker, tmp_path, kind):
+@pytest.mark.parametrize("kind", ["empty", "missing", "git", "dirty_git"])
+def test_non_archived_workspace_posts_nothing(make_orch, tracker, notifier, tmp_path, kind):
     from pathlib import Path
     import subprocess
     import yaml
@@ -788,8 +880,9 @@ def test_non_archived_workspace_posts_nothing(make_orch, tracker, tmp_path, kind
     hook = load_workflow(Path(__file__).parents[1] / "WORKFLOW.md").config["hooks"]["before_remove"]
     orch = make_orch(workflow(yaml.safe_dump({"hooks": {"before_remove": hook}})))
     issue = make_issue("TAL-1", state="Done")
+    tracker.set_issue(issue)
     ws = orch.workspaces.path_for(issue.identifier)
-    if kind == "git":
+    if kind in ("git", "dirty_git"):
         repo = tmp_path / "repo"
         def git(*args):
             subprocess.run(["git", *args], check=True, capture_output=True)
@@ -797,10 +890,22 @@ def test_non_archived_workspace_posts_nothing(make_orch, tracker, tmp_path, kind
         git("-C", str(repo), "-c", "user.name=Test", "-c", "user.email=test@example.com",
             "commit", "--allow-empty", "-m", "init")
         git("-C", str(repo), "worktree", "add", "-b", "u/tfriedman/test", str(ws))
+        if kind == "dirty_git":
+            (ws / "report.md").write_text("uncommitted result")
     elif kind == "empty":
         orch.workspaces.ensure(issue)
-    orch._remove_workspace(issue)
-    assert not ws.exists()
+    orch.tick()
+    if kind == "dirty_git":
+        orch.tick()
+        assert (ws / "report.md").read_text() == "uncommitted result"
+        assert [title for title, _ in notifier.sent] == ["TAL-1: workspace kept"]
+        git("-C", str(ws), "add", "report.md")
+        git("-C", str(ws), "-c", "user.name=Test", "-c", "user.email=test@example.com",
+            "commit", "-m", "save result")
+        orch.tick()
+        assert not ws.exists()  # notification deduplication must not prevent recovery
+    else:
+        assert not ws.exists()
     assert not (ws.parent / ".archive").exists()
     assert tracker.called("post_note") == []
 

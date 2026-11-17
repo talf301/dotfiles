@@ -76,7 +76,8 @@ class FakeTracker:
     def fetch_issues_by_ids(self, issue_ids):
         self.calls.append(("fetch_issues_by_ids", tuple(issue_ids)))
         self._maybe_fail("fetch_issues_by_ids")
-        return [self.issues[i] for i in issue_ids if i in self.issues]
+        return [issue for ref in issue_ids for issue in self.issues.values()
+                if ref in (issue.id, issue.identifier)]
 
     def prepare_dispatch(self, issue):
         self.calls.append(("prepare_dispatch", issue.id))

@@ -274,12 +274,13 @@ def test_state_list_omits_and_logs_malformed(logged):
     assert logged[0][0] == "linear_malformed_issue"
 
 
-def test_id_refresh_maps_to_get_issue_and_omits_missing_and_other_teams():
+@pytest.mark.parametrize("prefix", ["uuid-", ""])
+def test_id_refresh_maps_to_get_issue_and_omits_missing_and_other_teams(prefix):
     board = FakeLinearBoard()
     board.add("TAL-1", state="In Progress")
     board.add("ENG-5")
-    issues = make_tracker(board.mcp).fetch_issues_by_ids(["uuid-TAL-1", "uuid-X", "uuid-ENG-5",
-                                                          "uuid-TAL-1"])
+    issues = make_tracker(board.mcp).fetch_issues_by_ids(
+        [prefix + ref for ref in ("TAL-1", "TAL-99", "ENG-5", "TAL-1")])
     assert [i.identifier for i in issues] == ["TAL-1"]
     first = board.mcp.called("get_issue")[0]
     assert first["includeRelations"] is True and "relations" in first["fields"]

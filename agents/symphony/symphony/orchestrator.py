@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import os
 import queue
+import re
 import threading
 import time
 from collections.abc import Callable
@@ -170,14 +171,16 @@ class Orchestrator:
         self.workspaces: WorkspaceManager | None = None
         self.threads: ThreadStore | None = None
         self.validation_error: SymphonyError | None = None
-        # issue_id -> (worker, issue to clean up or None) for cancelled workers not yet exited
-        self.draining: dict[str, tuple[WorkerHandle, Issue | None]] = {}
+        # Keep the identifier even when cancellation does not request terminal cleanup.
+        # issue_id -> (worker, issue to clean up or None, identifier)
+        self.draining: dict[str, tuple[WorkerHandle, Issue | None, str]] = {}
         self._tracker_cfg = None
         self._next_tick_ms = 0
         self._urls: dict[str, str | None] = {}
         self._token_base_pending: dict[str, int] = {}
         self._parking: set[str] = set()          # running issues told to stop after the turn
         self._state_notified: set[str] = set()   # running issues already notified for state
+        self._workspace_kept_notified: set[str] = set()
 
     # -- config ------------------------------------------------------------------------------
 
@@ -244,6 +247,7 @@ class Orchestrator:
         skipped = cleanup_terminal_workspaces(self.workspaces, self.tracker,
                                               cfg.tracker.terminal_states)
         for issue in skipped:
+            self._workspace_kept_notified.add(issue.identifier)
             self._notify(issue.identifier, "workspace kept",
                          "before_remove failed, so the workspace was not deleted")
         self._next_tick_ms = self.clock_ms()
@@ -326,6 +330,7 @@ class Orchestrator:
             if self.tracker is None:
                 self.write_status()
                 return
+        self._cleanup_unowned_workspaces()
         try:
             issues = self.tracker.fetch_issues_by_states(list(self.config.tracker.active_states))
         except SymphonyError as e:
@@ -340,6 +345,43 @@ class Orchestrator:
         self.write_status()
 
     # -- reconciliation ----------------------------------------------------------------------
+
+    def _cleanup_unowned_workspaces(self) -> None:
+        """Refresh only local ticket directories, never the team's terminal backlog.
+
+        Running and draining workers own their workspace until their exit is processed.
+        Hidden metadata/archive directories, files and symlinks are not workspaces.
+        """
+        owned = {entry.identifier for entry in self.state.running.values()}
+        owned.update(identifier for _, _, identifier in self.draining.values())
+        root = Path(self.workspaces.root).expanduser()
+        team = re.escape(self.config.tracker.provider["team_key"])
+        try:
+            present = {path.name for path in root.iterdir()
+                       if re.fullmatch(rf"{team}-[0-9]+", path.name, re.IGNORECASE)
+                       and not path.is_symlink() and path.is_dir()}
+        except FileNotFoundError:
+            self._workspace_kept_notified.clear()
+            return
+        except OSError as e:
+            log("workspace_scan_failed", "warning", error=str(e))
+            return
+        self._workspace_kept_notified.intersection_update(present)
+        identifiers = sorted(present - owned)
+        if not identifiers:
+            return
+        try:
+            issues = self.tracker.fetch_issues_by_ids(identifiers)
+        except SymphonyError as e:
+            log("workspace_refresh_failed", "warning", error=str(e), category=e.category)
+            return
+        for issue in issues:
+            if state_key(issue.state) not in self._terminal():
+                self._workspace_kept_notified.discard(issue.identifier)
+            if (issue.identifier in identifiers and issue.identifier not in owned
+                    and issue.id not in self.state.running and issue.id not in self.draining
+                    and state_key(issue.state) in self._terminal()):
+                self._remove_workspace(issue)
 
     def reconcile(self) -> None:
         """§16.3 plus stall detection (§8.5 A) and graceful park (deviation 5): only a ticket
@@ -406,7 +448,7 @@ class Orchestrator:
         cleanup (terminal) runs then. The claim is released unless a retry is scheduled."""
         entry = self._pop_running(issue_id)
         entry.worker.cancel(reason)
-        self.draining[issue_id] = (entry.worker, cleanup)
+        self.draining[issue_id] = (entry.worker, cleanup, entry.identifier)
         self.state.claimed.discard(issue_id)
         log("worker_cancelled", **_fields(issue_id, entry.identifier, reason=reason,
                                           session_id=entry.session_id,
@@ -515,7 +557,7 @@ class Orchestrator:
     def on_worker_exit(self, issue_id: str, outcome: WorkerOutcome) -> None:
         """§16.6 plus notifications (In Review, Done, repeated failure, kept workspace)."""
         if issue_id in self.draining:
-            _, cleanup = self.draining.pop(issue_id)
+            _, cleanup, _ = self.draining.pop(issue_id)
             log("worker_drained", **_fields(issue_id, cleanup.identifier if cleanup else None,
                                             reason=outcome.reason, normal=outcome.normal))
             if cleanup is not None:
@@ -641,7 +683,10 @@ class Orchestrator:
             log("workspace_remove_failed", "warning",
                 **_fields(issue.id, issue.identifier, error=str(e)))
             removed = False
-        if not removed:
+        if removed:
+            self._workspace_kept_notified.discard(issue.identifier)
+        elif issue.identifier not in self._workspace_kept_notified:
+            self._workspace_kept_notified.add(issue.identifier)
             self._notify(issue.identifier, "workspace kept",
                          "before_remove failed, so the workspace was not deleted")
 
@@ -758,7 +803,7 @@ class Orchestrator:
     def shutdown(self, grace_s: float = SHUTDOWN_GRACE_S) -> None:
         """Interrupt running turns (a restart resumes the same thread) and wait up to grace_s."""
         workers = [e.worker for e in self.state.running.values()]
-        workers += [w for w, _ in self.draining.values()]
+        workers += [w for w, _, _ in self.draining.values()]
         for issue_id in list(self.state.running):
             self._terminate(issue_id, "shutdown")
         deadline = time.monotonic() + grace_s

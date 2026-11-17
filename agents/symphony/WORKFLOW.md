@@ -101,7 +101,9 @@ codex:
   stall_timeout_ms: 300000
 
 budget:
-  token_cap: 3000000      # per ticket; label budget:<n>k overrides
+  # Runaway guard only, not a spending budget (Tal, 2026-11-16). Counts cached input, which
+  # dominates: a small code ticket used 3.4M. Label budget:<n>k overrides per ticket.
+  token_cap: 100000000
 
 notify:
   enabled: true

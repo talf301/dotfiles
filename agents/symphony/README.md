@@ -104,7 +104,7 @@ notify him.
   environment; the shared daemon never receives it. Keychain writes go through
   `security -i` on stdin, so the token is not in any process argument list. The agent's own
   Linear access is Codex's Linear MCP over its own OAuth.
-- **Budget:** `max_turns` 20 per dispatch; per-ticket token cap 3M (label `budget:<n>k`
+- **Budget:** `max_turns` 20 per dispatch; per-ticket token cap 100M as a runaway guard, not a budget (label `budget:<n>k`
   overrides). Hitting the cap posts a question and moves the ticket to In Review.
 - **Prompt rules** (in `WORKFLOW.md`): compute only as the ticket authorizes; any new AWS or
   Baseten resource needs a question every time; never merge, approve, force-push or push to main; park

@@ -102,8 +102,9 @@ codex:
 
 budget:
   # Runaway guard only, not a spending budget (Tal, 2026-11-16). Counts cached input, which
-  # dominates: a small code ticket used 3.4M. Label budget:<n>k overrides per ticket.
-  token_cap: 100000000
+  # dominates: a small code ticket used 3.4M, and TAL-185 (experiment, ~10 h of work) passed
+  # 100M. Label budget:<n>k overrides per ticket.
+  token_cap: 1000000000
 
 notify:
   enabled: true

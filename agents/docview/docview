@@ -1,0 +1,719 @@
+#!/usr/bin/env python3
+"""docview: show documents in one Neovim per Rex session, in one floating viewer.
+
+Each Rex session gets one background Neovim (headless, your normal config). Every
+document, diff review (diffreview) and ticket draft (rexwork promote) is a tab
+page in it; gt/gT switch, and the tabline names each tab. The tab remembers
+which agent pane its review comments go to. One floating pane per session is the
+viewer, attached with `nvim --remote-ui`. Neovim sizes itself to the smallest
+attached viewer, so there is never more than one: opening from another Rex tab
+moves the viewer there. Closing the pane never loses edits.
+
+  docview open FILE [--title T] [--tab-label L] [--comments FILE] [--agent-block BLOCK]
+                    [--session SESSION] [--bounds X,Y,W,H] [--no-focus]
+  docview toggle [--session S] [--window W | --block B]   show/hide the viewer
+  docview close FILE [--quit] [--session S]
+  docview ls
+  docview gc [--hours N]
+
+Output is JSON. State: ~/.local/state/rexwork/sessions/<uuid>/nvim.sock and
+viewer.json. Older per-document Neovims (~/.local/state/docview/<id>/) are
+listed as legacy and can still be retired with `close`.
+"""
+import argparse
+import contextlib
+import errno
+import fcntl
+import hashlib
+import json
+import os
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+STATE_HOME = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state"))
+SESSIONS = STATE_HOME / "rexwork" / "sessions"
+LEGACY = STATE_HOME / "docview"
+STATE = LEGACY  # older name, kept for callers
+SERVER_LUA = HERE / "server.lua"
+# macOS limits Unix socket paths to 104 bytes; longer ones go here instead.
+SOCKETS = Path("/tmp") / f"docview-{os.getuid()}"
+SOCK_MAX = 100
+SHELL_FLAVOR = "com.superlogical.terminal.shell"
+# Panes started without a login shell have a bare PATH, so use the full path.
+NVIM = shutil.which("nvim") or "nvim"
+# Extra arguments for the background Neovim (tests use a clean config).
+NVIM_ARGS = []
+SESSION_UUID_RE = re.compile(r"^[0-9a-fA-F-]{8,64}$")
+BLOCK_RE = re.compile(r"^block:[0-9A-Za-z-]{1,64}$")
+ATTACH_WAIT = 5.0
+CALL_TIMEOUT = 10
+LOCK_TIMEOUT = 60
+LAST_ERROR = None
+
+
+def fail(message):
+    print(json.dumps({"error": message}), file=sys.stderr)
+    sys.exit(1)
+
+
+def run(args, timeout=20):
+    # With a terminal on stdin, `nvim --remote-expr` prints its result to stderr.
+    return subprocess.run(args, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL)
+
+
+def rex(*args):
+    out = run(["rex", *args])
+    if out.returncode != 0:
+        fail(f"rex {' '.join(args[:3])}: {out.stderr.strip()}")
+    return json.loads(out.stdout) if out.stdout.strip() else {}
+
+
+def rex_soft(*args):
+    """rex, returning None instead of failing."""
+    out = run(["rex", *args])
+    if out.returncode != 0:
+        return None
+    try:
+        return json.loads(out.stdout) if out.stdout.strip() else {}
+    except ValueError:
+        return None
+
+
+def vim_string(text):
+    """A Vim single-quoted string literal for text (only ' needs escaping)."""
+    return "'" + text.replace("'", "''") + "'"
+
+
+def lua(sock, code, timeout=5, arg=None):
+    """Run Lua in a Neovim and return its JSON-encodable result, or None (see LAST_ERROR).
+
+    Pass values as `arg`, never by formatting them into `code`: Lua sees it as _A,
+    sent as JSON data, so paths with quotes or ]] cannot change the code.
+    """
+    global LAST_ERROR
+    LAST_ERROR = None
+    expr = "json_encode(luaeval(" + vim_string(code)
+    if arg is not None:
+        # ASCII JSON has no raw newlines, so it fits in one Vim string literal.
+        expr += ", json_decode(" + vim_string(json.dumps(arg)) + ")"
+    expr += "))"
+    try:
+        out = run([NVIM, "--server", str(sock), "--remote-expr", expr], timeout=timeout)
+    except subprocess.TimeoutExpired:
+        LAST_ERROR = "timeout"
+        return None
+    if out.returncode != 0 or not out.stdout.strip():
+        LAST_ERROR = (out.stderr or out.stdout).strip() or f"exit {out.returncode}"
+        return None
+    try:
+        return json.loads(out.stdout)
+    except ValueError:
+        LAST_ERROR = out.stdout.strip()
+        return None
+
+
+def call(sock, code, arg=None, timeout=None):
+    """lua(), failing with a clear message when Neovim does not answer."""
+    timeout = timeout or CALL_TIMEOUT
+    result = lua(sock, code, timeout=timeout, arg=arg)
+    if result is None and LAST_ERROR == "timeout":
+        fail(f"the editor Neovim ({sock}) did not answer within {timeout}s; it may be waiting at a "
+             "prompt in the editor float. Answer or dismiss it there, then try again.")
+    if result is None:
+        fail(f"the editor Neovim ({sock}) failed: {LAST_ERROR}")
+    return result
+
+
+def alive(sock):
+    return Path(sock).exists() and lua(sock, "1", timeout=3) == 1
+
+
+def status(sock):
+    """UIs, modified buffers, size; works for legacy and shared Neovims."""
+    return lua(
+        sock,
+        "{uis = vim.tbl_map(function(u) return {u.width, u.height, u.chan} end, vim.api.nvim_list_uis()),"
+        " modified = vim.tbl_map(function(b) return vim.api.nvim_buf_get_name(b) end,"
+        " vim.tbl_filter(function(b) return vim.bo[b].modified end, vim.api.nvim_list_bufs())),"
+        " readonly = vim.bo.readonly, columns = vim.o.columns, lines = vim.o.lines}",
+    )
+
+
+def detach_viewers(sock):
+    lua(sock, "(function() for _, u in ipairs(vim.api.nvim_list_uis()) do pcall(vim.fn.chanclose, u.chan) end return 1 end)()")
+
+
+def quit_server(sock):
+    lua(sock, "(function() vim.schedule(function() vim.cmd('qall') end) return 1 end)()", timeout=5)
+
+
+# ---- session state ------------------------------------------------------------
+
+def uuid_of(session):
+    text = (session or "").strip()
+    text = text[len("session:"):] if text.startswith("session:") else text
+    if not SESSION_UUID_RE.match(text):
+        fail(f"not a Rex session id: {session!r}")
+    return text
+
+
+def session_dir(session, create=True):
+    """The session's state dir (rexwork's), made if needed; refuses ids or links that
+    point outside SESSIONS."""
+    uuid = uuid_of(session)
+    directory = SESSIONS / uuid
+    if create:
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if directory.exists():
+        resolved = directory.resolve()
+        if resolved.parent != SESSIONS.resolve() or resolved.name != uuid:
+            fail(f"{directory} is not directly inside {SESSIONS}; not touching it")
+    return directory
+
+
+def block_id(block):
+    if not block:
+        return None
+    if not block.startswith("block:"):
+        block = "block:" + block
+    if not BLOCK_RE.match(block):
+        fail(f"not a Rex block id: {block!r}")
+    return block
+
+
+def sock_path(directory):
+    sock = Path(directory) / "nvim.sock"
+    if len(str(sock).encode()) <= SOCK_MAX:
+        return sock
+    return SOCKETS / f"{Path(directory).name}.sock"
+
+
+_held = threading.local()
+
+
+@contextlib.contextmanager
+def session_lock(session, timeout=None):
+    """Serialize everything that picks a tab or places the viewer in one session: server
+    start, tab selection and viewer placement for docview and diffreview open, toggle and
+    close. Reentrant within a thread. Its own file, not rexwork's .lock, so it never waits
+    on (or blocks) the marker and state updates that hold that one briefly."""
+    directory = session_dir(session)
+    key = str(directory)
+    held = getattr(_held, "locks", None)
+    if held is None:
+        held = _held.locks = {}
+    if held.get(key):
+        held[key] += 1
+        try:
+            yield
+        finally:
+            held[key] -= 1
+        return
+    timeout = LOCK_TIMEOUT if timeout is None else timeout
+    with open(directory / "docview.lock", "w") as fh:
+        deadline = time.time() + timeout
+        while True:
+            try:
+                fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.time() >= deadline:
+                    fail(f"another docview, diffreview or rexwork command has held the editor of {session} "
+                         f"for over {timeout:.0f}s; try again when it finishes")
+                time.sleep(0.05)
+        held[key] = 1
+        try:
+            yield
+        finally:
+            held[key] = 0
+            fcntl.flock(fh, fcntl.LOCK_UN)
+
+
+def listening(sock):
+    """True if a process accepts connections on SOCK, False if provably none does."""
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(2)
+    try:
+        s.connect(str(sock))
+        return True
+    except (FileNotFoundError, ConnectionRefusedError):
+        return False
+    except OSError as e:
+        if e.errno in (errno.ENOENT, errno.ECONNREFUSED, errno.ENOTSOCK):
+            return False
+        return True  # cannot tell: treat as in use, never replace it
+    finally:
+        s.close()
+
+
+def busy(sock):
+    fail(f"the editor Neovim ({sock}) is busy: it is running but did not answer, perhaps waiting at a "
+         "prompt in the editor float. Answer or dismiss it there, then try again. Nothing was changed.")
+
+
+def ensure_server(session, cwd=None):
+    """The session's shared Neovim socket, starting Neovim if needed. Returns (sock, started).
+
+    A Neovim that is listening but slow to answer is never replaced: it may hold unsaved
+    edits. Only a socket nobody listens on is removed."""
+    with session_lock(session):
+        return _ensure_server(session, cwd)
+
+
+def _ensure_server(session, cwd):
+    directory = session_dir(session)
+    sock = sock_path(directory)
+    if sock.exists() or sock.is_symlink():
+        if lua(sock, "1", timeout=CALL_TIMEOUT) == 1:
+            return sock, False
+        if LAST_ERROR == "timeout" or listening(sock):
+            busy(sock)
+        sock.unlink()  # stale: nothing listens on it
+    sock.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    env = dict(os.environ, DOCVIEW_SERVER_LUA=str(SERVER_LUA), DOCVIEW_SESSION="session:" + uuid_of(session),
+               REX_SESSION="session:" + uuid_of(session))
+    # Tabs belong to different agent panes: no pane-specific value may live in the process
+    # environment, where Neovim's subprocesses would inherit the wrong one.
+    for name in ("REVIEW_FILE", "REX_REVIEW_BLOCK", "REX_BLOCK"):
+        env.pop(name, None)
+    subprocess.Popen(
+        [NVIM, *NVIM_ARGS, "--headless", "--listen", str(sock),
+         "--cmd", "lua dofile(vim.env.DOCVIEW_SERVER_LUA)"],
+        cwd=str(cwd or Path.home()), env=env, start_new_session=True,
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    deadline = time.time() + 15
+    while time.time() < deadline:
+        if alive(sock):
+            return sock, True
+        time.sleep(0.2)
+    fail(f"the editor Neovim did not start at {sock}")
+
+
+def server_state(sock):
+    return lua(sock, "require('docview_server').state()", timeout=CALL_TIMEOUT)
+
+
+def servers():
+    """(session, directory, sock) for every session with a shared Neovim socket file."""
+    for directory in sorted(SESSIONS.glob("*")) if SESSIONS.exists() else []:
+        if directory.is_dir() and SESSION_UUID_RE.match(directory.name):
+            sock = sock_path(directory)
+            if sock.exists():
+                yield "session:" + directory.name, directory, sock
+
+
+def read_json(path):
+    try:
+        data = json.loads(Path(path).read_text())
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def write_json(path, data):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    tmp = path.with_name(path.name + f".{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(data, indent=2) + "\n")
+    tmp.replace(path)
+
+
+# ---- the viewer ---------------------------------------------------------------
+
+def find_window(session, block):
+    view = rex("session", "inspect", session, "--json")
+    for window in view.get("windows", []):
+        for layer in window.get("layers", []):
+            if any(b.get("block_id") == block for b in layer.get("blocks", [])):
+                return window["window_id"]
+    fail(f"{block} is not in a tab of {session}")
+
+
+def block_exists(session, block):
+    out = run(["rex", "session", "inspect", session, "--json"])
+    return out.returncode == 0 and block in out.stdout
+
+
+def viewer_state(viewer):
+    """Where the recorded viewer is now: {window_id, minimized} or None when gone."""
+    if not viewer or not viewer.get("layer_id"):
+        return None
+    view = rex_soft("session", "inspect", viewer["session_id"], "--json")
+    if not view:
+        return None
+    for window in view.get("windows", []):
+        for layer in window.get("layers", []):
+            if layer.get("layer_id") == viewer["layer_id"]:
+                blocks = [b.get("block_id") for b in layer.get("blocks", [])]
+                if viewer.get("block_id") not in blocks:
+                    return None
+                return {"window_id": window["window_id"], "minimized": layer.get("state") == "minimized"}
+    return None
+
+
+def close_viewer(meta):
+    """Close a viewer pane recorded as meta["viewer"] (legacy) or as the viewer itself."""
+    viewer = meta.get("viewer") if "viewer" in meta else meta
+    viewer = viewer or {}
+    if viewer.get("block_id") and block_exists(viewer["session_id"], viewer["block_id"]):
+        run(["rex", "block", "close", "-s", viewer["session_id"], viewer["block_id"]])
+
+
+def set_layer(viewer, state, focus=False):
+    request = {"session_id": viewer["session_id"], "layer_id": viewer["layer_id"], "state": state}
+    if focus:
+        request["focus"] = True
+    rex("api", "call", "session.set_layer_state", json.dumps(request))
+
+
+def wait_attached(sock):
+    state = None
+    deadline = time.time() + ATTACH_WAIT
+    while True:
+        state = status(sock)
+        if (state and state["uis"]) or time.time() >= deadline:
+            return state
+        time.sleep(0.2)
+
+
+def show_viewer(session, window, sock, focus=True, bounds=None):
+    """Make the session's one viewer visible on WINDOW. Returns (viewer, action)."""
+    call(sock, "1")  # a Neovim stuck at a prompt fails here, before any pane changes
+    directory = session_dir(session)
+    path = directory / "viewer.json"
+    viewer = read_json(path)
+    where = viewer_state(viewer)
+    if where and where["window_id"] == window:
+        if where["minimized"] or focus:
+            set_layer(viewer, "normal", focus=focus)
+        return viewer, "restored" if where["minimized"] else "reused"
+    action = "moved" if where else "attached"
+    if where:
+        close_viewer(viewer)
+    detach_viewers(sock)  # never two viewers: Neovim sizes to the smallest
+    bounds = bounds or [0.06, 0.06, 0.88, 0.88]
+    request = {
+        "session_id": session, "window_id": window, "bounds": bounds, "focus": focus,
+        "layout": {"block": {"flavor": SHELL_FLAVOR, "label": "Editor", "options": {
+            "cwd": str(Path.home()), "shell": "none",
+            "command": [NVIM, "--server", str(sock), "--remote-ui"],
+            "exit": {"on_completion": True},
+        }}},
+    }
+    layer = rex("api", "call", "session.new_layer", json.dumps(request))
+    viewer = {"session_id": session, "window_id": window, "block_id": layer["block_ids"][0],
+              "layer_id": layer["layer_id"], "sock": str(sock), "opened_at": int(time.time())}
+    write_json(path, viewer)
+    wait_attached(sock)
+    return viewer, action
+
+
+def retire_if_empty(session, sock, state=None):
+    """No tab left: close the viewer; with nothing unsaved, quit Neovim too.
+    Returns (viewer_closed, server_quit)."""
+    state = state or server_state(sock) or {}
+    if state.get("labeled", 1) > 0:
+        return False, False
+    directory = session_dir(session)
+    viewer = read_json(directory / "viewer.json")
+    detach_viewers(sock)
+    close_viewer(viewer)
+    (directory / "viewer.json").unlink(missing_ok=True)
+    if not state.get("modified"):
+        quit_server(sock)
+        return True, True
+    return True, False
+
+
+# ---- legacy per-document Neovims ----------------------------------------------
+
+def doc_dir(path):
+    return LEGACY / hashlib.sha1(str(path).encode()).hexdigest()[:12]
+
+
+def read_meta(directory):
+    return read_json(Path(directory) / "meta.json")
+
+
+def write_meta(directory, meta):
+    write_json(Path(directory) / "meta.json", meta)
+
+
+def legacy_documents():
+    for directory in sorted(LEGACY.glob("*")) if LEGACY.exists() else []:
+        meta = read_meta(directory)
+        if meta:
+            sock = Path(meta["sock"])
+            state = status(sock) if alive(sock) else None
+            yield directory, meta, state
+
+
+def start_server(path, sock, env):
+    """Legacy: a Neovim for one document (kept for callers; new code uses ensure_server)."""
+    sock.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if sock.exists():
+        sock.unlink()
+    subprocess.Popen(
+        [NVIM, "--headless", "--listen", str(sock), "--cmd", "autocmd SwapExists * let v:swapchoice = 'o'", str(path)],
+        cwd=path.parent, env=env, start_new_session=True,
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    deadline = time.time() + 15
+    while time.time() < deadline:
+        if alive(sock):
+            return
+        time.sleep(0.2)
+    fail(f"Neovim did not start for {path}")
+
+
+# ---- commands -----------------------------------------------------------------
+
+def caller(args):
+    session = args.session or os.environ.get("REX_SESSION")
+    block = getattr(args, "agent_block", None) or os.environ.get("REX_BLOCK")
+    if not session or not block:
+        fail("not in Rex: pass --session and --agent-block")
+    return "session:" + uuid_of(session), block_id(block)
+
+
+def open_tab(sock, path, session, agent_block, label=None, comments=None, kind="doc"):
+    """Show PATH in its tab of the session's Neovim; comments go to AGENT_BLOCK. Without
+    LABEL, an open tab keeps its label and a new one is 'Doc: <file stem>'."""
+    res = call(sock, "require('docview_server').open_doc(_A)", arg={
+        "path": str(path), "label": label, "label_default": f"Doc: {path.stem}", "kind": kind, "block": agent_block, "session": session,
+        "comments": str(comments) if comments else None,
+        "comments_default": str(path.with_name(path.stem + ".comments.md")),
+    })
+    if not isinstance(res, dict) or res.get("error"):
+        fail(f"could not open {path} in the editor Neovim: {res.get('error') if isinstance(res, dict) else res}")
+    return res
+
+
+def cmd_open(args):
+    path = Path(args.file).resolve()
+    if not path.is_file():
+        fail(f"no such file: {path}")
+    session, agent_block = caller(args)
+    window = find_window(session, agent_block)
+    title = args.title or path.name
+    label = args.tab_label or (f"Doc: {args.title}" if args.title else None)
+    # One lock from server start to viewer placement: the tab shown is the caller's.
+    with session_lock(session):
+        sock, started = ensure_server(session, cwd=path.parent)
+        tab = open_tab(sock, path, session, agent_block, label,
+                       comments=Path(args.comments).resolve() if args.comments else None,
+                       kind=args.kind)
+        viewer, action = show_viewer(session, window, sock, focus=not args.no_focus,
+                                     bounds=[float(x) for x in args.bounds.split(",")])
+        state = server_state(sock) or {}
+    current = next((t for t in state.get("tabs", []) if t.get("path") == str(path)), {})
+    label = current.get("label", label)
+    result = {"path": str(path), "sock": str(sock), "comments": current.get("comments"), "title": title,
+              "label": label, "agent_block": agent_block, "session": session, "viewer": viewer,
+              "viewer_action": action, "opened_at": int(time.time()), "started": started,
+              "attached": bool(state.get("uis")), "readonly": bool(tab.get("readonly")),
+              "size": [state.get("columns"), state.get("lines")] if state else None,
+              "tab": tab.get("tabnr"), "tabs": len(state.get("tabs", []))}
+    legacy = read_meta(doc_dir(path))
+    if legacy and alive(Path(legacy.get("sock", ""))):
+        result["legacy_sock"] = legacy["sock"]
+        result["note"] = ("An older docview Neovim still has this file open"
+                          + ("; this tab is read-only" if result["readonly"] else "")
+                          + f". Retire it with `docview close {path} --quit` once its edits are saved.")
+    print(json.dumps(result, indent=2))
+
+
+def cmd_toggle(args):
+    session = "session:" + uuid_of(args.session or os.environ.get("REX_SESSION"))
+    with session_lock(session):
+        _toggle(args, session)
+
+
+def _toggle(args, session):
+    directory = session_dir(session)
+    sock = sock_path(directory)
+    viewer = read_json(directory / "viewer.json")
+    where = viewer_state(viewer)
+    window = args.window
+    if not window and args.block:
+        window = find_window(session, block_id(args.block))
+    if where and (window is None or where["window_id"] == window):
+        if where["minimized"]:
+            set_layer(viewer, "normal", focus=True)
+            action = "restored"
+        else:
+            set_layer(viewer, "minimized")
+            action = "minimized"
+        print(json.dumps({"session": session, "action": action, "viewer": viewer}, indent=2))
+        return
+    state = lua(sock, "require('docview_server').state()", timeout=CALL_TIMEOUT) if sock.exists() else None
+    if state is None and LAST_ERROR == "timeout":
+        call(sock, "1")  # says Neovim is stuck, and how to unstick it
+    if not state or not state.get("labeled"):
+        fail(f"nothing is open in the editor for {session}")
+    if not window:
+        fail("the viewer is gone: pass --window or --block to say where to show it")
+    viewer, action = show_viewer(session, window, sock, focus=True)
+    print(json.dumps({"session": session, "action": action, "viewer": viewer}, indent=2))
+
+
+def close_in_server(session, sock, field, value, quit):
+    """Close the tab FIELD=VALUE in one session's Neovim. Returns a result dict or None."""
+    with session_lock(session):
+        return _close_in_server(session, sock, field, value, quit)
+
+
+def _close_in_server(session, sock, field, value, quit):
+    res = call(sock, "require('docview_server').close_tab(_A)",
+               arg={"field": field, "value": value, "quit": bool(quit)})
+    if not res.get("found"):
+        return None
+    out = {"session": session, "closed": bool(res.get("closed")), "modified": res.get("modified") or [],
+           "viewer_closed": False, "server_quit": False}
+    if res.get("closed"):
+        out["viewer_closed"], out["server_quit"] = retire_if_empty(session, sock)
+    return out
+
+
+def cmd_close(args):
+    path = Path(args.file).resolve()
+    result = {"path": str(path), "viewer_closed": False, "quit": False, "modified": [], "sessions": []}
+    blocked = False
+    targets = [(s, d, k) for s, d, k in servers()
+               if not args.session or s == "session:" + uuid_of(args.session)]
+    for session, _directory, sock in targets:
+        if not listening(sock):
+            continue
+        out = close_in_server(session, sock, "docview_path", str(path), args.quit)
+        if out is None:
+            continue
+        result["sessions"].append(out)
+        if out["closed"]:
+            result["viewer_closed"] = True
+            result["quit"] = result["quit"] or bool(args.quit)
+        elif args.quit and out["modified"]:
+            blocked = True
+            result["modified"] += out["modified"]
+    # A document from before the shared Neovims.
+    directory = doc_dir(path)
+    meta = read_meta(directory)
+    if meta:
+        sock = Path(meta.get("sock", directory / "nvim.sock"))
+        legacy = {"legacy": True, "closed": False, "modified": []}
+        if alive(sock):
+            detach_viewers(sock)
+            if args.quit:
+                legacy["modified"] = (status(sock) or {}).get("modified", [])
+                if legacy["modified"]:
+                    blocked = True
+                    result["modified"] += legacy["modified"]
+                else:
+                    quit_server(sock)
+                    result["quit"] = legacy["closed"] = True
+        close_viewer(meta)
+        result["viewer_closed"] = True
+        meta["viewer"] = None
+        write_meta(directory, meta)
+        result["sessions"].append(legacy)
+    print(json.dumps(result, indent=2))
+    if blocked:
+        sys.exit(2)  # unsaved edits: that document is left open
+
+
+def cmd_ls(_):
+    rows = []
+    for session, directory, sock in servers():
+        state = server_state(sock) if alive(sock) else None
+        viewer = read_json(directory / "viewer.json") or None
+        if viewer:
+            where = viewer_state(viewer)
+            viewer = {**viewer, "state": ("minimized" if where["minimized"] else "normal") if where else "gone"}
+        if not state:
+            continue
+        in_tabs = set()
+        for tab in state["tabs"]:
+            if not tab.get("label"):
+                continue
+            in_tabs.add(tab.get("path"))
+            rows.append({"path": tab.get("path") or tab.get("key"), "title": tab.get("label"), "running": True,
+                         "viewers": len(state["uis"]), "modified": bool(tab.get("modified")),
+                         "size": [state["columns"], state["lines"]], "viewer": viewer, "session": session,
+                         "kind": tab.get("kind"), "label": tab.get("label"), "tab": tab.get("nr"),
+                         "agent_block": tab.get("block"), "comments": tab.get("comments"),
+                         "key": tab.get("key"), "sock": str(sock), "legacy": False})
+        for name in state["modified"]:
+            if name not in in_tabs:
+                rows.append({"path": name, "title": None, "running": True, "viewers": len(state["uis"]),
+                             "modified": True, "size": [state["columns"], state["lines"]], "viewer": viewer,
+                             "session": session, "kind": "hidden", "label": None, "tab": None,
+                             "sock": str(sock), "legacy": False})
+    for _, m, s in legacy_documents():
+        rows.append({"path": m["path"], "title": m.get("title"), "running": s is not None,
+                     "viewers": len(s["uis"]) if s else 0, "modified": bool(s and s["modified"]),
+                     "size": s and [s["columns"], s["lines"]], "viewer": m.get("viewer"),
+                     "session": (m.get("viewer") or {}).get("session_id"), "kind": "doc",
+                     "sock": m.get("sock"), "legacy": True})
+    print(json.dumps(rows, indent=2))
+
+
+def cmd_gc(args):
+    """Quit Neovims with no tab, no viewer and nothing unsaved; legacy ones when also old."""
+    cutoff = time.time() - args.hours * 3600
+    quit_paths = []
+    for session, directory, sock in servers():
+        if not alive(sock):
+            continue
+        state = server_state(sock) or {}
+        if not state.get("labeled") and not state.get("uis") and not state.get("modified"):
+            quit_server(sock)
+            (directory / "viewer.json").unlink(missing_ok=True)
+            quit_paths.append(str(sock))
+    for _, meta, state in legacy_documents():
+        if state and not state["uis"] and not state["modified"] and meta.get("opened_at", 0) < cutoff:
+            quit_server(Path(meta["sock"]))
+            quit_paths.append(meta["path"])
+    print(json.dumps({"quit": quit_paths}, indent=2))
+
+
+def main():
+    parser = argparse.ArgumentParser(prog="docview", description=__doc__.split("\n\n")[0])
+    sub = parser.add_subparsers(dest="command", required=True)
+    p = sub.add_parser("open", help="show FILE in a tab of the session's editor float")
+    p.add_argument("file")
+    p.add_argument("--title", help="names the tab: 'Doc: TITLE' (default: the file name)")
+    p.add_argument("--tab-label", help="the tab's whole label, such as 'Ticket: draft'")
+    p.add_argument("--kind", default="doc", choices=["doc", "ticket"], help=argparse.SUPPRESS)
+    p.add_argument("--comments", help="review comments file (default: FILE's name + .comments.md)")
+    p.add_argument("--agent-block", help="agent pane that receives comments (default: $REX_BLOCK)")
+    p.add_argument("--session", help="Rex session of that pane (default: $REX_SESSION)")
+    p.add_argument("--bounds", default="0.06,0.06,0.88,0.88", help="where a new viewer goes")
+    p.add_argument("--no-focus", action="store_true")
+    p.set_defaults(func=cmd_open)
+    p = sub.add_parser("toggle", help="hide the editor float if shown; show it (here) if hidden or gone")
+    p.add_argument("--session", help="Rex session (default: $REX_SESSION)")
+    p.add_argument("--window", help="Rex tab (window id) to show it on")
+    p.add_argument("--block", help="a pane on the Rex tab to show it on")
+    p.set_defaults(func=cmd_toggle)
+    p = sub.add_parser("close", help="close FILE's tab; --quit also drops its buffer if nothing is unsaved")
+    p.add_argument("file")
+    p.add_argument("--quit", action="store_true")
+    p.add_argument("--session", help="only in this Rex session's editor")
+    p.set_defaults(func=cmd_close)
+    sub.add_parser("ls", help="list open documents per session, and legacy ones").set_defaults(func=cmd_ls)
+    p = sub.add_parser("gc", help="quit editor Neovims with nothing open, shown or unsaved")
+    p.add_argument("--hours", type=float, default=12, help="legacy Neovims: also older than this")
+    p.set_defaults(func=cmd_gc)
+    args = parser.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()

@@ -327,6 +327,125 @@ class PathTest(unittest.TestCase):
             self.assertTrue(os.path.isabs(t), t)
 
 
+DAY = 86400
+NOW = 1_800_000_000
+
+
+def held_state(ticket, provider, path, age_days, landed=False, **extra):
+    record = {"path": path, "provider": provider, "at": NOW - age_days * DAY}
+    state = {"ticket": ticket, "label": f"{ticket} work", "kind": "ticketed", "worktree": path,
+             "worktree_provider": provider, "worktree_created": record, "branch": f"u/tfriedman/{ticket.lower()}"}
+    if provider == "treehouse":
+        state["lease_id"] = record["lease_id"] = "lease-1"
+    if landed:
+        state["landed_at"] = NOW - DAY
+    state.update(extra)
+    return state
+
+
+class WorktreeTest(TempState):
+    def write(self, uuid, state):
+        d = rb.STATE / uuid
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "session.json").write_text(json.dumps(state))
+
+    def test_held_git_and_slot(self):
+        info = rb.worktree_info(held_state("TAL-1", "git", "/tmp/wt-a", 3))
+        self.assertEqual((info["held"], info["provider"], info["landed"]), (True, "git", False))
+        self.assertEqual(rb.own_worktree_line(info, NOW).plain(), " wt 3d")
+        slot = rb.worktree_info(held_state("TAL-2", "treehouse", "/tmp/slot/1/precog", 2))
+        self.assertEqual(rb.own_worktree_line(slot, NOW).plain(), " slot 2d")
+
+    def test_adopted_is_not_held(self):
+        state = held_state("TAL-3", "git", "/tmp/wt-b", 1)
+        state["worktree_created"]["provider"] = "adopted"
+        self.assertIsNone(rb.worktree_info(state))
+        # A path with no creation record, or a record for another path, is not held either.
+        self.assertIsNone(rb.worktree_info({"worktree": "/tmp/wt-b", "worktree_provider": "adopted"}))
+        state = held_state("TAL-3", "git", "/tmp/wt-b", 1)
+        state["worktree"] = "/tmp/elsewhere"
+        self.assertIsNone(rb.worktree_info(state))
+
+    def test_landed_and_holding_warns(self):
+        info = rb.worktree_info(held_state("TAL-4", "git", "/tmp/wt-c", 5, landed=True))
+        line = rb.own_worktree_line(info, NOW)
+        self.assertEqual(line.plain(), " wt 5d landed")
+        self.assertIn("\x1b[1;31m", line.render())
+
+    def test_pending_and_failed(self):
+        pending = rb.worktree_info({"ticket": "TAL-5", "pending": ["worktree"]})
+        self.assertEqual(rb.own_worktree_line(pending, NOW).plain(), " wt pending")
+        self.assertFalse(pending["held"])
+        failed = rb.worktree_info({"ticket": "TAL-5", "pending": ["worktree"], "worktree_error": "lease timed out"})
+        self.assertEqual(rb.own_worktree_line(failed, NOW).plain(), " wt failed")
+        self.assertIsNone(rb.worktree_info({"ticket": "TAL-6"}))
+        self.assertIsNone(rb.worktree_info("junk"))
+
+    def test_fleet_counts_and_ages(self):
+        self.write("01a1fabd-0000-7000-8000-00000000000a", held_state("TAL-10", "git", "/tmp/wt-10", 11))
+        self.write("01a1fabd-0000-7000-8000-00000000000b", held_state("TAL-11", "treehouse", "/tmp/s/1/p", 2,
+                                                                      landed=True))
+        self.write("01a1fabd-0000-7000-8000-00000000000c", held_state("TAL-12", "treehouse", "/tmp/s/2/p", 0.5))
+        adopted = held_state("TAL-13", "git", "/tmp/wt-13", 30)
+        adopted["worktree_created"]["provider"] = "adopted"
+        self.write("01a1fabd-0000-7000-8000-00000000000d", adopted)
+        (rb.STATE / "01a1fabd-0000-7000-8000-00000000000e").mkdir()  # no session.json
+        (rb.STATE / "01a1fabd-0000-7000-8000-00000000000f").mkdir()
+        (rb.STATE / "01a1fabd-0000-7000-8000-00000000000f" / "session.json").write_text("{bad")
+        (rb.STATE / "locks").mkdir()
+        held = rb.Fleet().scan(force=True)
+        self.assertEqual(sorted(h["ticket"] for h in held), ["TAL-10", "TAL-11", "TAL-12"])
+        self.assertEqual(rb.fleet_line(held, NOW).plain(), "held 3 (oldest 11d) slots 2, 1 landed")
+        self.assertEqual(rb.fleet_line(held, NOW, compact=True).plain(), "held 3/11d")
+        self.assertEqual(rb.held_list_line(held, NOW).plain(),
+                         "TAL-11 slot 2d landed │ TAL-10 wt 11d │ TAL-12 slot 12h")
+
+    def test_fleet_rereads_only_changed_files(self):
+        uuid = "01a1fabd-0000-7000-8000-00000000000a"
+        self.write(uuid, held_state("TAL-10", "git", "/tmp/wt-10", 1))
+        fleet = rb.Fleet(every=0)
+        self.assertEqual(len(fleet.scan()), 1)
+        reads = []
+        saved = rb.read_json
+        rb.read_json = lambda *a: reads.append(a) or saved(*a)
+        try:
+            fleet.scan()
+            self.assertEqual(reads, [])
+            path = rb.STATE / uuid / "session.json"
+            path.write_text(json.dumps({"ticket": "TAL-10"}))  # released
+            os.utime(path, ns=(time.time_ns() + 10 ** 9, time.time_ns() + 10 ** 9))
+            self.assertEqual(fleet.scan(), [])
+        finally:
+            rb.read_json = saved
+
+    def test_none_held_skips_the_item(self):
+        self.assertEqual(rb.Fleet().scan(force=True), [])
+        lines = rb.compose(sample_model(), 200, 4, color=False, now=NOW)
+        self.assertNotIn("held", lines[0].plain())
+        self.assertEqual(lines[3].plain(), "top goal › middle › deepest one")  # no held list
+
+    def test_compose_with_worktrees(self):
+        held = [{**rb.worktree_info(held_state("TAL-11", "treehouse", "/tmp/s/1/p", 3)),
+                 "session_id": SID}]
+        model = sample_model(5)
+        model["worktree"] = held[0]
+        model["held"] = held
+        model["objectives"]["doing_path"] = "top goal / middle / deepest one"
+        lines = rb.compose(model, 140, 5, color=False, now=NOW)
+        self.assertTrue(lines[0].plain().startswith("TAL-203 2/9 !1 blocked slot 3d ▸ deepest one"))
+        self.assertIn("held 1/3d", lines[0].plain())  # short form when the goal would be squeezed
+        wide = rb.compose(model, 220, 1, color=False, now=NOW)[0].plain()
+        self.assertIn("held 1 (oldest 3d) slots 1", wide)
+        self.assertEqual(lines[3].plain(), "TAL-11 slot 3d")
+        self.assertEqual(lines[4].plain(), "top goal › middle › deepest one")
+        # Narrow: the ticket and the own marker survive; the fleet item is cut first.
+        narrow = rb.compose(model, 40, 1, color=False, now=NOW)[0].plain()
+        self.assertTrue(narrow.startswith("TAL-203 2/9 !1 blocked slot 3d"), narrow)
+        for width in (20, 60, 120, 200):
+            for line in rb.compose(model, width, 4, color=False, now=NOW):
+                self.assertLessEqual(line.width(), width)
+
+
 class FakeRex:
     """Enough of `rex` for open/close/fit: one tab, two panes side by side."""
 

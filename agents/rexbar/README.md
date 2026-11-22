@@ -17,7 +17,7 @@ rexbar run    --session S [--window W] [--fit]    # the renderer the pane runs
 
 Left to right, most important first; anything that does not fit is cut from the right with `…`:
 
-1. The ticket (or `scratch`), done/total goals, `!N blocked` when any goal is blocked, and the deepest `doing` goal (`+N` when several are equally deep). From `session.json` and `objectives.md`.
+1. The ticket (or `scratch`), done/total goals, `!N blocked` when any goal is blocked, this session's worktree marker (see [Worktrees](#worktrees)), and the deepest `doing` goal (`+N` when several are equally deep). From `session.json` and `objectives.md`.
 2. The history strip: one cell per event, oldest at the left, newest at the right, oldest dropped (`…`) to fit. Colours use the 16-colour palette, so they follow the theme. `--no-color` prints a letter instead.
 
    | Event | Colour | Letter | Source |
@@ -32,16 +32,27 @@ Left to right, most important first; anything that does not fit is cut from the 
    | landed | bright blue | L | `landed_at` |
 
 3. Agents in the session from `rexboard ls --json`: working, need you (rexboard's `needs_you` group: unseen done, question, permission), idle (everything else, and stale rows), and `+N sub` for working subagents (`children.working`).
-4. Plan usage from `ai-usage status --json`: `5h` and `wk` percent for the main agent's provider (Claude unless the main agent is Codex), then the other provider. Yellow from 50%, red from 80%, `–` when unknown. Then the main agent's model, effort, context percent and tokens when rexboard has its `usage`, and the session's `branch` when `session.json` has one.
+4. Plan usage from `ai-usage status --json`: `5h` and `wk` percent for the main agent's provider (Claude unless the main agent is Codex), then the other provider. Yellow from 50%, red from 80%, `–` when unknown. Then the worktrees held across all sessions (`held 4 (oldest 11d) slots 2, 1 landed`; left out when none), the main agent's model, effort, context percent and tokens when rexboard has its `usage`, and the session's `branch` when `session.json` has one.
 
 With one row, everything is on that row. With more rows:
 
 - Row 1: ticket, goal, agent counts, usage.
 - Row 2: the strip, then the latest event (`picture: Status bar options 3m ago`; the age updates every second).
 - Row 3: one item per agent pane in the session: state (`need you`, `working`, `done`, `idle`), the pane's title cut to 20 cells, `+N` working subagents, and rexboard's message. Panes that need Tal come first, then working ones, then the rest; within each, panes on the bar's own tab first. The first item gets half the row.
-- Row 4: the current goal's parents, outermost first (`round 2 › bottom status bar`).
+- Row 4: every held worktree, landed ones first, then oldest first (`TAL-180 wt 11d landed │ TAL-210 slot 3d`). When none is held, the current goal's parents instead, outermost first (`round 2 › bottom status bar`).
+- Row 5: the goal's parents, when row 4 lists worktrees.
 
-Further rows stay empty. Narrow widths switch agents and usage to short forms (`w1 y1 i2 +3`, one provider).
+Further rows stay empty. When the status would squeeze the goal below about 24 cells, the branch is dropped first, then agents, usage and held worktrees switch to short forms (`w1 y1 i2 +3`, one provider, `held 4/11d`).
+
+## Worktrees
+
+`rexwork start TAL-N` can give a ticket session a worktree (a treehouse slot for precog, a plain git worktree elsewhere) that only `rexwork release TAL-N` gives back. The bar uses rexwork's definition of held (`held_worktree()`, which `rexwork ls` flags): `session.json` has `worktree` and a `worktree_created` record for that same path whose provider is `git` or `treehouse`. An `adopted` worktree, or a path with no creation record, is not held. The age runs from `worktree_created.at` (else `worktree_at`).
+
+- This session, after the ticket on row 1: `wt 3d` (git) or `slot 3d` (treehouse) in cyan; `wt 3d landed` in bold red when the session has `landed_at` (PR opened) and still holds it, since that is the one to release; `wt pending` (yellow) when `pending` lists `worktree`; `wt failed` (bold red) when `worktree_error` is set.
+- All sessions, with the usage group on row 1: `held N (oldest AGE)`, then `slots K` when any are treehouse slots, then `, L landed` in bold red. It sits right of the ticket and goal, so it is cut first.
+- Row 4 lists them, as above.
+
+The bar lists the state root's session directories at most every 5 s and reads a `session.json` again only when its mtime changes; no subprocess.
 
 Minimized floating panes show as pills at the bottom right of the tab and can cover the right end of the bar's last row. That is why the most important content is at the left, and the strip is left-aligned.
 
@@ -91,4 +102,4 @@ rexboard's `usage` is `null` for every pane today, because rexboard's hooks and 
 
 ## Tests
 
-`python3 -m unittest test_rexbar.py` from this directory. They cover goal parsing (nesting, tabs, blocked), the change log, history merging and strip fitting, truncation at widths 20/60/120/200 and rows 1/2/3/4, malformed inputs, the usage cache, and open/close/toggle/fit against a stubbed `rex` (including panes labelled `Bar` that are not rexbar's, stale records and dead bars) (including sizing to 3 rows when an app sizes panes, and stopping at the app's 3-row floor), the agent and goal-path rows, relative times advancing, the full-width last cell, and the built PATH. State goes to a temp dir by replacing `STATE`.
+`python3 -m unittest test_rexbar.py` from this directory. They cover goal parsing (nesting, tabs, blocked), the change log, history merging and strip fitting, truncation at widths 20/60/120/200 and rows 1/2/3/4, malformed inputs, the usage cache, and open/close/toggle/fit against a stubbed `rex` (including panes labelled `Bar` that are not rexbar's, stale records and dead bars) (including sizing to 3 rows when an app sizes panes, and stopping at the app's 3-row floor), the agent, held-worktree and goal-path rows, worktree ownership (git, treehouse, adopted, landed, pending, failed, ages, mtime caching), relative times advancing, the full-width last cell, and the built PATH. State goes to a temp dir by replacing `STATE`.

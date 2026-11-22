@@ -280,6 +280,134 @@ def collect_events(session, history, log):
     return events
 
 
+# ---- worktrees ----------------------------------------------------------------------
+
+OWNED_PROVIDERS = ("git", "treehouse")  # as rexwork: an `adopted` worktree is not held
+
+
+def same_path(a, b):
+    try:
+        return bool(a and b) and str(Path(a).resolve()) == str(Path(b).resolve())
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return False
+
+
+def worktree_info(state):
+    """What a session.json says about its worktree, by rexwork's own rules.
+
+    `held` mirrors rexwork's held_worktree(): only a `worktree_created` record
+    with an owned provider, for the recorded path, counts; a path alone (an
+    adopted worktree) never does. `pending` is a worktree step still to do,
+    `failed` its last error."""
+    if not isinstance(state, dict):
+        return None
+    record = state.get("worktree_created")
+    held = (bool(state.get("worktree")) and isinstance(record, dict)
+            and record.get("provider") in OWNED_PROVIDERS and same_path(record.get("path"), state["worktree"]))
+    pending = isinstance(state.get("pending"), list) and "worktree" in state["pending"]
+    failed = bool(state.get("worktree_error"))
+    if not (held or pending or failed):
+        return None
+    since = (record.get("at") if isinstance(record, dict) else None) or state.get("worktree_at")
+    return {
+        "held": held,
+        "provider": record.get("provider") if held else None,
+        "since": since if isinstance(since, (int, float)) else None,
+        "landed": isinstance(state.get("landed_at"), (int, float)),
+        "pending": pending, "failed": failed,
+        "ticket": state.get("ticket"), "label": state.get("label"),
+    }
+
+
+class Fleet:
+    """Worktrees held by every rexwork session. Each session.json is read again
+    only when its mtime changes; the directory is listed at most every `every` s."""
+
+    def __init__(self, root=None, every=5):
+        self.root, self.every = root, every
+        self.cache = {}  # dir name -> (mtime, info)
+        self.last, self.value = 0.0, []
+
+    def scan(self, force=False):
+        if not force and time.time() - self.last < self.every:
+            return self.value
+        self.last = time.time()
+        root = Path(self.root or STATE)
+        try:
+            names = [d.name for d in root.iterdir() if SESSION_ID.match(d.name)]
+        except OSError:
+            names = []
+        held, cache = [], {}
+        for name in sorted(names):
+            path = root / name / "session.json"
+            stamp = mtime(path)
+            if stamp is None:
+                continue
+            old = self.cache.get(name)
+            info = old[1] if old and old[0] == stamp else worktree_info(read_json(path, {}))
+            cache[name] = (stamp, info)
+            if info and info["held"]:
+                held.append({**info, "session_id": "session:" + name})
+        self.cache, self.value = cache, held
+        return held
+
+
+def wt_word(provider):
+    return "slot" if provider == "treehouse" else "wt"
+
+
+def wt_age(info, now):
+    return ago(now - info["since"]) if info.get("since") else "?"
+
+
+def own_worktree_line(info, now):
+    """This session's marker for row 1: `wt 3d`, `slot 3d`, `wt pending`, `wt failed`."""
+    line = Line()
+    if not info:
+        return line
+    if info["held"]:
+        text = f" {wt_word(info['provider'])} {wt_age(info, now)}"
+        if info["landed"]:
+            return line.add(text + " landed", "1;31")  # the one to release
+        return line.add(text, "36")
+    if info["failed"]:
+        return line.add(" wt failed", "1;31")
+    return line.add(" wt pending", "33")
+
+
+def fleet_line(held, now, compact=False):
+    """`held 4 (oldest 11d) slots 2` across every session; empty when nothing is held."""
+    line = Line()
+    if not held:
+        return line
+    ages = [now - h["since"] for h in held if h.get("since")]
+    oldest = ago(max(ages)) if ages else "?"
+    landed = sum(1 for h in held if h["landed"])
+    slots = sum(1 for h in held if h["provider"] == "treehouse")
+    if compact:
+        return line.add(f"held {len(held)}/{oldest}", "1;31" if landed else "36")
+    line.add("held ", "2").add(str(len(held)), "36").add(f" (oldest {oldest})", "2")
+    if slots:
+        line.add(" slots ", "2").add(str(slots), "36")
+    if landed:
+        line.add(",", "2").add(f" {landed} landed", "1;31")
+    return line
+
+
+def held_list_line(held, now):
+    """Each held worktree, landed ones (ready to release) first, then oldest first."""
+    line = Line()
+    order = sorted(held, key=lambda h: (not h["landed"], h.get("since") or now))
+    for i, h in enumerate(order):
+        if i:
+            line.add(SEP, "2")
+        name = h.get("ticket") or clean(str(h.get("label") or h["session_id"][-8:]))
+        line.add(str(name), "1").add(f" {wt_word(h['provider'])} {wt_age(h, now)}")
+        if h["landed"]:
+            line.add(" landed", "1;31")
+    return line
+
+
 # ---- external sources ---------------------------------------------------------------
 
 def board_rows(session_id, rows):
@@ -562,6 +690,7 @@ def id_parts(model):
         head.add(f" {obj['done']}/{obj['total']}", "2")
     if obj["blocked"]:
         head.add(f" !{obj['blocked']} blocked", "1;31")
+    head.extend(own_worktree_line(model.get("worktree"), model.get("now") or time.time()))
     tail = Line()
     if obj["doing"]:
         tail.add(" ▸ ", "33").add(clean(obj["doing"]))
@@ -702,6 +831,8 @@ def compose(model, width, rows, color=True, now=None):
     """The frame as a list of `rows` Line objects."""
     now = now if now is not None else time.time()
     width, rows = max(1, int(width)), max(1, int(rows))
+    model = {**model, "now": now}
+    held = model.get("held") or []
     head, tail = id_parts(model)
     main = (model["agents"] or {}).get("main")
     mline = model_line(main)
@@ -710,11 +841,17 @@ def compose(model, width, rows, color=True, now=None):
         branch.add(str(model["session"]["branch"]), "2")
     events = model["events"]
     right = join(agents_line(model["agents"]), usage_line(model["usage"], (main or {}).get("harness")),
-                 mline, branch)
-    # When the full status would squeeze the goal below ~24 cells, use short forms.
-    if width - right.width() - head.width() < 24 + (len(events) + 3 if rows == 1 else 0):
+                 fleet_line(held, now), mline, branch)
+    # When the full status would squeeze the goal below ~24 cells, drop the
+    # branch first, then use short forms.
+    need = 24 + (len(events) + 3 if rows == 1 else 0)
+    if branch.spans and width - right.width() - head.width() < need:
+        right = join(agents_line(model["agents"]), usage_line(model["usage"], (main or {}).get("harness")),
+                     fleet_line(held, now), mline)
+    if width - right.width() - head.width() < need:
         right = join(agents_line(model["agents"], compact=True),
-                     usage_line(model["usage"], (main or {}).get("harness"), compact=True), mline)
+                     usage_line(model["usage"], (main or {}).get("harness"), compact=True),
+                     fleet_line(held, now, compact=True), mline)
 
     if rows == 1:
         sep_w = text_width(SEP)
@@ -748,8 +885,11 @@ def compose(model, width, rows, color=True, now=None):
     if rows >= 3:
         out.append(panes_line((model["agents"] or {}).get("panes") or [], width).truncate(width)
                    if model["agents"] is not None else Line().add("agents \u2013", "2"))
-    if rows >= 4:
+    if rows >= 4 and held:
+        out.append(held_list_line(held, now).truncate(width))
+    if len(out) < rows:
         out.append(path_line(model["objectives"].get("doing_path")).truncate(width))
+    out = out[:rows]
     return out + [Line() for _ in range(rows - len(out))]
 
 
@@ -794,11 +934,13 @@ class Source:
         self.stamps = [mtime(p) for p in self.paths()]
         return True
 
-    def model(self, board, usage, session_id, window=None):
+    def model(self, board, usage, session_id, window=None, held=None):
         rows = board_rows(session_id, board) if board is not None else None
         main_block = self.session.get("main_block") if isinstance(self.session, dict) else None
         return {
             "session": self.session,
+            "worktree": worktree_info(self.session),
+            "held": held or [],
             "objectives": summarize_objectives(self.objectives or []),
             "events": collect_events(self.session, self.history, self.log),
             "agents": agent_summary(rows, main_block, window) if rows is not None else None,
@@ -1217,7 +1359,7 @@ def cmd_once(args):
         cache.refresh()
     usage, _ = cache.read()
     board = fetch_board()
-    model = source.model(board, usage, session, args.window)
+    model = source.model(board, usage, session, args.window, Fleet().scan(force=True))
     width = args.width or shutil.get_terminal_size((120, 2)).columns
     rows = args.rows or 1
     print(frame_text(compose(model, width, rows, color=not args.no_color), not args.no_color))
@@ -1316,6 +1458,7 @@ def cmd_run(args):
         threading.Thread(target=work, daemon=True).start()
 
     source = Source(directory if directory.is_dir() else None)
+    fleet = Fleet()
     out.write("\x1b[?25l\x1b[?7l\x1b[2J")
     out.flush()
     last, last_poll, last_size, logged = None, 0.0, None, 0
@@ -1333,7 +1476,7 @@ def cmd_run(args):
                 last = None
                 maybe_fit(size.lines)
             logged = log_errors(directory, logged)
-            model = source.model(board.value, usage.value, session, args.window)
+            model = source.model(board.value, usage.value, session, args.window, fleet.scan())
             lines = compose(model, size.columns, size.lines, color=True, now=now)
             text = paint(lines, size.columns)
             if text != last:

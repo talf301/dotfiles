@@ -1,0 +1,410 @@
+#!/usr/bin/env python3
+"""diffreview: review the changes since the last review in Neovim, in the session's editor float.
+
+Run it from the agent's pane inside a git repo or worktree.
+
+  diffreview open [--base REV] [--agent-block B] [--session S] [--bounds X,Y,W,H] [--no-focus]
+  diffreview mark [REV] [--opened-head SHA [--opened-dirty]]
+                                 set the last-reviewed marker (default HEAD)
+  diffreview status              show the marker and what the next review covers
+  diffreview base [--base REV]   print the base the next review would use
+  diffreview close [--quit]      close the review tab; --quit also drops its buffers
+
+`open` diffs the marker against the working tree (committed and uncommitted
+changes). With no marker, the base is the merge-base with the default branch.
+Comments made with <leader>rc go to the session's review directory and
+<leader>rs types them into the calling agent pane. <leader>rm marks the HEAD
+the diff was opened at, and says so if HEAD has moved since.
+
+The marker is per session and repo. The diff is a tab in the session's shared
+docview Neovim (one per Rex session, one floating viewer); the tab and the
+comments file are per repo and agent pane (--agent-block, default $REX_BLOCK),
+so two agents reviewing one checkout do not collide.
+
+The marker lives in ~/.local/state/rexwork/sessions/<uuid>/session.json under
+"last_reviewed" (repo toplevel -> commit). Add --json for machine output.
+"""
+import argparse
+import fcntl
+import hashlib
+import importlib.util
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from importlib.machinery import SourceFileLoader
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+_loader = SourceFileLoader("docview", str(HERE.parent / "docview" / "docview"))
+docview = importlib.util.module_from_spec(importlib.util.spec_from_loader("docview", _loader))
+_loader.exec_module(docview)
+fail, run, rex, lua, alive, NVIM = docview.fail, docview.run, docview.rex, docview.lua, docview.alive, docview.NVIM
+
+STATE = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "rexwork" / "sessions"
+# Where per-review Neovims lived before the shared docview Neovim (legacy; still retired by close).
+SOCKETS = Path("/tmp") / f"diffreview-{os.getuid()}"
+SESSION_ID = re.compile(r"^[0-9a-fA-F-]{8,64}$")
+BLOCK_ID = re.compile(r"^block:[0-9A-Za-z-]{1,64}$")
+
+
+def git(*args, cwd=None, check=True):
+    out = subprocess.run(["git", *args], capture_output=True, text=True, timeout=30, cwd=cwd,
+                         stdin=subprocess.DEVNULL)
+    if check and out.returncode != 0:
+        fail(f"git {' '.join(args)}: {out.stderr.strip()}")
+    return out.stdout.strip() if out.returncode == 0 else None
+
+
+def toplevel():
+    top = git("rev-parse", "--show-toplevel", check=False)
+    if not top:
+        fail("not inside a git repository")
+    return str(Path(top).resolve())
+
+
+def commit(top, rev):
+    return git("rev-parse", "--verify", "--quiet", f"{rev}^{{commit}}", cwd=top, check=False)
+
+
+def subject(top, sha):
+    return git("log", "-1", "--format=%h %s", sha, cwd=top, check=False)
+
+
+def dirty(top):
+    return bool(git("status", "--porcelain", cwd=top, check=False))
+
+
+def untracked(top):
+    out = git("ls-files", "--others", "--exclude-standard", cwd=top, check=False)
+    return out.splitlines() if out else []
+
+
+def default_branch(top):
+    head = git("symbolic-ref", "-q", "--short", "refs/remotes/origin/HEAD", cwd=top, check=False)
+    for ref in [head, "origin/main", "origin/master", "main", "master"]:
+        if ref and commit(top, ref):
+            return ref
+    return None
+
+
+def session_dir(session):
+    """The session's state dir; refuses ids that could point outside STATE."""
+    session = session or os.environ.get("REX_SESSION")
+    if not session:
+        fail("not in Rex: pass --session")
+    uuid = session.removeprefix("session:")
+    if not SESSION_ID.match(uuid):
+        fail(f"not a Rex session id: {session!r}")
+    directory = STATE / uuid
+    resolved = directory.resolve()
+    if resolved.parent != STATE.resolve() or resolved.name != uuid:
+        fail(f"{directory} is not directly inside {STATE}; not touching it")
+    return directory
+
+
+def agent_block_id(block, required=True):
+    """Normalise and check a Rex block id; it becomes part of file names."""
+    block = block or os.environ.get("REX_BLOCK")
+    if not block:
+        if required:
+            fail("not in Rex: pass --agent-block")
+        return None
+    if not block.startswith("block:"):
+        block = "block:" + block
+    if not BLOCK_ID.match(block):
+        fail(f"not a Rex block id: {block!r}")
+    return block
+
+
+def read_session(directory):
+    try:
+        data = json.loads((directory / "session.json").read_text())
+    except FileNotFoundError:
+        return {}
+    except ValueError:
+        fail(f"{directory / 'session.json'} is not valid JSON; not touching it")
+    if not isinstance(data, dict):
+        fail(f"{directory / 'session.json'} is not a JSON object; not touching it")
+    return data
+
+
+def set_marker(directory, top, sha):
+    """Update only last_reviewed[top], keeping every other key.
+
+    Holds rexwork's lock (flock on <dir>/.lock) across read-merge-replace, so a
+    concurrent rexwork update is not overwritten.
+    """
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with open(directory / ".lock", "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        data = read_session(directory)
+        markers = data.get("last_reviewed")
+        data["last_reviewed"] = {**(markers if isinstance(markers, dict) else {}), top: sha}
+        tmp = directory / f"session.json.{os.getpid()}.tmp"
+        tmp.write_text(json.dumps(data, indent=2) + "\n")
+        tmp.replace(directory / "session.json")
+
+
+def repo_key(top):
+    return f"{Path(top).name}-{hashlib.sha1(top.encode()).hexdigest()[:8]}"
+
+
+def view_key(top, block):
+    """File-name stem for one agent pane's review of one repo."""
+    return f"{repo_key(top)}.{block.removeprefix('block:')}"
+
+
+def comments_path(directory, top, block):
+    return directory / "review" / f"{view_key(top, block)}.diff-comments.md"
+
+
+def tab_key(top, block):
+    """vim.t.diffreview_key of one agent pane's review tab of one repo."""
+    return view_key(top, block)
+
+
+def review_paths(directory, top, session, block):
+    """Legacy socket and the viewer metadata file for one agent pane's review of one repo."""
+    key = hashlib.sha1(f"{session}\0{top}\0{block}".encode()).hexdigest()[:12]
+    return SOCKETS / f"{key}.sock", directory / "review" / f"{view_key(top, block)}.viewer.json"
+
+
+def resolve_base(top, directory, explicit=None):
+    """Return (base sha, how it was chosen, notes)."""
+    notes = []
+    if explicit:
+        sha = commit(top, explicit)
+        if not sha:
+            fail(f"not a commit: {explicit}")
+        return sha, f"--base {explicit}", notes
+    marker = (read_session(directory).get("last_reviewed") or {}).get(top) if directory else None
+    if marker:
+        if commit(top, marker):
+            if git("merge-base", "--is-ancestor", marker, "HEAD", cwd=top, check=False) is None:
+                notes.append("The marker is not an ancestor of HEAD (history was rewritten?); "
+                             "the diff compares its tree with the working tree.")
+            return marker, "last reviewed", notes
+        notes.append(f"Marker {marker[:11]} no longer exists; using the merge-base instead.")
+    branch = default_branch(top)
+    if branch:
+        sha = git("merge-base", "HEAD", branch, cwd=top, check=False)
+        if sha:
+            return sha, f"merge-base with {branch}", notes
+    notes.append("No default branch found; showing only uncommitted changes.")
+    return commit(top, "HEAD"), "HEAD", notes
+
+
+def summary(top, base, how, notes):
+    head = commit(top, "HEAD")
+    count = git("rev-list", "--count", f"{base}..HEAD", cwd=top, check=False) or "0"
+    message = f"Reviewing {subject(top, base)} ({how}) to the working tree: {count} commit(s)"
+    message += " plus uncommitted changes." if dirty(top) else "."
+    new_files = untracked(top)
+    if new_files:
+        # diffview never lists untracked files when the left side is a commit.
+        shown = ", ".join(new_files[:5]) + (" ..." if len(new_files) > 5 else "")
+        notes = [*notes, f"Not shown: {len(new_files)} untracked file(s): {shown}"]
+    return {"repo": top, "base": base, "base_from": how, "head": head, "commits": int(count),
+            "dirty": dirty(top), "untracked": new_files, "notes": notes,
+            "message": " ".join([message, *notes])}
+
+
+def output(args, data):
+    print(json.dumps(data, indent=2) if args.json else data["message"])
+
+
+def cmd_base(args):
+    top = toplevel()
+    directory = session_dir(args.session) if (args.session or os.environ.get("REX_SESSION")) else None
+    block = agent_block_id(args.agent_block, required=False)
+    base, how, notes = resolve_base(top, directory, args.base)
+    data = summary(top, base, how, notes)
+    data["comments"] = str(comments_path(directory, top, block)) if directory and block else None
+    data["tab_key"] = tab_key(top, block) if block else None
+    output(args, data)
+
+
+def cmd_status(args):
+    top = toplevel()
+    directory = session_dir(args.session)
+    block = agent_block_id(args.agent_block, required=False)
+    marker = (read_session(directory).get("last_reviewed") or {}).get(top)
+    base, how, notes = resolve_base(top, directory)
+    data = summary(top, base, how, notes)
+    data.update(marker=marker, comments=str(comments_path(directory, top, block)) if block else None)
+    data["message"] = (f"Marker: {subject(top, marker) if marker else 'none'}. " + data["message"])
+    output(args, data)
+
+
+def head_moved_note(opened, head):
+    """Say plainly that commits after the opened HEAD were not reviewed, or return None."""
+    if not head or head == opened:
+        return None
+    return (f"HEAD moved from {opened[:11]} to {head[:11]} since this diff was opened; "
+            f"marked {opened[:11]}; reopen to review the rest.")
+
+
+def cmd_mark(args):
+    top = toplevel()
+    directory = session_dir(args.session)
+    block = agent_block_id(args.agent_block, required=False)
+    rev = args.opened_head or args.rev
+    sha = commit(top, rev)
+    if not sha:
+        fail(f"not a commit: {rev}")
+    head = commit(top, "HEAD")
+    previous = (read_session(directory).get("last_reviewed") or {}).get(top)
+    set_marker(directory, top, sha)
+    message = f"Marked {subject(top, sha)} as reviewed"
+    message += f" (was {previous[:11]})." if previous and previous != sha else "."
+    moved = head_moved_note(sha, head) if args.opened_head else None
+    if moved:
+        message = f"{moved} {message}"
+    is_dirty = dirty(top)
+    if args.opened_head and args.opened_dirty:
+        message += (" The diff included uncommitted changes; the marker can only be a commit, "
+                    "so they will show again in the next review.")
+    elif is_dirty:
+        message += (" There are uncommitted changes; the marker can only be a commit, "
+                    "so they will show again in the next review.")
+    # Start the next review with an empty comments file; keep the old one beside it.
+    archived = None
+    if block:
+        comments = comments_path(directory, top, block)
+        if comments.exists() and comments.stat().st_size:
+            archived = comments.with_name(f"{comments.stem}.{sha[:11]}-{int(time.time())}.md")
+            comments.replace(archived)
+            message += f" Old comments moved to {archived}."
+        session = args.session or os.environ.get("REX_SESSION")
+        shared = docview.sock_path(directory)
+        if alive(shared):
+            lua(shared, "require('docview_server').clear_marks(_A)", arg=tab_key(top, block))
+        legacy, _ = review_paths(directory, top, session, block)
+        if alive(legacy):
+            lua(legacy, "require('config.review').clear_marks()")
+    output(args, {"repo": top, "marker": sha, "previous": previous, "head": head,
+                  "head_moved": bool(moved), "dirty": is_dirty,
+                  "archived_comments": archived and str(archived), "message": message})
+
+
+def cmd_open(args):
+    top = toplevel()
+    session = args.session or os.environ.get("REX_SESSION")
+    if not session:
+        fail("not in Rex: pass --session and --agent-block")
+    session = "session:" + docview.uuid_of(session)
+    agent_block = agent_block_id(args.agent_block)
+    directory = session_dir(session)
+    window = docview.find_window(session, agent_block)
+    base, how, notes = resolve_base(top, directory, args.base)
+    comments = comments_path(directory, top, agent_block)
+    _, meta_path = review_paths(directory, top, session, agent_block)
+    # What this diff shows; <leader>rm marks this HEAD, not whatever HEAD is later.
+    opened_head, opened_dirty = commit(top, "HEAD"), dirty(top)
+
+    # docview's session lock from server start to viewer placement, as `docview open` holds it.
+    with docview.session_lock(session):
+        sock, started = docview.ensure_server(session, cwd=top)
+        # diffview lays out for the screen it has, so show the viewer first.
+        viewer, action = docview.show_viewer(session, window, sock, focus=not args.no_focus,
+                                             bounds=[float(x) for x in args.bounds.split(",")])
+        # Values go to Lua as data (_A), never as source text.
+        opened = docview.call(sock, "require('docview_server').open_diff(_A)", timeout=30, arg={
+            "key": tab_key(top, agent_block), "top": top, "base": base, "head": opened_head,
+            "dirty": opened_dirty, "comments": str(comments), "block": agent_block, "session": session,
+            "label": f"Review: {Path(top).name}"})
+    data = summary(top, base, how, notes)
+    data.update(comments=str(comments), agent_block=agent_block, sock=str(sock), viewer=viewer,
+                viewer_action=action, started=started, diffview=opened is True, opened_at=int(time.time()),
+                opened_head=opened_head, opened_dirty=opened_dirty, session=session,
+                tab_key=tab_key(top, agent_block))
+    if opened is not True:
+        data["message"] += f" DiffviewOpen failed: {opened}"
+    meta_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    tmp = meta_path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, indent=2) + "\n")
+    tmp.replace(meta_path)
+    output(args, data)
+
+
+def _read(path):
+    try:
+        return json.loads(path.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def cmd_close(args):
+    top = toplevel()
+    session = args.session or os.environ.get("REX_SESSION")
+    directory = session_dir(session)
+    session = "session:" + directory.name
+    agent_block = agent_block_id(args.agent_block)
+    legacy, meta_path = review_paths(directory, top, session, agent_block)
+    result = {"repo": top, "quit": False, "modified": [], "closed": False}
+    sock = docview.sock_path(directory)
+    if alive(sock):
+        out = docview.close_in_server(session, sock, "diffreview_key", tab_key(top, agent_block), args.quit)
+        if out:
+            result.update(closed=out["closed"], viewer_closed=out["viewer_closed"], server_quit=out["server_quit"])
+            if out["closed"]:
+                result["quit"] = bool(args.quit)
+            elif args.quit:
+                result["modified"] += out["modified"]
+    # A review Neovim from before the shared one.
+    meta = _read(meta_path)
+    if alive(legacy):
+        docview.detach_viewers(legacy)
+        if args.quit:
+            modified = (docview.status(legacy) or {}).get("modified", [])
+            result["modified"] += modified
+            if not modified:
+                docview.quit_server(legacy)
+                result["quit"] = True
+        docview.close_viewer(meta)
+        result["closed"] = True
+    result["message"] = ("Closed the review tab." if result["closed"] else "No review tab was open.")
+    if result["quit"]:
+        result["message"] += " Its buffers were dropped."
+    if result["modified"]:
+        result["message"] += " Left open: unsaved edits in " + ", ".join(result["modified"])
+    output(args, result)
+    if result["modified"]:
+        sys.exit(2)
+
+
+def main():
+    parser = argparse.ArgumentParser(prog="diffreview", description=__doc__.split("\n\n")[0])
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    def add(name, func, help_text):
+        p = sub.add_parser(name, help=help_text)
+        p.add_argument("--session", help="Rex session (default: $REX_SESSION)")
+        p.add_argument("--agent-block", help="agent pane whose review this is (default: $REX_BLOCK)")
+        p.add_argument("--json", action="store_true")
+        p.set_defaults(func=func)
+        return p
+
+    p = add("open", cmd_open, "show the diff since the last review in a float on the agent's tab")
+    p.add_argument("--base", help="diff from REV instead of the marker")
+    p.add_argument("--bounds", default="0.03,0.03,0.94,0.94")
+    p.add_argument("--no-focus", action="store_true")
+    p = add("mark", cmd_mark, "set the last-reviewed marker")
+    p.add_argument("rev", nargs="?", default="HEAD")
+    p.add_argument("--opened-head", metavar="SHA",
+                   help="the HEAD the reviewed diff was opened at: mark it, and say if HEAD has moved since")
+    p.add_argument("--opened-dirty", action="store_true", help="the reviewed diff included uncommitted changes")
+    add("status", cmd_status, "show the marker and what the next review covers")
+    p = add("base", cmd_base, "print the base the next review would use")
+    p.add_argument("--base", help="use REV instead of the marker")
+    p = add("close", cmd_close, "close the review tab")
+    p.add_argument("--quit", action="store_true", help="also drop its buffers if nothing is unsaved")
+    args = parser.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()

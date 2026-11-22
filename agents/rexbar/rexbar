@@ -1,0 +1,1386 @@
+#!/usr/bin/env python3
+"""rexbar: a status bar for a Rex tab, in a thin pane along its bottom.
+
+  rexbar run    --session S [--window W] [--fit] [--fit-rows N]
+  rexbar once   --session S [--width N] [--rows N] [--no-color]
+  rexbar open   --session S --window W [--block B]
+  rexbar close  --session S --window W [--block B]
+  rexbar toggle --session S --window W [--block B]
+  rexbar fit    --session S --window W [--block B]
+
+The bar shows, left to right: the ticket (or "scratch"), done/total goals, a
+blocked marker and the deepest `doing` goal; a history strip of coloured cells
+(pictures, goal status changes, reviews, promote, land), newest at the right;
+the session's agents by state; plan usage (5-hour, weekly) and the main agent's
+model and context when rexboard has them.
+
+`run` and `once` only read the session, except `<session dir>/bar/`, where the
+bar keeps objectives-log.json (goal and review changes it has seen). `open`,
+`close`, `toggle` and `fit` print one line of JSON.
+
+--session must be a Rex session id (hex and dashes, optional "session:").
+Without --session, $REX_SESSION is used only if Rex knows that session.
+"""
+import argparse
+import fcntl
+import json
+import os
+import re
+import select
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import unicodedata
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+STATE = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "rexwork" / "sessions"
+CACHE = Path(os.environ.get("REXBAR_CACHE")
+             or Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "rexbar" / "ai-usage.json")
+# A pane's command may start without the login shell's PATH, so every tool is
+# found on a PATH built here, and subprocesses get the same PATH.
+TOOL_DIRS = [str(Path.home() / ".local/bin"), str(Path.home() / ".cargo/bin"), "/opt/homebrew/bin",
+             "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"]
+PATH = os.pathsep.join(d for d in dict.fromkeys(TOOL_DIRS + os.environ.get("PATH", "").split(os.pathsep)) if d)
+
+
+def tool(name, env, default):
+    return os.environ.get(env) or shutil.which(name, path=PATH) or default
+
+
+AI_USAGE = tool("ai-usage", "REXBAR_AI_USAGE", str(Path.home() / ".cargo/bin/ai-usage"))
+REXBOARD = tool("rexboard", "REXBAR_REXBOARD", "/opt/homebrew/bin/rexboard")
+REX = tool("rex", "REXBAR_REX", "/opt/homebrew/bin/rex")
+SHELL_FLAVOR = "com.superlogical.terminal.shell"
+LABEL = "Bar"
+# Rex's app gives a tiled pane at least 3 rows (a smaller ratio still yields 3),
+# so 3 is the target: status, history, agents.
+TARGET_ROWS = 3
+DEFAULT_TAB_ROWS = 50      # used when Rex cannot report real pane sizes
+USAGE_TTL = 60             # seconds between ai-usage runs
+BOARD_TTL = 4              # seconds between rexboard runs
+LOG_MAX = 500              # events kept in objectives-log.json
+STATUSES = ("todo", "doing", "done", "blocked")
+
+
+def fail(message, code=1):
+    print(f"rexbar: {message}", file=sys.stderr)
+    sys.exit(code)
+
+
+ERRORS = []  # (time, message) of failed source runs, newest last
+
+
+def note_error(message):
+    ERRORS.append((time.time(), message))
+    del ERRORS[:-20]
+
+
+def run(args, timeout=20):
+    env = {**os.environ, "PATH": PATH}
+    try:
+        return subprocess.run(args, capture_output=True, text=True, timeout=timeout,
+                              stdin=subprocess.DEVNULL, env=env)
+    except FileNotFoundError:
+        return subprocess.CompletedProcess(args, 127, "", f"{args[0]}: not found")
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(args, 124, "", f"{args[0]}: timed out after {timeout}s")
+    except OSError as e:
+        return subprocess.CompletedProcess(args, 126, "", str(e))
+
+
+# ---- state files --------------------------------------------------------------
+
+SESSION_ID = re.compile(r"^[0-9a-fA-F-]{8,64}$")
+
+
+def session_dir(session):
+    """The session's state dir, or None if the id is not a plain Rex session id."""
+    sid = session[len("session:"):] if session.startswith("session:") else session
+    if not SESSION_ID.match(sid):
+        return None
+    root = STATE.resolve()
+    directory = (root / sid).resolve()
+    if directory.parent != root or directory.name != sid:
+        return None
+    return directory
+
+
+def read_json(path, default):
+    try:
+        data = json.loads(Path(path).read_text())
+    except (OSError, ValueError):
+        return default
+    return data if isinstance(data, type(default)) else default
+
+
+def write_json(path, data):
+    """Atomic write through a uniquely named temp file in the same directory."""
+    fd, tmp = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(json.dumps(data, indent=2) + "\n")
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+class Lock:
+    """flock on a file; opened for append so it is never truncated."""
+
+    def __init__(self, path):
+        self.path = path
+
+    def __enter__(self):
+        self.f = open(self.path, "a")
+        fcntl.flock(self.f, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *exc):
+        fcntl.flock(self.f, fcntl.LOCK_UN)
+        self.f.close()
+
+
+def mtime(path):
+    try:
+        return Path(path).stat().st_mtime_ns
+    except OSError:
+        return None
+
+
+# ---- objectives -----------------------------------------------------------------
+
+OBJ_LINE = re.compile(r"^(?P<indent>[ \t]*)[-*+][ \t]+(?:\[[ xX]\][ \t]+)?(?P<status>[A-Za-z]+)[ \t]*:[ \t]*(?P<text>.*)$")
+
+
+def parse_objectives(text):
+    """Goals as dicts {status, text, depth, path}, in file order.
+
+    Only `- status: text` lines with a known status count. Depth comes from the
+    indent (a tab is 4 spaces); `path` joins the parents' texts so a goal is
+    keyed by where it sits as well as what it says.
+    """
+    items, stack = [], []  # stack: (indent, text)
+    for line in text.splitlines():
+        m = OBJ_LINE.match(line)
+        if not m:
+            continue
+        status = m.group("status").lower()
+        if status not in STATUSES:
+            continue
+        indent = len(m.group("indent").replace("\t", "    "))
+        body = m.group("text").strip()
+        while stack and stack[-1][0] >= indent:
+            stack.pop()
+        path = " / ".join([t for _, t in stack] + [body])
+        items.append({"status": status, "text": body, "depth": len(stack), "path": path})
+        stack.append((indent, body))
+    return items
+
+
+def summarize_objectives(items):
+    doing = [i for i in items if i["status"] == "doing"]
+    deepest = max((i["depth"] for i in doing), default=-1)
+    current = [i for i in doing if i["depth"] == deepest]
+    return {
+        "total": len(items),
+        "done": sum(i["status"] == "done" for i in items),
+        "blocked": sum(i["status"] == "blocked" for i in items),
+        "doing": current[0]["text"] if current else None,
+        "doing_more": max(0, len(current) - 1),
+        "doing_path": current[0]["path"] if current else None,
+    }
+
+
+def clean(text):
+    """One display line: no markdown backticks, no control characters."""
+    text = (text or "").replace("`", "")
+    return "".join(" " if unicodedata.category(c)[0] == "C" else c for c in text).strip()
+
+
+# ---- the bar's own log ------------------------------------------------------------
+
+def update_log(directory, items, session, now=None):
+    """Append goal-status and review changes to bar/objectives-log.json.
+
+    The first time a source is seen it is only recorded as the baseline. items
+    is None when objectives.md could not be read, so a missing file never reads
+    as every goal removed. Returns the log.
+    """
+    now = int(now if now is not None else time.time())
+    bar = directory / "bar"
+    try:
+        bar.mkdir(exist_ok=True, mode=0o700)
+    except OSError:
+        return {"events": []}
+    path = bar / "objectives-log.json"
+    with Lock(bar / "lock"):
+        log = read_json(path, {})
+        events = log.get("events") if isinstance(log.get("events"), list) else []
+        changed = False
+        if items is not None:
+            snap = {i["path"]: i["status"] for i in items}
+            old = log.get("objectives")
+            if isinstance(old, dict):
+                for key, status in snap.items():
+                    if old.get(key) != status:
+                        text = key.rsplit(" / ", 1)[-1]
+                        events.append({"t": now, "kind": "objective", "status": status, "text": text,
+                                       "from": old.get(key)})
+                        changed = True
+            if old != snap:
+                log["objectives"] = snap
+                changed = True
+        reviews = session.get("last_reviewed") if isinstance(session, dict) else None
+        if isinstance(reviews, dict):
+            reviews = {str(k): str(v) for k, v in reviews.items()}
+            old = log.get("reviews")
+            if isinstance(old, dict):
+                for top, sha in reviews.items():
+                    if old.get(top) != sha:
+                        events.append({"t": now, "kind": "review", "text": f"{Path(top).name} at {sha[:8]}"})
+                        changed = True
+            if old != reviews:
+                log["reviews"] = reviews
+                changed = True
+        if changed:
+            log["events"] = events[-LOG_MAX:]
+            log["version"] = 1
+            write_json(path, log)
+        log.setdefault("events", events)
+        return log
+
+
+def collect_events(session, history, log):
+    """All history events, oldest first: {t, kind, text, status?}."""
+    events = []
+    for item in history.get("items", []) if isinstance(history, dict) else []:
+        if isinstance(item, dict) and isinstance(item.get("time"), (int, float)):
+            events.append({"t": item["time"], "kind": "picture", "text": str(item.get("title") or "picture")})
+    for e in log.get("events", []) if isinstance(log, dict) else []:
+        if isinstance(e, dict) and isinstance(e.get("t"), (int, float)) and e.get("kind") in ("objective", "review"):
+            events.append(e)
+    if isinstance(session, dict):
+        filing = session.get("filing") if isinstance(session.get("filing"), dict) else {}
+        promoted = session.get("promoted_at") or filing.get("at")
+        if isinstance(promoted, (int, float)):
+            events.append({"t": promoted, "kind": "promote",
+                           "text": f"promoted to {session.get('ticket') or filing.get('ticket') or 'ticket'}"})
+        if isinstance(session.get("landed_at"), (int, float)):
+            events.append({"t": session["landed_at"], "kind": "land", "text": "landed"})
+    events.sort(key=lambda e: e["t"])
+    return events
+
+
+# ---- external sources ---------------------------------------------------------------
+
+def board_rows(session_id, rows):
+    if not isinstance(rows, list):
+        return []
+    return [r for r in rows if isinstance(r, dict) and r.get("session_id") == session_id]
+
+
+def agent_summary(rows, main_block=None, window=None):
+    """Counts by state and the main agent's usage, from rexboard rows of one session."""
+    out = {"working": 0, "waiting": 0, "idle": 0, "sub": 0, "main": None}
+    for r in rows:
+        group, state = r.get("group"), r.get("state")
+        if r.get("stale"):
+            out["idle"] += 1
+        elif group == "working" or (group is None and state == "working"):
+            out["working"] += 1
+        elif group == "needs_you" or state in ("question", "permission"):
+            out["waiting"] += 1
+        else:
+            out["idle"] += 1
+        children = r.get("children")
+        if isinstance(children, dict):
+            out["sub"] += sum(v for k, v in children.items() if k == "working" and isinstance(v, int))
+    out["panes"] = agent_panes(rows, window)
+    with_usage = [r for r in rows if isinstance(r.get("usage"), dict)]
+    pick = [r for r in with_usage if r.get("block_id") == main_block] or \
+           [r for r in with_usage if window and r.get("window_id") == window] or with_usage
+    if pick:
+        pick.sort(key=lambda r: str(r.get("updated_at") or ""), reverse=True)
+        r = pick[0]
+        out["main"] = {"harness": r.get("harness"), **r["usage"]}
+    elif rows:
+        main = [r for r in rows if r.get("block_id") == main_block]
+        if main:
+            out["main"] = {"harness": main[0].get("harness")}
+    return out
+
+
+PANE_ORDER = {"needs_you": 0, "working": 1}
+
+
+def agent_panes(rows, window=None):
+    """One entry per agent pane, the ones that need Tal first, then working, then the rest;
+    within each, panes on the bar's own tab first, then the most recently updated."""
+    panes = []
+    for r in rows:
+        group = "idle" if r.get("stale") else r.get("group") or ("working" if r.get("state") == "working" else "idle")
+        if group not in PANE_ORDER:
+            group = "idle"
+        children = r.get("children") if isinstance(r.get("children"), dict) else {}
+        panes.append({
+            "group": group, "state": str(r.get("state") or ""),
+            "name": clean(str(r.get("title") or r.get("pane") or r.get("harness") or "agent")),
+            "msg": clean(str(r.get("msg") or "")),
+            "sub": sum(v for k, v in children.items() if k == "working" and isinstance(v, int)),
+            "here": bool(window) and r.get("window_id") == window,
+            "updated": str(r.get("updated_at") or ""),
+        })
+    panes.sort(key=lambda a: a["updated"], reverse=True)
+    panes.sort(key=lambda a: (PANE_ORDER.get(a["group"], 2), not a["here"]))
+    return panes
+
+
+def parse_usage(data):
+    """{provider: {"5h": pct, "wk": pct}} from `ai-usage status --json`."""
+    out = {}
+    for card in data.get("cards", []) if isinstance(data, dict) else []:
+        if not isinstance(card, dict):
+            continue
+        meters = {}
+        for m in card.get("meters", []) or []:
+            if not isinstance(m, dict) or not isinstance(m.get("used_percent"), (int, float)):
+                continue
+            label = str(m.get("label", "")).lower()
+            if "week" in label:
+                meters["wk"] = m["used_percent"]
+            elif "session" in label or "hour" in label or "5h" in label:
+                meters["5h"] = m["used_percent"]
+        if card.get("provider"):
+            out[str(card["provider"])] = meters
+    return out
+
+
+class UsageCache:
+    """ai-usage output cached in a file shared by every bar, refreshed at most every ttl s."""
+
+    def __init__(self, path=None, command=None, ttl=USAGE_TTL):
+        self.path = Path(path or CACHE)
+        self.command = command or [AI_USAGE, "status", "--json"]
+        self.ttl = ttl
+        self._busy = threading.Lock()
+
+    def read(self):
+        """(usage or None, age in s or None). Never runs anything."""
+        data = read_json(self.path, {})
+        at = data.get("fetched_at")
+        if not isinstance(at, (int, float)):
+            return None, None
+        usage = data.get("usage") if data.get("ok") else None
+        return usage, time.time() - at
+
+    def stale(self):
+        _, age = self.read()
+        return age is None or age >= self.ttl
+
+    def refresh(self, force=False):
+        """Run ai-usage if the cache is stale. Safe to call from a thread."""
+        if not force and not self.stale():
+            return
+        if not self._busy.acquire(blocking=False):
+            return
+        try:
+            r = run(self.command, timeout=20)
+            entry = {"fetched_at": time.time(), "ok": False}
+            if r.returncode != 0:
+                note_error(f"ai-usage: exit {r.returncode}: {(r.stderr or '').strip()[:200]}")
+            if r.returncode == 0:
+                try:
+                    entry = {"fetched_at": time.time(), "ok": True, "usage": parse_usage(json.loads(r.stdout))}
+                except ValueError:
+                    pass
+            try:
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                write_json(self.path, entry)
+            except OSError:
+                pass
+        finally:
+            self._busy.release()
+
+
+def fetch_board():
+    r = run([REXBOARD, "ls", "--json"], timeout=8)
+    if r.returncode != 0:
+        note_error(f"rexboard ls: exit {r.returncode}: {(r.stderr or '').strip()[:200]}")
+        return None
+    try:
+        return json.loads(r.stdout)
+    except ValueError:
+        note_error("rexboard ls: output is not JSON")
+        return None
+
+
+# ---- drawing --------------------------------------------------------------------
+
+COLORS = {
+    "picture": "35", "done": "32", "doing": "33", "blocked": "31", "todo": "90",
+    "review": "36", "promote": "34", "land": "94",
+}
+GLYPHS = {
+    "picture": "p", "done": "+", "doing": ">", "blocked": "!", "todo": ".",
+    "review": "r", "promote": "P", "land": "L",
+}
+CELL = "▮"  # ▮
+ELLIPSIS = "…"
+SEP = " │ "  # │
+
+
+def char_width(c):
+    if unicodedata.combining(c):
+        return 0
+    return 2 if unicodedata.east_asian_width(c) in ("W", "F") else 1
+
+
+def text_width(s):
+    return sum(char_width(c) for c in s)
+
+
+class Line:
+    """A row of styled spans: [(text, sgr or None)]."""
+
+    def __init__(self, spans=None):
+        self.spans = [s for s in (spans or []) if s[0]]
+
+    def add(self, text, style=None):
+        if text:
+            self.spans.append((text, style))
+        return self
+
+    def extend(self, other):
+        self.spans.extend(other.spans)
+        return self
+
+    def width(self):
+        return sum(text_width(t) for t, _ in self.spans)
+
+    def plain(self):
+        return "".join(t for t, _ in self.spans)
+
+    def truncate(self, width):
+        """At most width cells; a cut line ends with an ellipsis."""
+        if self.width() <= width:
+            return Line(list(self.spans))
+        if width <= 0:
+            return Line()
+        room, out = width - 1, []
+        for text, style in self.spans:
+            keep = ""
+            for c in text:
+                w = char_width(c)
+                if w > room:
+                    room = 0
+                    break
+                keep += c
+                room -= w
+            if keep:
+                out.append((keep, style))
+            if room <= 0 and keep != text:
+                break
+        # Drop trailing spaces before the ellipsis.
+        while out and out[-1][0].endswith(" "):
+            t, s = out[-1]
+            t = t.rstrip(" ")
+            out[-1] = (t, s)
+            if not t:
+                out.pop()
+        out.append((ELLIPSIS, "2"))
+        return Line(out)
+
+    def render(self, color=True):
+        if not color:
+            return self.plain()
+        parts = []
+        for text, style in self.spans:
+            parts.append(f"\x1b[{style}m{text}\x1b[0m" if style else text)
+        return "".join(parts)
+
+
+def ago(seconds):
+    seconds = max(0, int(seconds))
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m"
+    if seconds < 86400:
+        return f"{seconds // 3600}h"
+    return f"{seconds // 86400}d"
+
+
+def event_key(e):
+    return e.get("status") if e.get("kind") == "objective" else e.get("kind")
+
+
+def strip_line(events, width, color=True):
+    """The newest events that fit in width cells, oldest dropped; a leading … marks the cut."""
+    if width <= 0 or not events:
+        return Line()
+    shown = events if len(events) <= width else events[-(width - 1):] if width > 1 else []
+    line = Line()
+    if len(shown) < len(events):
+        line.add(ELLIPSIS, "2")
+    for e in shown:
+        key = event_key(e) or "todo"
+        line.add(CELL if color else GLYPHS.get(key, "?"), COLORS.get(key))
+    # Merge neighbouring spans of the same style to keep the output short.
+    merged = []
+    for text, style in line.spans:
+        if merged and merged[-1][1] == style:
+            merged[-1] = (merged[-1][0] + text, style)
+        else:
+            merged.append((text, style))
+    return Line(merged)
+
+
+def pct_style(p):
+    return "31" if p >= 80 else "33" if p >= 50 else None
+
+
+def fmt_pct(p):
+    return f"{p:.0f}%" if isinstance(p, (int, float)) else "–"
+
+
+def id_parts(model):
+    """(fixed head, shrinkable objective) for the ticket segment."""
+    session, obj = model["session"], model["objectives"]
+    head = Line()
+    ticket = session.get("ticket") if isinstance(session, dict) else None
+    head.add(str(ticket) if ticket else "scratch", "1")
+    if obj["total"]:
+        head.add(f" {obj['done']}/{obj['total']}", "2")
+    if obj["blocked"]:
+        head.add(f" !{obj['blocked']} blocked", "1;31")
+    tail = Line()
+    if obj["doing"]:
+        tail.add(" ▸ ", "33").add(clean(obj["doing"]))
+        if obj["doing_more"]:
+            tail.add(f" +{obj['doing_more']}", "2")
+    return head, tail
+
+
+def agents_line(agents, compact=False):
+    """Agents by state. compact: `w1 y1 i2 +4` (working, need you, idle, subagents)."""
+    line = Line()
+    if agents is None:
+        return line.add("agents –", "2")
+    parts = [("working", "33", "w"), ("waiting", "1;35", "y"), ("idle", "2", "i")]
+    first = True
+    for key, style, short in parts:
+        if agents[key]:
+            word = f"{short}{agents[key]}" if compact else \
+                f"{agents[key]} {key if key != 'waiting' else 'need you'}"
+            line.add("" if first else " ").add(word, style)
+            first = False
+    if agents["sub"]:
+        line.add(" +").add(f"{agents['sub']}" if compact else f"{agents['sub']} sub", "33")
+    if first and not agents["sub"]:
+        line.add("no agents", "2")
+    return line
+
+
+def usage_line(usage, harness=None, compact=False):
+    """Plan usage, the main agent's provider first. compact: that provider only."""
+    line = Line()
+    if not usage:
+        return line.add("5h – wk –", "2")
+    order = ["codex", "claude"] if harness == "codex" else ["claude", "codex"]
+    if compact:
+        order = [p for p in order if p in usage][:1]
+    first = True
+    for provider in order:
+        meters = usage.get(provider)
+        if meters is None:
+            continue
+        if not first:
+            line.add(" ")
+            line.add("cx " if provider == "codex" else "cl ", "2")
+        five, week = meters.get("5h"), meters.get("wk")
+        if first or five is not None:
+            line.add("5h ", "2").add(fmt_pct(five), pct_style(five) if five is not None else "2")
+            line.add(" ")
+        line.add("wk ", "2").add(fmt_pct(week), pct_style(week) if week is not None else "2")
+        first = False
+    return line if not first else line.add("5h – wk –", "2")
+
+
+def model_line(main):
+    line = Line()
+    if not main:
+        return line
+    name = main.get("model_display") or main.get("model")
+    if name:
+        line.add(str(name), "36")
+        if main.get("effort"):
+            line.add(f" {main['effort']}", "2")
+    ctx = main.get("ctx_pct")
+    if isinstance(ctx, (int, float)):
+        line.add(" ctx " if name else "ctx ", "2").add(f"{ctx:.0f}%", pct_style(ctx))
+    tok = main.get("tok")
+    if isinstance(tok, (int, float)) and tok:
+        line.add(f" {tok / 1000:.0f}k tok" if tok < 10 ** 6 else f" {tok / 10 ** 6:.1f}M tok", "2")
+    return line
+
+
+PANE_STYLE = {"needs_you": ("need you", "1;35"), "working": ("working", "33"), "idle": ("idle", "2")}
+
+
+def panes_line(panes, width):
+    """Each agent pane: state, name (cut to 20 cells), message. The first pane, the
+    one most likely to need Tal, gets half the row; the rest share the other half."""
+    line = Line()
+    if not panes:
+        return line.add("no agent panes in this session", "2")
+    for i, a in enumerate(panes):
+        if len(panes) == 1:
+            share = width
+        elif i == 0:
+            share = max(24, width // 2)
+        else:
+            share = max(20, (width - width // 2) // min(len(panes) - 1, 2))
+        word, style = PANE_STYLE.get(a["group"], ("idle", "2"))
+        if a["group"] == "idle" and a["state"] in ("done", "unknown"):
+            word = a["state"]
+        item = Line().add(word, style).add(" ").extend(Line([(a["name"], "1")]).truncate(20))
+        if a["sub"]:
+            item.add(f" +{a['sub']}", "33")
+        if a["msg"]:
+            item.add(": ", "2").add(a["msg"])
+        if i:
+            line.add(SEP, "2")
+        line.extend(item.truncate(share - (text_width(SEP) if i else 0)))
+        if line.width() >= width:
+            break
+    return line
+
+
+def path_line(path):
+    """The current goal's parents, outermost first."""
+    line = Line()
+    if not path:
+        return line
+    parts = path.split(" / ")
+    for i, part in enumerate(parts):
+        if i:
+            line.add(" \u203a ", "2")
+        line.add(clean(part), "33" if i == len(parts) - 1 else None)
+    return line
+
+
+def join(*lines, sep=SEP):
+    out = Line()
+    for line in lines:
+        if not line.spans:
+            continue
+        if out.spans:
+            out.add(sep, "2")
+        out.extend(line)
+    return out
+
+
+def fit_id(head, tail, room, min_tail=12):
+    """The ticket segment in at most room cells, cutting the goal text first."""
+    full = Line(head.spans + tail.spans)
+    if full.width() <= room:
+        return full
+    keep = max(room - head.width(), min(min_tail, tail.width()))
+    return Line(head.spans + tail.truncate(keep).spans).truncate(room)
+
+
+def compose(model, width, rows, color=True, now=None):
+    """The frame as a list of `rows` Line objects."""
+    now = now if now is not None else time.time()
+    width, rows = max(1, int(width)), max(1, int(rows))
+    head, tail = id_parts(model)
+    main = (model["agents"] or {}).get("main")
+    mline = model_line(main)
+    branch = Line()
+    if isinstance(model["session"], dict) and model["session"].get("branch"):
+        branch.add(str(model["session"]["branch"]), "2")
+    events = model["events"]
+    right = join(agents_line(model["agents"]), usage_line(model["usage"], (main or {}).get("harness")),
+                 mline, branch)
+    # When the full status would squeeze the goal below ~24 cells, use short forms.
+    if width - right.width() - head.width() < 24 + (len(events) + 3 if rows == 1 else 0):
+        right = join(agents_line(model["agents"], compact=True),
+                     usage_line(model["usage"], (main or {}).get("harness"), compact=True), mline)
+
+    if rows == 1:
+        sep_w = text_width(SEP)
+        avail = width - right.width() - (sep_w if right.spans else 0)
+        id_full = head.width() + tail.width()
+        strip_want = len(events) + (sep_w if events else 0)
+        if id_full + strip_want <= avail:
+            id_room = id_full
+        else:
+            id_room = max(min(id_full, head.width() + 12), avail - min(strip_want, 8 + sep_w))
+        ident = fit_id(head, tail, id_room)
+        strip_room = avail - ident.width() - sep_w
+        strip = strip_line(events, min(strip_room, len(events) + 1), color) if strip_room > 0 else Line()
+        line = join(ident, strip, right)
+        return [line.truncate(width)]
+
+    # Two or more rows: identity and status on top, history underneath.
+    sep_w = text_width(SEP)
+    ident = fit_id(head, tail, max(width - right.width() - sep_w, head.width() + 12))
+    top = join(ident, right).truncate(width)
+    strip_w = min(len(events), max(0, min(width - 2, max(width * 2 // 3, width - 40))))
+    bottom = strip_line(events, strip_w, color)
+    if events:
+        last = events[-1]
+        label = last.get("kind") if last.get("kind") != "objective" else last.get("status")
+        bottom.add("  ").add(f"{label}: ", COLORS.get(event_key(last)))
+        bottom.add(clean(last.get("text", ""))).add(f" {ago(now - last['t'])} ago", "2")
+    else:
+        bottom.add("no history yet", "2")
+    out = [top, bottom.truncate(width)]
+    if rows >= 3:
+        out.append(panes_line((model["agents"] or {}).get("panes") or [], width).truncate(width)
+                   if model["agents"] is not None else Line().add("agents \u2013", "2"))
+    if rows >= 4:
+        out.append(path_line(model["objectives"].get("doing_path")).truncate(width))
+    return out + [Line() for _ in range(rows - len(out))]
+
+
+# ---- the model --------------------------------------------------------------------
+
+class Source:
+    """Reads the session's files again only when their mtimes change."""
+
+    def __init__(self, directory, write_log=True):
+        self.directory = directory
+        self.write_log = write_log
+        self.stamps = None
+        self.session, self.history, self.objectives, self.log = {}, {}, None, {"events": []}
+
+    def paths(self):
+        d = self.directory
+        return [d / "session.json", d / "objectives.md", d / "show" / "history.json",
+                d / "bar" / "objectives-log.json"]
+
+    def poll(self):
+        """True if anything changed since the last poll."""
+        if self.directory is None:
+            return False
+        stamps = [mtime(p) for p in self.paths()]
+        if stamps == self.stamps:
+            return False
+        self.stamps = stamps
+        d = self.directory
+        self.session = read_json(d / "session.json", {})
+        self.history = read_json(d / "show" / "history.json", {})
+        try:
+            self.objectives = parse_objectives((d / "objectives.md").read_text(errors="replace"))
+        except OSError:
+            self.objectives = None
+        if self.write_log and d.is_dir():
+            try:
+                self.log = update_log(d, self.objectives, self.session)
+            except OSError:
+                self.log = read_json(d / "bar" / "objectives-log.json", {"events": []})
+        else:
+            self.log = read_json(d / "bar" / "objectives-log.json", {"events": []})
+        self.stamps = [mtime(p) for p in self.paths()]
+        return True
+
+    def model(self, board, usage, session_id, window=None):
+        rows = board_rows(session_id, board) if board is not None else None
+        main_block = self.session.get("main_block") if isinstance(self.session, dict) else None
+        return {
+            "session": self.session,
+            "objectives": summarize_objectives(self.objectives or []),
+            "events": collect_events(self.session, self.history, self.log),
+            "agents": agent_summary(rows, main_block, window) if rows is not None else None,
+            "usage": usage,
+        }
+
+
+# ---- Rex ----------------------------------------------------------------------------
+
+def rex(*args, timeout=20):
+    """Run rex and return parsed JSON; raises RuntimeError on failure."""
+    out = run([REX, *args], timeout=timeout)
+    if out.returncode != 0:
+        raise RuntimeError(f"rex {' '.join(args[:3])}: {(out.stderr or out.stdout).strip()}")
+    try:
+        return json.loads(out.stdout) if out.stdout.strip() else {}
+    except ValueError:
+        return {}
+
+
+def api(method, payload):
+    return rex("api", "call", method, json.dumps(payload))
+
+
+def inspect(session):
+    return rex("session", "inspect", session, "--json")
+
+
+def find_window(view, window_id):
+    for w in view.get("windows", []) if isinstance(view, dict) else []:
+        if w.get("window_id") == window_id:
+            return w
+    return None
+
+
+def tiled_layer(window):
+    for layer in window.get("layers", []):
+        if layer.get("kind") == "tiled":
+            return layer
+    return None
+
+
+def walk(node, out=None):
+    """Leaves of a layout node as (block_id, rect)."""
+    out = [] if out is None else out
+    if not isinstance(node, dict):
+        return out
+    if node.get("block_id"):
+        out.append((node["block_id"], node.get("rect") or [0, 0, 1, 1]))
+    split = node.get("split")
+    if isinstance(split, dict):
+        walk(split.get("before"), out)
+        walk(split.get("after"), out)
+    return out
+
+
+def find_bar(window, recorded=None):
+    """The recorded bar block if it is still a tiled pane of this tab, else None.
+
+    A pane is never taken as the bar by its label: a pane someone else labelled
+    "Bar" is not rexbar's to close or resize.
+    """
+    layer = tiled_layer(window) if window else None
+    if not layer or not recorded:
+        return None
+    blocks = {b.get("block_id") for b in layer.get("blocks", [])}
+    return recorded if recorded in blocks else None
+
+
+class Unverified(RuntimeError):
+    """Rex or ps did not answer, so whether a pane is the bar is unknown. Retryable."""
+
+
+EX_TEMPFAIL = 75
+
+
+def process_args(pid):
+    """The command line of a local process; "" when no local process has that
+    pid (ps ran and found none: another host's process, or it exited); None when
+    ps itself failed."""
+    if not isinstance(pid, int):
+        return ""
+    r = run(["/bin/ps", "-o", "args=", "-p", str(pid)], timeout=5)
+    if r.returncode == 0:
+        return r.stdout.strip()
+    if r.returncode == 1 and not r.stdout.strip():
+        return ""
+    return None
+
+
+def runs_rexbar(session, block):
+    """Whether the block's foreground program is `rexbar run` for this session:
+    True, False (Rex answered and shows something else), or None (unknown:
+    the process query or ps failed)."""
+    try:
+        info = rex("block", "call", "-s", session, "-b", block, "process", timeout=8)
+    except RuntimeError:
+        return None
+    proc = info.get("foreground") or info.get("child") if isinstance(info, dict) else None
+    if not isinstance(proc, dict):
+        return False if isinstance(info, dict) and info else None
+    script = str(proc.get("script") or "")
+    if Path(script).name != "rexbar":
+        return False
+    args = process_args(proc.get("pid"))
+    if args is None:
+        return None
+    if not args:
+        return True  # not a local process (another host): the script is all Rex reports
+    words = args.split()
+    return "run" in words and session in words
+
+
+def owned_bar(session, window_id, directory, view=None, retry_delay=0.5):
+    """(bar block or None, view). The bar is the block recorded in bar/state.json
+    for this tab, still on the tab and still running `rexbar run`. A record whose
+    block is gone, or confirmed to run something else, is dropped, so `panes`
+    lists only live bars. When the check cannot be made (twice), the record is
+    kept and Unverified is raised, so nothing is created, closed or resized."""
+    view = view if view is not None else inspect(session)
+    window = find_window(view, window_id)
+    state_path = directory / "bar" / "state.json"
+    state = read_json(state_path, {})
+    panes = state.get("panes") if isinstance(state.get("panes"), dict) else {}
+    recorded = panes.get(window_id)
+    bar = find_bar(window, recorded)
+    if bar:
+        ours = runs_rexbar(session, bar)
+        if ours is None:
+            time.sleep(retry_delay)
+            ours = runs_rexbar(session, bar)
+        if ours is None:
+            raise Unverified(f"could not check that {bar} still runs rexbar (Rex or ps did not answer); "
+                             "nothing changed, try again")
+        if not ours:
+            bar = None
+    if recorded and not bar:
+        panes.pop(window_id, None)
+        state["panes"] = panes
+        if state_path.parent.is_dir():
+            write_json(state_path, state)
+    return bar, view
+
+
+def bar_split(layer, bar):
+    """(split node, before-side block) when bar is the after side of the layer's top split."""
+    root = layer.get("layout") or {}
+    split = root.get("split")
+    if not isinstance(split, dict) or split.get("direction") != "vertical":
+        return None, None
+    if (split.get("after") or {}).get("block_id") != bar:
+        return None, None
+    leaves = walk(split.get("before"))
+    return (split, leaves[0][0]) if leaves else (None, None)
+
+
+def terminal_size(session, block):
+    """(rows, owned) for a terminal block; owned is False when no app sizes it."""
+    try:
+        r = api("com.superlogical.terminal.size", {"session_id": session, "block_id": block})
+    except RuntimeError:
+        return None, False
+    rows = r.get("rows") if isinstance(r.get("rows"), int) else None
+    return rows, bool(r.get("owner"))
+
+
+def tab_rows(session, layer, exclude=None):
+    """Estimated rows of the whole tab, from its tallest pane's real size."""
+    leaves = [(b, rect) for b, rect in walk(layer.get("layout") or {}) if b != exclude]
+    leaves.sort(key=lambda x: -(x[1][3] if len(x[1]) == 4 else 0))
+    for block, rect in leaves[:2]:
+        rows, owned = terminal_size(session, block)
+        if rows and owned and len(rect) == 4 and rect[3] > 0:
+            return rows / rect[3]
+    return DEFAULT_TAB_ROWS
+
+
+def bar_fraction(rows_total, target=TARGET_ROWS):
+    """Fraction of the tab for the bar: target rows plus one row of pane chrome."""
+    return min(0.5, max(0.01, (target + 1) / max(rows_total, 1)))
+
+
+def resize(session, before, bar, fraction):
+    api("session.resize_pane", {"session_id": session, "direction": "vertical",
+                                "before_block_id": before, "after_block_id": bar,
+                                "ratio": round(1 - fraction, 4)})
+
+
+def fit(session, window_id, bar=None, target=TARGET_ROWS, own_rows=None, settle=0.4, tries=3):
+    """Size the bar to `target` rows. Returns a dict describing what it did.
+
+    The first guess comes from the tallest pane's rows. Then, when Rex reports
+    real sizes (an app shows the tab), it measures the bar and corrects the
+    fraction, a few times. The model is rows = fraction * tab_rows - 1 (one row
+    goes to the divider, as one column does between side-by-side panes), so the
+    correction is (target + 1) / (measured + 1).
+    """
+    view = inspect(session)
+    window = find_window(view, window_id)
+    if not window:
+        raise RuntimeError(f"{window_id} is not a tab of {session}")
+    layer = tiled_layer(window)
+    if not layer or not bar:
+        raise RuntimeError("no bar on this tab")
+    split, before = bar_split(layer, bar)
+    if not split:
+        raise RuntimeError("the bar is not the bottom of the tab's top split")
+    current = 1 - float(split.get("ratio", 0.95))
+    rows, owned = (own_rows, True) if own_rows else terminal_size(session, bar)
+    if owned and rows:
+        fraction = current * (target + 1) / (rows + 1) if rows != target else current
+    else:
+        fraction = bar_fraction(tab_rows(session, layer, exclude=bar), target)
+    fraction = min(0.5, max(0.01, fraction))
+    resize(session, before, bar, fraction)
+    measured = None
+    for _ in range(tries):
+        time.sleep(settle)
+        before_rows = measured
+        measured, owned = terminal_size(session, bar)
+        if not owned or not measured or measured == target:
+            break
+        if measured == before_rows or (measured > target and measured == rows):
+            break  # the app's minimum pane height: a smaller ratio changes nothing
+        fraction = min(0.5, max(0.01, fraction * (target + 1) / (measured + 1)))
+        resize(session, before, bar, fraction)
+    return {"block": bar, "ratio": round(1 - fraction, 4), "rows": measured, "sized_by_app": owned}
+
+
+def resolve_session(args):
+    """session:UUID from --session, or from $REX_SESSION when Rex knows it."""
+    session = args.session
+    if not session:
+        env = os.environ.get("REX_SESSION")
+        if env:
+            env = env if env.startswith("session:") else "session:" + env
+            try:
+                inspect(env)
+                session = env
+            except RuntimeError:
+                pass
+    if not session:
+        fail("pass --session (REX_SESSION is unset or names no live session)")
+    if not session.startswith("session:"):
+        session = "session:" + session
+    if session_dir(session) is None:
+        fail(f"invalid Rex session id: {session!r}")
+    return session
+
+
+def resolve_window(args, session, view=None, required=True):
+    window = args.window
+    if not window and args.block:
+        view = view or inspect(session)
+        block = args.block if args.block.startswith("block:") else "block:" + args.block
+        for w in view.get("windows", []):
+            if any(b.get("block_id") == block for layer in w.get("layers", []) for b in layer.get("blocks", [])):
+                window = w["window_id"]
+    if window and not window.startswith("window:"):
+        window = "window:" + window
+    if required and not window:
+        fail("pass --window (or --block of a pane on that tab)")
+    return window
+
+
+def bar_command(session, window):
+    return [sys.executable, str(HERE / "rexbar"), "run", "--session", session, "--window", window, "--fit"]
+
+
+def open_bar(session, window_id, directory, settle=0.6):
+    """Create (or find) the bar on a tab. Call with the session lock held."""
+    view = inspect(session)
+    window = find_window(view, window_id)
+    if not window:
+        raise RuntimeError(f"{window_id} is not a tab of {session}")
+    layer = tiled_layer(window)
+    if not layer:
+        raise RuntimeError(f"{window_id} has no tiled panes")
+    bar_dir = directory / "bar"
+    bar_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    bar, _ = owned_bar(session, window_id, directory, view)
+    state_path = bar_dir / "state.json"
+    state = read_json(state_path, {})
+    panes = state.get("panes") if isinstance(state.get("panes"), dict) else {}
+    created = False
+    if not bar:
+        root = layer.get("layout") or {}
+        anchor = (root.get("split") or {}).get("split_id") or root.get("block_id")
+        if not anchor:
+            raise RuntimeError("cannot find the tab's layout root")
+        rows_total = tab_rows(session, layer)
+        fraction = bar_fraction(rows_total)
+        result = api("session.new_split", {
+            "session_id": session, "anchor_id": anchor, "direction": "vertical", "side": "after",
+            "ratio": round(1 - fraction, 4), "focus": False,
+            "layout": {"block": {"flavor": SHELL_FLAVOR, "label": LABEL, "options": {
+                "command": bar_command(session, window_id), "cwd": str(directory)}}},
+        })
+        bar = (result.get("block_ids") or [None])[0]
+        if not bar:
+            raise RuntimeError("rex did not return the new block")
+        created = True
+    panes[window_id] = bar
+    state["panes"] = panes
+    state["session"] = session
+    write_json(state_path, state)
+    sizing = None
+    try:
+        if created and settle:
+            time.sleep(settle)  # the app re-balances a new split on the tab it shows
+        sizing = fit(session, window_id, bar)
+    except RuntimeError as e:
+        sizing = {"error": str(e)}
+    return {"pane": bar, "window": window_id, "created": created, "fit": sizing}
+
+
+def close_bar(session, window_id, directory):
+    """Close the bar on a tab, if any. Call with the session lock held."""
+    bar, _ = owned_bar(session, window_id, directory)
+    if bar:
+        rex("block", "close", "-s", session, bar)
+    state_path = directory / "bar" / "state.json"
+    state = read_json(state_path, {})
+    panes = state.get("panes") if isinstance(state.get("panes"), dict) else {}
+    if window_id in panes:
+        panes.pop(window_id)
+        state["panes"] = panes
+        write_json(state_path, state)
+    return {"pane": bar, "window": window_id, "closed": bool(bar)}
+
+
+def session_lock(directory):
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    return Lock(directory / ".lock")
+
+
+def cmd_pane(args):
+    session = resolve_session(args)
+    directory = session_dir(session)
+    window = resolve_window(args, session)
+    try:
+        with session_lock(directory):
+            if args.command == "open":
+                out = open_bar(session, window, directory)
+            elif args.command == "close":
+                out = close_bar(session, window, directory)
+            elif args.command == "toggle":
+                if owned_bar(session, window, directory)[0]:
+                    out = {"action": "close", **close_bar(session, window, directory)}
+                else:
+                    out = {"action": "open", **open_bar(session, window, directory)}
+            else:  # fit
+                bar, _ = owned_bar(session, window, directory)
+                if not bar:
+                    raise RuntimeError("no bar of rexbar's on this tab")
+                out = fit(session, window, bar)
+    except Unverified as e:
+        fail(str(e), EX_TEMPFAIL)
+    except RuntimeError as e:
+        fail(str(e))
+    print(json.dumps(out))
+
+
+# ---- once / run ----------------------------------------------------------------------
+
+def size_of(stream):
+    try:
+        return os.get_terminal_size(stream.fileno())
+    except (OSError, ValueError, AttributeError):
+        return os.terminal_size((80, TARGET_ROWS))
+
+
+def paint(lines, columns):
+    """One frame: cursor home, then each row followed by erase-to-end-of-line.
+
+    compose() returns exactly one line per screen row, so nothing is erased
+    below. A row that fills the width gets no erase: with wrap off the cursor
+    sits on the last column, and erasing from there (EL or ED) would delete
+    the row's last cell.
+    """
+    rows = []
+    for line in lines:
+        text = line.render(True)
+        rows.append(text if line.width() >= columns else text + "\x1b[K")
+    return "\x1b[H" + "\r\n".join(rows)
+
+
+def log_errors(directory, seen):
+    """Append new source errors to bar/run.log (kept under 64 KB)."""
+    new = ERRORS[seen:]
+    if not new or directory is None or not (directory / "bar").is_dir():
+        return len(ERRORS)
+    path = directory / "bar" / "run.log"
+    try:
+        if path.exists() and path.stat().st_size > 65536:
+            path.write_text("")
+        with open(path, "a") as f:
+            for at, message in new:
+                f.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S', time.localtime(at))} pid {os.getpid()} {message}\n")
+    except OSError:
+        pass
+    return len(ERRORS)
+
+
+def frame_text(lines, color):
+    return "\n".join(line.render(color) for line in lines)
+
+
+def cmd_once(args):
+    session = resolve_session(args)
+    directory = session_dir(session)
+    source = Source(directory if directory.is_dir() else None)
+    source.poll()
+    cache = UsageCache()
+    if cache.stale():
+        cache.refresh()
+    usage, _ = cache.read()
+    board = fetch_board()
+    model = source.model(board, usage, session, args.window)
+    width = args.width or shutil.get_terminal_size((120, 2)).columns
+    rows = args.rows or 1
+    print(frame_text(compose(model, width, rows, color=not args.no_color), not args.no_color))
+
+
+class Ticker(threading.Thread):
+    """Runs fn every interval s in the background; wakes the main loop on change."""
+
+    def __init__(self, interval, fn, wake):
+        super().__init__(daemon=True)
+        self.interval, self.fn, self.wake = interval, fn, wake
+        self.value = None
+        self.first = threading.Event()  # set after the first run, whatever it returned
+
+    def run(self):
+        while True:
+            try:
+                value = self.fn()
+            except Exception:  # noqa: BLE001 - a source must never stop the bar
+                value = None
+            if value != self.value:
+                self.value = value
+                self.wake()
+            self.first.set()
+            time.sleep(self.interval)
+
+
+def cmd_run(args):
+    session = resolve_session(args)
+    directory = session_dir(session)
+    out = sys.stdout
+    rfd, wfd = os.pipe()
+    os.set_blocking(wfd, False)
+    os.set_blocking(rfd, False)
+
+    def wake(*_):
+        try:
+            os.write(wfd, b"x")
+        except OSError:
+            pass
+
+    signal.set_wakeup_fd(wfd)
+    signal.signal(signal.SIGWINCH, lambda *_: None)
+    stop = []
+    for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+        signal.signal(sig, lambda *_: stop.append(1))
+
+    cache = UsageCache()
+    board = Ticker(BOARD_TTL, fetch_board, wake)
+
+    def usage_fn():
+        cache.refresh()
+        return cache.read()[0]
+
+    usage = Ticker(USAGE_TTL / 4, usage_fn, wake)  # refresh() itself keeps to the TTL
+    usage.value = cache.read()[0]  # the cached numbers, even if stale, until the refresh
+    board.start()
+    usage.start()
+    # rexboard answers in tens of milliseconds; wait briefly so the first frame
+    # is not a placeholder (which Rex keeps in scrollback when the pane resizes).
+    board.first.wait(1.5)
+
+    fitter = {"last": 0.0, "tries": 0, "rows": None, "busy": False}
+
+    def maybe_fit(rows):
+        if not args.fit or fitter["busy"]:
+            return
+        if rows == args.fit_rows:
+            fitter["tries"] = 0
+            return
+        if rows != fitter["rows"]:
+            fitter["rows"], fitter["tries"] = rows, 0
+        if fitter["tries"] >= 3 or time.time() - fitter["last"] < 3:
+            return
+        fitter["tries"] += 1
+        fitter["last"] = time.time()
+        fitter["busy"] = True
+
+        def work():
+            try:
+                state = read_json(directory / "bar" / "state.json", {})
+                recorded = (state.get("panes") or {}).get(args.window) if isinstance(state.get("panes"), dict) else None
+                # Only the recorded bar resizes itself: a `rexbar run` started by
+                # hand in some other pane never moves a border.
+                block = os.environ.get("REX_BLOCK")
+                if not block or block != recorded:
+                    return
+                # Only an app that shows the tab sizes panes from the layout; a
+                # tab nobody shows keeps its default size, so there is nothing to fit.
+                if args.window and block and terminal_size(session, block)[1]:
+                    fit(session, args.window, block, target=args.fit_rows, own_rows=rows, tries=0)
+            except Exception:  # noqa: BLE001
+                pass
+            finally:
+                fitter["busy"] = False
+        threading.Thread(target=work, daemon=True).start()
+
+    source = Source(directory if directory.is_dir() else None)
+    out.write("\x1b[?25l\x1b[?7l\x1b[2J")
+    out.flush()
+    last, last_poll, last_size, logged = None, 0.0, None, 0
+    try:
+        while not stop:
+            now = time.time()
+            if now - last_poll >= 1:
+                source.poll()
+                last_poll = now
+            size = size_of(out)
+            if size != last_size:
+                if last_size is not None:
+                    out.write("\x1b[H\x1b[2J\x1b[3J")  # drop the old frame and its scrollback
+                last_size = size
+                last = None
+                maybe_fit(size.lines)
+            logged = log_errors(directory, logged)
+            model = source.model(board.value, usage.value, session, args.window)
+            lines = compose(model, size.columns, size.lines, color=True, now=now)
+            text = paint(lines, size.columns)
+            if text != last:
+                out.write(text)
+                out.flush()
+                last = text
+            ready, _, _ = select.select([rfd], [], [], 1.0)
+            if ready:
+                try:
+                    while os.read(rfd, 512):
+                        pass
+                except (BlockingIOError, OSError):
+                    pass
+    finally:
+        out.write("\x1b[0m\x1b[?7h\x1b[?25h")
+        out.flush()
+
+
+def main():
+    parser = argparse.ArgumentParser(prog="rexbar", description=__doc__.split("\n\n")[0])
+    sub = parser.add_subparsers(dest="command", required=True)
+    for name, text in [("run", "render the bar in this pane until killed"),
+                       ("once", "print one frame"),
+                       ("open", "create the bar pane on a tab"),
+                       ("close", "remove the bar pane from a tab"),
+                       ("toggle", "open or close the bar pane"),
+                       ("fit", "size the bar pane to its rows again")]:
+        p = sub.add_parser(name, help=text)
+        p.add_argument("--session", help="Rex session id (default: $REX_SESSION if Rex knows it)")
+        p.add_argument("--window", help="the tab (window id)")
+        if name == "once":
+            p.add_argument("--width", type=int, help="columns (default: the terminal's)")
+            p.add_argument("--rows", type=int, help="rows (default 1)")
+            p.add_argument("--no-color", action="store_true", help="plain text, letters for history cells")
+        if name == "run":
+            p.add_argument("--fit", action="store_true", help="resize the pane to --fit-rows when its height drifts")
+            p.add_argument("--fit-rows", type=int, default=TARGET_ROWS, help=f"rows to keep (default {TARGET_ROWS})")
+        if name in ("open", "close", "toggle", "fit"):
+            p.add_argument("--block", help="a pane on the tab, instead of --window")
+    args = parser.parse_args()
+    if args.command == "once":
+        cmd_once(args)
+    elif args.command == "run":
+        cmd_run(args)
+    else:
+        cmd_pane(args)
+
+
+if __name__ == "__main__":
+    main()

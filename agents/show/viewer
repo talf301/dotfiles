@@ -1,0 +1,283 @@
+#!/usr/bin/env python3
+"""The show pane: draws the session's current picture with Kitty graphics.
+
+  viewer DIR             follow DIR/history.json (the show pane)
+  viewer --single PNG    draw one picture; q or Esc quits (fallback for enlarge)
+
+Keys: h/Left/k/p previous, l/Right/j/n next, g first, G latest,
+Enter/z enlarge, r redraw, q quit.
+"""
+import base64
+import fcntl
+import json
+import os
+import select
+import shutil
+import signal
+import struct
+import subprocess
+import sys
+import termios
+import time
+import tty
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+SHOW = HERE / "show"
+IMAGE_ID = 4171
+ESC = "\033"
+
+
+def out(s):
+    os.write(sys.stdout.fileno(), s.encode() if isinstance(s, str) else s)
+
+
+def png_size(path):
+    try:
+        with open(path, "rb") as f:
+            head = f.read(24)
+    except OSError:
+        return None
+    if head[:8] != b"\x89PNG\r\n\x1a\n":
+        return None
+    return struct.unpack(">II", head[16:24])
+
+
+def cell_size(cols, rows):
+    """Pixels per cell, from the tty, else from Rex, else a guess."""
+    try:
+        r, c, xp, yp = struct.unpack("HHHH", fcntl.ioctl(1, termios.TIOCGWINSZ, b"\0" * 8))
+        if xp and yp and c and r:
+            return xp / c, yp / r
+    except OSError:
+        pass
+    session, block = os.environ.get("REX_SESSION"), os.environ.get("REX_BLOCK")
+    rex = shutil.which("rex")
+    if session and block and rex:
+        try:
+            info = json.loads(subprocess.run([rex, "block", "call", "-s", session, "-b", block, "size"],
+                                             capture_output=True, text=True, timeout=3).stdout)
+            if info.get("cell_width_px") and info.get("cell_height_px"):
+                return float(info["cell_width_px"]), float(info["cell_height_px"])
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            pass
+    return 10.0, 20.0
+
+
+def fit(cols, rows, cw, ch, iw, ih):
+    """Place an iw x ih px image in a cols x rows cell area with cw x ch px cells.
+
+    Returns (c, r, left, top): the box in cells and its offset, centred. The
+    image is scaled down to fit both dimensions, never up, and never cropped.
+    The box is whole cells, so its aspect matches the image to within half a
+    cell on the non-limiting side.
+    """
+    cols, rows = max(1, cols), max(1, rows)
+    sx, sy = cols * cw / iw, rows * ch / ih
+    if min(sx, sy) >= 1.0:  # fits at native size
+        c, r = round(iw / cw), round(ih / ch)
+    elif sx <= sy:  # width limits: all columns, rows from the aspect ratio
+        c, r = cols, round(cols * cw * ih / iw / ch)
+    else:  # height limits
+        c, r = round(rows * ch * iw / ih / cw), rows
+    c, r = min(cols, max(1, c)), min(rows, max(1, r))
+    return c, r, (cols - c) // 2, (rows - r) // 2
+
+
+def placement(cols, rows, cw, ch, iw, ih):
+    """The cursor move and Kitty placement keys for the picture area (rows above the footer)."""
+    c, r, left, top = fit(cols, rows - 1, cw, ch, iw, ih)
+    return f"{ESC}[{top + 1};{left + 1}H", f",c={c},r={r}"
+
+
+class Viewer:
+    def __init__(self, directory=None, single=None):
+        self.dir = Path(directory) if directory else None
+        self.single = single
+        self.items = []
+        self.index = -1
+        self.mtime = None
+        self.dirty = True
+        self.cell = None
+
+    # history
+
+    def load(self):
+        if self.single:
+            if not self.items:
+                self.items = [{"png": self.single, "title": Path(self.single).name}]
+                self.index = 0
+            return
+        path = self.dir / "history.json"
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            return
+        if mtime == self.mtime:
+            return
+        self.mtime = mtime
+        try:
+            items = json.loads(path.read_text()).get("items", [])
+        except (OSError, ValueError):
+            return
+        grew = len(items) > len(self.items)
+        self.items = items
+        if grew or self.index >= len(items):
+            self.index = len(items) - 1  # a new picture always comes to the front
+        self.dirty = True
+
+    def move(self, to):
+        if self.items:
+            to = max(0, min(len(self.items) - 1, to))
+            if to != self.index:
+                self.index = to
+                self.dirty = True
+
+    # drawing
+
+    def draw(self):
+        self.dirty = False
+        try:  # the tty itself, not $COLUMNS/$LINES, which may be inherited and stale
+            cols, rows = os.get_terminal_size(1)
+        except OSError:
+            cols, rows = 80, 24
+        if self.cell is None:
+            self.cell = cell_size(cols, rows)
+        cw, ch = self.cell
+        out(f"{ESC}_Ga=d,d=I,i={IMAGE_ID},q=2{ESC}\\{ESC}[2J{ESC}[H")
+        if not self.items:
+            self.footer(cols, rows, "Nothing shown yet. Run: show FILE")
+            return
+        item = self.items[self.index]
+        size = png_size(item["png"])
+        if not size:
+            self.footer(cols, rows, f"Cannot read {item['png']}")
+            return
+        # Both c and r are always given, so the terminal never sizes the image
+        # from its pixels (which can overflow the pane); fit() keeps the aspect.
+        move, place = placement(cols, rows, cw, ch, *size)
+        out(move)
+        data = base64.b64encode(Path(item["png"]).read_bytes()).decode()
+        chunks = [data[i:i + 4096] for i in range(0, len(data), 4096)] or [""]
+        buf = []
+        for n, chunk in enumerate(chunks):
+            more = 0 if n == len(chunks) - 1 else 1
+            if n == 0:
+                buf.append(f"{ESC}_Ga=T,f=100,i={IMAGE_ID},C=1{place},q=2,m={more};{chunk}{ESC}\\")
+            else:
+                buf.append(f"{ESC}_Gm={more};{chunk}{ESC}\\")
+        out("".join(buf))
+        self.footer(cols, rows, item.get("title") or Path(item["png"]).name)
+
+    def footer(self, cols, rows, title):
+        if self.single:
+            hints = "q close"
+            pos = ""
+        else:
+            hints = "h/l prev/next  enter enlarge  q close"
+            pos = f"{self.index + 1}/{len(self.items)}  " if self.items else ""
+        left = f" {pos}{title}"
+        room = cols - len(hints) - 2
+        if room < 12 and not self.single:
+            hints = "h l enter q"
+            room = cols - len(hints) - 2
+        if room < 8:
+            text = left[:cols]
+        else:
+            if len(left) > room:
+                left = left[:room - 1] + "~"
+            text = left + " " * (cols - len(left) - len(hints) - 1) + hints + " "
+        out(f"{ESC}[{rows};1H{ESC}[7m{text[:cols]}{ESC}[0m")
+
+    # keys
+
+    def enlarge(self):
+        if self.single or not self.items:
+            return
+        subprocess.Popen([sys.executable, str(SHOW), "--enlarge", "--index", str(self.index + 1)],
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def key(self, data):
+        """Handle input bytes; return False to quit."""
+        i = 0
+        while i < len(data):
+            rest = data[i:]
+            seq = None
+            for s in (b"\x1b[D", b"\x1b[C", b"\x1b[A", b"\x1b[B", b"\x1b[H", b"\x1b[F", b"\x1b[I", b"\x1b[O"):
+                if rest.startswith(s):
+                    seq = s
+                    break
+            if seq:
+                i += len(seq)
+                if seq in (b"\x1b[D", b"\x1b[A"):
+                    self.move(self.index - 1)
+                elif seq in (b"\x1b[C", b"\x1b[B"):
+                    self.move(self.index + 1)
+                elif seq == b"\x1b[H":
+                    self.move(0)
+                elif seq == b"\x1b[F":
+                    self.move(len(self.items) - 1)
+                elif seq == b"\x1b[I":
+                    self.dirty = True  # focus came back: redraw in case the client lost the image
+                continue
+            c = rest[:1]
+            i += 1
+            if c in (b"q", b"Q") or (c == b"\x1b" and self.single):
+                return False
+            if c in (b"h", b"k", b"p"):
+                self.move(self.index - 1)
+            elif c in (b"l", b"j", b"n", b" "):
+                self.move(self.index + 1)
+            elif c == b"g":
+                self.move(0)
+            elif c == b"G":
+                self.move(len(self.items) - 1)
+            elif c in (b"\r", b"\n", b"z", b"f"):
+                self.enlarge()
+            elif c in (b"r", b"\x0c"):
+                self.cell = None
+                self.dirty = True
+        return True
+
+    def run(self):
+        fd = sys.stdin.fileno()
+        saved = termios.tcgetattr(fd)
+        signal.signal(signal.SIGWINCH, lambda *_: setattr(self, "dirty", True) or setattr(self, "cell", None))
+        try:
+            tty.setraw(fd)
+            # Alternate screen, hidden cursor, focus reports.
+            out(f"{ESC}[?1049h{ESC}[?25l{ESC}[?1004h")
+            last_load = float("-inf")
+            while True:
+                now = time.monotonic()
+                if now - last_load > 0.3:
+                    self.load()
+                    last_load = now
+                if self.dirty:
+                    self.draw()
+                try:
+                    ready, _, _ = select.select([fd], [], [], 0.3)
+                except InterruptedError:
+                    continue
+                if ready:
+                    data = os.read(fd, 1024)
+                    if not data or not self.key(data):
+                        break
+        finally:
+            out(f"{ESC}_Ga=d,d=I,i={IMAGE_ID},q=2{ESC}\\{ESC}[?1004l{ESC}[?25h{ESC}[?1049l")
+            termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+
+
+def main():
+    args = sys.argv[1:]
+    if len(args) == 2 and args[0] == "--single":
+        Viewer(single=args[1]).run()
+    elif len(args) == 1:
+        Viewer(directory=args[0]).run()
+    else:
+        print(__doc__, file=sys.stderr)
+        sys.exit(2)
+
+
+if __name__ == "__main__":
+    main()

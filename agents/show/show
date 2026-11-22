@@ -1,0 +1,662 @@
+#!/usr/bin/env python3
+"""show: draw a picture in the show pane beside the calling Rex pane.
+
+  show FILE [--title T] [--session SESSION] [--block BLOCK]
+  show --enlarge [--index N] [--session SESSION] [--block BLOCK]
+  show --toggle [--session SESSION] [--block BLOCK]
+
+FILE is a PNG, JPEG/GIF/WebP, SVG, Mermaid file (.mmd, .mermaid), or a Markdown
+file holding a mermaid block (the first one is drawn). It is converted to PNG
+and added to the session's history. The show pane is a split to the right of
+the calling pane, labelled "Show"; it is created with --focus=false if the
+caller's tab has none. Focus never moves.
+
+--enlarge opens the current picture (or picture N) in a large floating pane on
+the show pane's tab. q or Esc closes it and focus returns to the pane that had it.
+A second --enlarge from the same tab replaces only the float show itself
+recorded in state.json for that tab; other tabs' enlarged pictures stay.
+
+--toggle closes the Show pane on the caller's tab if there is one, else opens it
+(--focus=false) on the latest picture.
+
+--session must be a Rex session id (hex and dashes, optional "session:"); any
+other value is refused before anything is written.
+
+Output is one line of JSON. State lives in
+~/.local/state/rexwork/sessions/<UUID>/show/.
+"""
+import argparse
+import fcntl
+import json
+import os
+import re
+import shutil
+import struct
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+VIEWER = HERE / "viewer"
+REX_VIEW = Path.home() / ".config/rex/extensions/plugins/rex-view/skills/rex-view/scripts/viewer"
+STATE = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "rexwork" / "sessions"
+SHELL_FLAVOR = "com.superlogical.terminal.shell"
+LABEL = "Show"
+ENLARGED_LABEL = "Show: enlarged"
+RATIO = "40"  # percent of the caller's width given to the show pane
+MMDC = shutil.which("mmdc") or str(Path.home() / ".local/bin/mmdc")
+MAGICK = shutil.which("magick")
+RASTER = {".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tif", ".tiff", ".heic"}
+
+
+def fail(message, code=1):
+    print(f"show: {message}", file=sys.stderr)
+    sys.exit(code)
+
+
+def run(args, timeout=60):
+    try:
+        return subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+    except FileNotFoundError:
+        return subprocess.CompletedProcess(args, 127, "", f"{args[0]}: not found")
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(args, 124, "", f"{args[0]}: timed out after {timeout}s")
+
+
+def rex(*args):
+    out = run(["rex", *args], timeout=20)
+    if out.returncode != 0:
+        fail(f"rex {' '.join(args[:3])}: {out.stderr.strip()}")
+    return json.loads(out.stdout) if out.stdout.strip() else {}
+
+
+# ---- conversion -------------------------------------------------------------
+
+def png_size(path):
+    with open(path, "rb") as f:
+        head = f.read(24)
+    if head[:8] != b"\x89PNG\r\n\x1a\n" or head[12:16] != b"IHDR":
+        return None
+    return struct.unpack(">II", head[16:24])
+
+
+def first_lines(text, n=4):
+    """The useful start of a tool's error output, without stack frames."""
+    keep = []
+    for line in text.strip().splitlines():
+        if re.match(r"\s+at |Parser\.", line):
+            break
+        if line.strip():
+            keep.append(line.rstrip())
+    return "\n".join(keep[:n]) or "no error output"
+
+
+def mermaid_to_png(src, out):
+    r = run([MMDC, "-i", str(src), "-o", str(out), "-s", "2", "-b", "white", "-q"], timeout=90)
+    if r.returncode != 0 or not out.exists():
+        raise ValueError("mermaid conversion failed:\n" + first_lines(r.stderr or r.stdout))
+
+
+def markdown_to_png(src, out, tmp):
+    text = src.read_text(errors="replace")
+    m = re.search(r"^[ \t]*(```|~~~)[ \t]*mermaid[^\n]*\n(.*?)^[ \t]*\1", text, re.S | re.M)
+    if not m:
+        raise ValueError(f"no mermaid block in {src}; only Markdown holding a mermaid block is supported")
+    mmd = tmp / "block.mmd"
+    mmd.write_text(m.group(2))
+    mermaid_to_png(mmd, out)
+
+
+SVG_ROOT = re.compile(r"<svg\b[^>]*>", re.S)
+UNITS = {"": 1.0, "px": 1.0, "pt": 4 / 3, "pc": 16.0, "in": 96.0, "cm": 96 / 2.54, "mm": 96 / 25.4}
+QL_SIZE = 2048  # qlmanage thumbnail edge in pixels
+
+
+def svg_attr(tag, name):
+    m = re.search(r"\s" + name + r"\s*=\s*([\"'])(.*?)\1", tag, re.S)
+    return m.group(2).strip() if m else None
+
+
+def svg_length(value):
+    m = re.fullmatch(r"([0-9]*\.?[0-9]+(?:[eE][-+]?[0-9]+)?)\s*([a-z]*)", value or "")
+    if not m or m.group(2) not in UNITS:
+        return None
+    n = float(m.group(1)) * UNITS[m.group(2)]
+    return n if n > 0 else None
+
+
+def svg_size(text):
+    """The SVG's own (width, height) in CSS px, from width/height or viewBox; None if unknown."""
+    m = SVG_ROOT.search(text)
+    if not m:
+        return None
+    tag = m.group(0)
+    w, h = svg_length(svg_attr(tag, "width")), svg_length(svg_attr(tag, "height"))
+    box = [float(x) for x in re.split(r"[\s,]+", svg_attr(tag, "viewBox") or "") if x][:4] \
+        if re.fullmatch(r"[-+0-9.eE\s,]+", svg_attr(tag, "viewBox") or "x") else []
+    if len(box) == 4 and box[2] > 0 and box[3] > 0:
+        if w and not h:
+            h = w * box[3] / box[2]
+        elif h and not w:
+            w = h * box[2] / box[3]
+        elif not w and not h:
+            w, h = box[2], box[3]
+    return (w, h) if w and h else None
+
+
+def square_svg(text):
+    """Wrap the SVG in a square canvas with the picture at the top left.
+
+    QuickLook draws an SVG on a square canvas and crops whatever does not
+    fit (a wide picture loses its right side). On a square canvas with an
+    explicit viewBox it scales by QL_SIZE / side, so the picture's region is
+    known exactly. Returns (wrapped_text, width, height, side) or None.
+    """
+    if re.search(r"<!DOCTYPE[^>]*\[", text):
+        return None  # internal DTD subset (entities): leave the file alone
+    size = svg_size(text)
+    if not size:
+        return None
+    w, h = size
+    side = max(w, h)
+    body = re.sub(r"<\?xml[^>]*\?>|<!DOCTYPE[^>]*>", "", text, count=2)
+    m = SVG_ROOT.search(body)
+    tag = re.sub(r"\s(?:width|height|x|y)\s*=\s*([\"']).*?\1", "", m.group(0), flags=re.S)
+    tag = tag[:4] + f' x="0" y="0" width="{w:g}" height="{h:g}"' + tag[4:]
+    inner = body[:m.start()] + tag + body[m.end():]
+    wrapped = (f'<svg xmlns="http://www.w3.org/2000/svg" width="{side:g}" height="{side:g}" '
+               f'viewBox="0 0 {side:g} {side:g}"><rect width="{side:g}" height="{side:g}" '
+               f'fill="#ffffff"/>{inner}</svg>')
+    return wrapped, w, h, side
+
+
+def quicklook_svg(src, out, tmp):
+    """Render through QuickLook at the SVG's own aspect ratio. True on success."""
+    wrapped = square_svg(src.read_text(errors="replace"))
+    if wrapped:
+        text, w, h, side = wrapped
+        staged = tmp / "square.svg"
+        staged.write_text(text)
+    else:
+        staged = src
+    run(["qlmanage", "-t", "-s", str(QL_SIZE), "-o", str(tmp), str(staged)])
+    thumb = tmp / (staged.name + ".png")
+    if not thumb.exists():
+        return False
+    if wrapped:
+        cw = min(QL_SIZE, round(w * QL_SIZE / side))
+        ch = min(QL_SIZE, round(h * QL_SIZE / side))
+        if MAGICK:
+            r = run([MAGICK, str(thumb), "-crop", f"{cw}x{ch}+0+0", "+repage", str(out)])
+        else:
+            r = run(["sips", "-c", str(ch), str(cw), "--cropOffset", "0", "0", str(thumb), "--out", str(out)])
+        if r.returncode == 0 and out.exists():
+            return True
+    elif MAGICK:
+        # Unknown size: trim the white canvas back to the picture.
+        r = run([MAGICK, str(thumb), "-trim", "+repage", "-bordercolor", "white", "-border", "24", str(out)])
+        if r.returncode == 0 and out.exists():
+            return True
+    shutil.move(str(thumb), str(out))
+    return True
+
+
+def svg_to_png(src, out, tmp):
+    """Prefer a real SVG renderer; macOS QuickLook (WebKit) is the built-in fallback.
+
+    ImageMagick's own SVG renderer (MSVG) fails on text and Mermaid's
+    foreignObject labels, so it is the last resort.
+    """
+    if shutil.which("resvg"):
+        r = run(["resvg", "--zoom", "2", str(src), str(out)])
+        if r.returncode == 0 and out.exists():
+            return
+    if shutil.which("rsvg-convert"):
+        r = run(["rsvg-convert", "--zoom", "2", "-b", "white", "-o", str(out), str(src)])
+        if r.returncode == 0 and out.exists():
+            return
+    if shutil.which("qlmanage"):
+        if quicklook_svg(src, out, tmp):
+            return
+    if MAGICK:
+        r = run([MAGICK, "-density", "192", "-background", "white", str(src), str(out)])
+        if r.returncode == 0 and out.exists():
+            return
+        raise ValueError("SVG conversion failed:\n" + first_lines(r.stderr))
+    raise ValueError("no SVG converter found (install one with: brew install resvg)")
+
+
+def raster_to_png(src, out):
+    r = run(["sips", "-s", "format", "png", str(src), "--out", str(out)])
+    if r.returncode == 0 and out.exists():
+        return
+    if MAGICK:
+        r = run([MAGICK, f"{src}[0]", str(out)])
+        if r.returncode == 0 and out.exists():
+            return
+    raise ValueError(f"cannot read this image: {src}\n" + first_lines(r.stderr))
+
+
+def convert(src, out):
+    """Write src as a PNG at out. Raises ValueError with a readable message."""
+    ext = src.suffix.lower()
+    with tempfile.TemporaryDirectory(prefix="show-") as t:
+        tmp = Path(t)
+        staged = tmp / "out.png"
+        if ext == ".png":
+            shutil.copyfile(src, staged)
+        elif ext in (".mmd", ".mermaid"):
+            mermaid_to_png(src, staged)
+        elif ext in (".md", ".markdown"):
+            markdown_to_png(src, staged, tmp)
+        elif ext == ".svg":
+            svg_to_png(src, staged, tmp)
+        elif ext in RASTER:
+            raster_to_png(src, staged)
+        else:
+            raise ValueError(f"unsupported file type {ext or '(none)'}: use PNG, JPEG, GIF, WebP, SVG, .mmd or .md")
+        size = png_size(staged)
+        if not size:
+            raise ValueError(f"conversion of {src} did not produce a PNG")
+        shutil.move(str(staged), str(out))
+        return size
+
+
+# ---- state ------------------------------------------------------------------
+
+SESSION_ID = re.compile(r"^[0-9a-fA-F-]{8,64}$")
+
+
+def session_dir(session):
+    """The session's state dir, or None if the id is not a plain Rex session id.
+
+    The id is checked before any path is built from it, and the result must be
+    a direct child of STATE, so --session can never point outside it.
+    """
+    sid = session[len("session:"):] if session.startswith("session:") else session
+    if not SESSION_ID.match(sid):
+        return None
+    root = STATE.resolve()
+    directory = (root / sid).resolve()
+    if directory.parent != root or directory.name != sid:
+        return None
+    return directory
+
+
+def show_dir(session):
+    directory = session_dir(session)
+    if directory is None:
+        fail(f"invalid Rex session id: {session!r}")
+    return directory / "show"
+
+
+def read_json(path, default):
+    try:
+        return json.loads(path.read_text())
+    except (OSError, ValueError):
+        return default
+
+
+def write_json(path, data):
+    """Atomic write through a uniquely named temp file in the same directory."""
+    fd, tmp = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(json.dumps(data, indent=2) + "\n")
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+class Lock:
+    def __init__(self, directory):
+        self.path = directory / "lock"
+
+    def __enter__(self):
+        self.f = open(self.path, "a")
+        fcntl.flock(self.f, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *exc):
+        fcntl.flock(self.f, fcntl.LOCK_UN)
+        self.f.close()
+
+
+# ---- panes ------------------------------------------------------------------
+
+def caller(args):
+    session = args.session or os.environ.get("REX_SESSION")
+    block = args.block or os.environ.get("REX_BLOCK")
+    if not session or not block:
+        fail("not in a Rex pane: pass --session and --block")
+    if not session.startswith("session:"):
+        session = "session:" + session
+    if not block.startswith("block:"):
+        block = "block:" + block
+    return session, block
+
+
+def window_of(view, block):
+    for window in view.get("windows", []):
+        for layer in window.get("layers", []):
+            if any(b.get("block_id") == block for b in layer.get("blocks", [])):
+                return window
+    return None
+
+
+def tiled_blocks(window):
+    for layer in window.get("layers", []):
+        if layer.get("kind") == "tiled":
+            for b in layer.get("blocks", []):
+                yield b
+
+
+class Unverified(Exception):
+    """The recorded Show pane exists but its program could not be queried."""
+
+
+RETRYABLE = 75  # EX_TEMPFAIL: the Show pane could not be verified; try again
+
+
+def query_viewer(session, block, directory):
+    """One ownership check: True (show's viewer), False (another program), None (query failed)."""
+    out = run(["rex", "block", "call", "-s", session, "-b", block, "process"], timeout=10)
+    if out.returncode != 0:
+        return None
+    try:
+        info = json.loads(out.stdout)
+    except ValueError:
+        return None
+    if not isinstance(info, dict):
+        return None
+    fg = info.get("foreground")
+    if not isinstance(fg, dict) or not fg.get("script") or not fg.get("cwd"):
+        return False  # answered: no program, or not a script
+    try:
+        return (Path(fg["script"]).resolve() == VIEWER.resolve()
+                and Path(fg["cwd"]).resolve() == Path(directory).resolve())
+    except (OSError, TypeError):
+        return False
+
+
+def runs_viewer(session, block, directory, retry_delay=0.3):
+    """query_viewer, retried once after a short pause if the first query failed."""
+    answer = query_viewer(session, block, directory)
+    if answer is None:
+        time.sleep(retry_delay)
+        answer = query_viewer(session, block, directory)
+    return answer
+
+
+def find_pane(view, window, state, session, directory):
+    """The Show pane this tab owns, or None.
+
+    Only the block recorded in state.json for this tab counts, and only while
+    it is a tiled block on the tab still running show's viewer on this
+    session's show dir. A pane merely labelled "Show" is never adopted.
+    Raises Unverified if the recorded block is on the tab but its program
+    could not be queried (twice), so nothing is created, closed or forgotten.
+    """
+    ids = {b["block_id"] for b in tiled_blocks(window)}
+    recorded = state.get("panes", {}).get(window["window_id"])
+    if not isinstance(recorded, str) or recorded not in ids:
+        return None
+    answer = runs_viewer(session, recorded, directory)
+    if answer is None:
+        raise Unverified(f"could not verify the Show pane {recorded}; try again")
+    return recorded if answer else None
+
+
+def ensure_pane(session, block, directory):
+    """Find or create the caller's Show pane. Call with the session Lock held."""
+    view = rex("session", "inspect", session, "--json")
+    window = window_of(view, block)
+    if not window:
+        fail(f"{block} is not in a tab of {session}")
+    state_path = directory / "state.json"
+    state = read_json(state_path, {})
+    pane = find_pane(view, window, state, session, directory)
+    created = False
+    if not pane:
+        result = rex("split", "-s", session, "-b", block, "--split=right", "--ratio", RATIO,
+                     "--label", LABEL, "--focus=false", "-c", str(directory), "--json",
+                     "--", sys.executable, str(VIEWER), str(directory))
+        pane = result["block_ids"][0]
+        created = True
+    state.setdefault("panes", {})[window["window_id"]] = pane
+    state["session"] = session
+    write_json(state_path, state)
+    return pane, window["window_id"], created
+
+
+# ---- commands ---------------------------------------------------------------
+
+def cmd_show(args):
+    src = Path(args.file).expanduser().resolve()
+    if not src.is_file():
+        fail(f"no such file: {src}")
+    session, block = caller(args)
+    directory = show_dir(session)
+    images = directory / "images"
+    images.mkdir(parents=True, exist_ok=True, mode=0o700)
+
+    # Convert outside the lock (it can take seconds), into a unique staging file.
+    fd, staged = tempfile.mkstemp(prefix=".staging-", suffix=".png", dir=images)
+    os.close(fd)
+    staged = Path(staged)
+    try:
+        try:
+            width, height = convert(src, staged)
+        except ValueError as e:
+            fail(str(e))
+        # One lock covers numbering, history, pane discovery, the split and
+        # state.json, so concurrent calls cannot both create a Show pane.
+        with Lock(directory):
+            history = read_json(directory / "history.json", {"items": []})
+            n = len(history["items"]) + 1
+            stem = re.sub(r"[^A-Za-z0-9._-]+", "-", src.stem)[:40] or "image"
+            out = images / f"{n:04d}-{stem}.png"
+            os.replace(staged, out)
+            history["items"].append({"png": str(out), "title": args.title or src.name, "source": str(src),
+                                     "width": width, "height": height, "time": int(time.time())})
+            write_json(directory / "history.json", history)
+            try:
+                pane, window, created = ensure_pane(session, block, directory)
+            except Unverified as e:
+                print(json.dumps({"image": str(out), "pane": None, "index": n, "count": n,
+                                  "created_pane": False, "error": str(e)}))
+                fail(f"picture {n} saved, but {e}", RETRYABLE)
+    finally:
+        if staged.exists():
+            staged.unlink()
+    print(json.dumps({"image": str(out), "pane": pane, "window": window, "index": n,
+                      "count": n, "created_pane": created}))
+
+
+def cmd_open_pane(args):
+    """Create (or find) the caller's Show pane without drawing anything."""
+    session, block = caller(args)
+    directory = show_dir(session)
+    (directory / "images").mkdir(parents=True, exist_ok=True, mode=0o700)
+    with Lock(directory):
+        if not (directory / "history.json").exists():
+            write_json(directory / "history.json", {"items": []})
+        try:
+            pane, window, created = ensure_pane(session, block, directory)
+        except Unverified as e:
+            fail(str(e), RETRYABLE)
+    print(json.dumps({"pane": pane, "window": window, "created_pane": created}))
+
+
+def cmd_toggle(args):
+    """Close the caller's Show pane if this tab has one; else open it on the latest picture."""
+    session, block = caller(args)
+    directory = show_dir(session)
+    (directory / "images").mkdir(parents=True, exist_ok=True, mode=0o700)
+    with Lock(directory):
+        if not (directory / "history.json").exists():
+            write_json(directory / "history.json", {"items": []})
+        view = rex("session", "inspect", session, "--json")
+        window = window_of(view, block)
+        if not window:
+            fail(f"{block} is not in a tab of {session}")
+        state_path = directory / "state.json"
+        state = read_json(state_path, {})
+        try:
+            pane = find_pane(view, window, state, session, directory)
+        except Unverified as e:
+            fail(str(e), RETRYABLE)
+        if pane:
+            rex("block", "close", "-s", session, pane)
+            state.setdefault("panes", {}).pop(window["window_id"], None)
+            write_json(state_path, state)
+            result = {"action": "closed", "pane": pane, "window": window["window_id"]}
+            if pane == block:
+                # Toggled from the Show pane itself: hand focus to the agent pane.
+                main = read_json(directory.parent / "session.json", {}).get("main_block")
+                tab = {b.get("block_id") for layer in window.get("layers", []) for b in layer.get("blocks", [])}
+                if isinstance(main, str) and main != pane and main in tab:
+                    run(["rex", "focus", "-s", session, main], timeout=10)
+                    result["focused"] = main
+        else:
+            try:
+                pane, window_id, _ = ensure_pane(session, block, directory)
+            except Unverified as e:
+                fail(str(e), RETRYABLE)
+            result = {"action": "opened", "pane": pane, "window": window_id}
+    print(json.dumps(result))
+
+
+def own_float(view, record, window_id):
+    """The layer id of show's own enlarge float on window_id, if it is still exactly that.
+
+    record is state["enlarge"][window_id]: the layer and block that show created
+    on that tab. Only that tab is searched. The layer must still exist, be
+    non-tiled, and hold only that block; anything else (a hand-made float with
+    the same label, a shared layer, another tab's float) is left alone.
+    """
+    if not isinstance(record, dict) or not record.get("layer") or not record.get("block"):
+        return None
+    for window in view.get("windows", []):
+        if window.get("window_id") != window_id:
+            continue
+        for layer in window.get("layers", []):
+            if layer.get("layer_id") != record["layer"]:
+                continue
+            blocks = [b.get("block_id") for b in layer.get("blocks", [])]
+            if layer.get("kind") != "tiled" and blocks == [record["block"]]:
+                return layer["layer_id"]
+            return None
+    return None
+
+
+def enlarge_records(state):
+    """state["enlarge"] as {window_id: record}, one enlarge float per tab.
+
+    An older state.json held a single record with its "window" inside; it is
+    read as that window's record.
+    """
+    records = state.get("enlarge")
+    if not isinstance(records, dict):
+        return {}
+    if "layer" in records:
+        window = records.get("window")
+        return {window: records} if isinstance(window, str) else {}
+    return {w: r for w, r in records.items() if isinstance(r, dict)}
+
+
+def cmd_enlarge(args):
+    session, block = caller(args)
+    directory = show_dir(session)
+    if not directory.is_dir():
+        fail("nothing shown yet in this session")
+    with Lock(directory):
+        enlarge(args, session, block, directory)
+
+
+def enlarge(args, session, block, directory):
+    items = read_json(directory / "history.json", {"items": []})["items"]
+    if not items:
+        fail("nothing shown yet in this session")
+    index = args.index or len(items)
+    if not 1 <= index <= len(items):
+        fail(f"index {index} is out of range 1..{len(items)}")
+    png = items[index - 1]["png"]
+
+    view = rex("session", "inspect", session, "--json")
+    window = window_of(view, block)
+    if not window:
+        fail(f"{block} is not in a tab of {session}")
+    # The float takes focus only on the tab being looked at, so a call from a
+    # background tab never switches tabs. Focus returns to the pane that had it.
+    focus = view.get("active_window_id") == window["window_id"]
+    back = (window.get("focused_block_id") or block) if focus else ""
+    state_path = directory / "state.json"
+    state = read_json(state_path, {})
+    record = enlarge_records(state).get(window["window_id"])
+    old = own_float(view, record, window["window_id"])
+    if old and back == record["block"]:
+        # Focus is in the float being replaced: return to where it would have.
+        back = record.get("returns_to") or block
+    if old:
+        run(["rex", "api", "call", "session.close_layer",
+             json.dumps({"session_id": session, "layer_id": old})])
+
+    if REX_VIEW.is_file():
+        draw = ["/bin/bash", str(REX_VIEW), png]
+    else:
+        draw = [sys.executable, str(VIEWER), "--single", png]
+    script = '"$@"; [ -z "$SHOW_BACK" ] || rex focus -s "$SHOW_SESSION" "$SHOW_BACK" >/dev/null 2>&1'
+    command = ["/usr/bin/env", f"SHOW_SESSION={session}", f"SHOW_BACK={back}",
+               "/bin/sh", "-c", script, "sh", *draw]
+    request = {
+        "session_id": session, "window_id": window["window_id"],
+        "bounds": [0.03, 0.03, 0.94, 0.94], "focus": focus,
+        "layout": {"block": {"flavor": SHELL_FLAVOR, "label": ENLARGED_LABEL, "options": {
+            "command": command, "cwd": str(directory), "exit": {"on_completion": True}}}},
+    }
+    layer = rex("api", "call", "session.new_layer", json.dumps(request))
+    state = read_json(state_path, {})
+    state["enlarge"] = enlarge_records(state)
+    state["enlarge"][window["window_id"]] = {"layer": layer["layer_id"],
+                                             "block": layer["block_ids"][0], "returns_to": back}
+    write_json(state_path, state)
+    print(json.dumps({"image": png, "index": index, "pane": layer["block_ids"][0],
+                      "layer": layer["layer_id"], "focused": focus, "returns_to": back or None}))
+
+
+def main():
+    parser = argparse.ArgumentParser(prog="show", description=__doc__.split("\n\n")[0],
+                                     epilog="Keys in the show pane: h/l or arrows prev/next, "
+                                            "g/G first/latest, Enter or z enlarge, r redraw, q close.")
+    parser.add_argument("file", nargs="?", help="PNG, JPEG, SVG, .mmd/.mermaid, or .md with a mermaid block")
+    parser.add_argument("--title", help="title in the footer (default: file name)")
+    parser.add_argument("--session", help="Rex session (default: $REX_SESSION)")
+    parser.add_argument("--block", help="calling pane (default: $REX_BLOCK)")
+    parser.add_argument("--enlarge", action="store_true", help="open a picture in a large float")
+    parser.add_argument("--index", type=int, help="with --enlarge: picture number, 1-based (default: latest)")
+    parser.add_argument("--open-pane", action="store_true",
+                        help="only create or find the caller's Show pane (used by rexwork start)")
+    parser.add_argument("--toggle", action="store_true",
+                        help="close the caller's Show pane, or reopen it on the latest picture")
+    args = parser.parse_args()
+    if args.toggle:
+        cmd_toggle(args)
+    elif args.open_pane:
+        cmd_open_pane(args)
+    elif args.enlarge:
+        cmd_enlarge(args)
+    elif args.file:
+        cmd_show(args)
+    else:
+        parser.error("give a FILE or --enlarge")
+
+
+if __name__ == "__main__":
+    main()

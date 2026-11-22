@@ -35,6 +35,14 @@
 - Correlate replies to the exact request and revision. After interruption, reconcile delivery and job state before retrying.
 - If an Inbox MCP tool is available, use it for Inbox messages and replies. Do not ask the same Inbox decision again through a blocking native question.
 
+## Show, track, offer
+
+- Show, don't describe. Any answer that explains how something works, how parts connect, what changed, a history, or "X vs Y" includes at least one picture: load the show-pictures skill, write a Mermaid or SVG file, and run `show FILE` from your Rex pane before you reply. A text sketch in the reply does not count. The picture appears in the Show pane beside you; no document. Documents for review still go through markdown-plans.
+- Keep `~/.local/state/rexwork/sessions/${REX_SESSION#session:}/objectives.md` current: nested goals, each a few words with a status (`todo`, `doing`, `done`, `blocked`). Update it when the plan changes or a goal completes.
+- When a reply recommends an action, weighs alternatives, or leaves Tal a decision or an obvious next step, its last lines are 1-3 numbered options, one line each (for example `1. Do it: merge main now`), so Tal can answer with one digit. A finished task with nothing to decide ends without options.
+- When Tal asks, or scratch work has grown to need a record, offer `rexwork promote` to turn the session into a Linear ticket; run it only after Tal agrees.
+- When Tal should review a diff, run `diffreview open`.
+
 ## Engineering quality
 
 - For a bug, reproduce the user-visible failure before changing code.

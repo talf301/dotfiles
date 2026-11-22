@@ -1,0 +1,10 @@
+#!/bin/sh
+# Claude Code status line. Always runs ai-usage (it records the plan limits Claude
+# passes on stdin), but prints nothing when this Rex session has a rexbar pane,
+# because the bar already shows the same numbers.
+out=$(/Users/tal/.cargo/bin/ai-usage claude-statusline)
+state="$HOME/.local/state/rexwork/sessions/${REX_SESSION#session:}/bar/state.json"
+if [ -n "$REX_SESSION" ] && grep -q '"block:' "$state" 2>/dev/null; then
+  exit 0
+fi
+printf '%s\n' "$out"

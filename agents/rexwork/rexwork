@@ -1,0 +1,2746 @@
+#!/usr/bin/env python3
+"""rexwork: start, promote and land a Rex session as one unit of work.
+
+  rexwork start --scratch NAME | --draft NAME | TAL-123 [options]
+  rexwork adopt [--name NAME]
+  rexwork promote [--template | --file | --recover | --clear-filing] [--draft FILE] [--repo PATH] [--dry-run]
+  rexwork land [--yes [--expect DIGEST]] [--keep] [--dry-run [--json]] [--no-pr] [--no-linear] [--linear-only]
+  rexwork release [TAL-123] [--yes] [--dry-run] [--force]
+  rexwork status [--json]
+  rexwork ls [--json]
+
+State lives in ~/.local/state/rexwork/sessions/<uuid>/. See README.md.
+"""
+import argparse
+import contextlib
+import fcntl
+import hashlib
+import json
+import os
+import re
+import secrets
+import shutil
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import urllib.error
+import urllib.request
+import uuid
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+ROOT = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "rexwork"
+SESSIONS = ROOT / "sessions"
+ARCHIVE = ROOT / "archive"
+WORKTREES = Path.home() / ".worktrees"
+SHOW = HERE.parent / "show" / "show"
+REXBAR = HERE.parent / "rexbar" / "rexbar"
+DOCVIEW = HERE.parent / "docview" / "docview"
+PROMOTE_LUA = HERE / "promote.lua"
+TEAM = "TAL"
+BRANCH_PREFIX = "u/tfriedman/"
+LINEAR_API = "https://api.linear.app/graphql"
+AGENTS = ("claude", "codex")
+TICKET_RE = re.compile(r"^([A-Za-z]+)-(\d+)$")
+# A Rex session id without its `session:` prefix, such as 01a1fabd-f4aa-...
+SESSION_UUID_RE = re.compile(r"^[0-9a-fA-F-]{8,64}$")
+BLOCK_RE = re.compile(r"^block:[0-9a-fA-F-]{8,64}$")
+# An authorization from `rexwork promote` is good for this long.
+AUTH_TTL = 12 * 3600
+# Rex names new sessions with two lowercase words, such as dawn-grotto.
+GENERATED_RE = re.compile(r"^[a-z]+-[a-z]+$")
+
+
+class Failure(Exception):
+    pass
+
+
+def fail(message):
+    raise Failure(message)
+
+
+def note(message):
+    print(f"rexwork: {message}", file=sys.stderr)
+
+
+def emit(data):
+    print(json.dumps(data, indent=2))
+    sys.stdout.flush()
+
+
+# ---- names ------------------------------------------------------------------
+
+def normalize_ticket(text):
+    """'tal-12' or '12' -> 'TAL-12'. Returns None for anything else."""
+    text = (text or "").strip()
+    if text.isdigit():
+        return f"{TEAM}-{int(text)}"
+    m = TICKET_RE.match(text)
+    return f"{m.group(1).upper()}-{int(m.group(2))}" if m else None
+
+
+def ticket_of_label(label):
+    first = (label or "").split(" ", 1)[0]
+    return normalize_ticket(first) if TICKET_RE.match(first) else None
+
+
+def label_matches_ticket(label, ticket):
+    """'TAL-1 Fix' matches TAL-1; 'TAL-10 Fix' does not."""
+    return ticket_of_label(label) == ticket
+
+
+def branch_matches_ticket(branch, ticket):
+    """u/tfriedman/tal-1 and u/tfriedman/tal-1-fix match TAL-1; u/tfriedman/tal-10-fix does not."""
+    if not branch or not ticket:
+        return False
+    prefix = BRANCH_PREFIX + ticket.lower()
+    return branch == prefix or branch.startswith(prefix + "-")
+
+
+def check_name(name, what="name"):
+    """A label or tab name that Rex will not read as an option."""
+    name = re.sub(r"\s+", " ", name or "").strip()
+    if not name:
+        fail(f"give a {what}")
+    if name.startswith("-"):
+        fail(f"{what} must not start with '-': {name!r}")
+    return name
+
+
+# Fields that belong to one ticket; dropped when a session's ticket changes.
+TICKET_FIELDS = ("title", "url", "repo", "worktree", "branch", "pr_url", "landed_at", "filing",
+                 "worktree_created", "worktree_provider", "lease_id", "worktree_at", "pending", "worktree_error")
+
+
+def ticket_change(state, ticket):
+    """Updates that clear the old ticket's fields when the session's ticket changes."""
+    old = state.get("ticket")
+    if old and old != ticket:
+        return {k: None for k in TICKET_FIELDS}
+    return {}
+
+
+def short_name(title, max_len=32, max_words=5):
+    """The first words of a title, for a session label."""
+    text = re.sub(r"^(\s*\[[^\]]*\]\s*)+", "", title or "").strip()
+    words, length = [], 0
+    for word in text.split():
+        if words and (length + 1 + len(word) > max_len or len(words) >= max_words):
+            break
+        words.append(word)
+        length += len(word) + (1 if len(words) > 1 else 0)
+    return " ".join(words).rstrip(":;,.-–—/ ")
+
+
+def slugify(text, max_len=40):
+    slug = re.sub(r"[^a-z0-9]+", "-", (text or "").lower()).strip("-")
+    if len(slug) > max_len:
+        cut = slug[:max_len]
+        slug = cut.rsplit("-", 1)[0] if "-" in cut else cut
+    return slug
+
+
+def ticket_label(ticket, title):
+    name = short_name(title)
+    return f"{ticket} {name}" if name else ticket
+
+
+def branch_name(ticket, title):
+    slug = slugify(short_name(title))
+    return BRANCH_PREFIX + ticket.lower() + (f"-{slug}" if slug else "")
+
+
+def is_generated_label(label):
+    return bool(GENERATED_RE.match(label or ""))
+
+
+def parse_draft(text):
+    """'# Title' on the first non-empty line, the description after it."""
+    text = re.sub(r"<!--.*?-->\n?", "", text, flags=re.S)
+    lines = text.splitlines()
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    if not lines or not re.match(r"^#\s+\S", lines[0]):
+        raise ValueError("the draft must start with '# Title' on its first line")
+    title = re.sub(r"^#\s+", "", lines[0]).strip()
+    if title.lower() in ("title", "<title>"):
+        raise ValueError("the draft still has the template's title")
+    description = "\n".join(lines[1:]).strip("\n")
+    if not description.strip():
+        raise ValueError("the draft has no description below the title")
+    return title, description.rstrip() + "\n"
+
+
+def merge_state(old, updates):
+    """Keep every key not being updated; a value of None removes the key."""
+    merged = dict(old)
+    for key, value in updates.items():
+        if value is None:
+            merged.pop(key, None)
+        else:
+            merged[key] = value
+    return merged
+
+
+def objectives_skeleton(label, ticket=None, url=None):
+    head = f"# Objectives: {label}\n\n"
+    if ticket:
+        head += f"Ticket: {ticket}" + (f" ({url})" if url else "") + "\n\n"
+    return head + ("Nested goals, each a few words with a status: todo, doing, done, blocked.\n\n"
+                   "- todo: (main goal)\n"
+                   "  - todo: (first step)\n")
+
+
+def draft_template(objectives):
+    return ("# Title: what this ticket delivers, in a few words\n\n"
+            "One or two short paragraphs: the goal and why it matters.\n\n"
+            "## Done when\n\n- ...\n\n"
+            "## Notes\n\n- Constraints, decisions already made, links.\n\n"
+            "+++ Agent notes\n\nDetail for agents: files, commands, evidence.\n\n+++\n\n"
+            "<!-- Objectives at the time of drafting (this comment is not filed):\n\n"
+            + (objectives.strip() or "(none yet)").replace("-->", "- ->") + "\n-->\n")
+
+
+# ---- state ------------------------------------------------------------------
+
+def uuid_of(session):
+    """The session id without `session:`. Fails for anything but a plain Rex id, so a
+    crafted --session (an absolute path, `..`) never names a directory."""
+    text = (session or "").strip()
+    text = text[len("session:"):] if text.startswith("session:") else text
+    if not SESSION_UUID_RE.match(text):
+        fail(f"not a Rex session id: {session!r}")
+    return text
+
+
+def session_id(text):
+    return "session:" + uuid_of(text)
+
+
+def is_session_id(text):
+    try:
+        uuid_of(text)
+    except Failure:
+        return False
+    return True
+
+
+def check_state_dir(directory):
+    """Fails unless DIRECTORY is a direct child of SESSIONS with its own name after resolving
+    links (a link from id A to sibling B is refused, as `show` does)."""
+    directory = Path(directory)
+    resolved = directory.resolve()
+    if (not SESSION_UUID_RE.match(directory.name) or resolved.parent != SESSIONS.resolve()
+            or resolved.name != directory.name):
+        fail(f"{directory} is not a rexwork session directory under {SESSIONS}")
+    return directory
+
+
+def state_dir(session):
+    return check_state_dir(SESSIONS / uuid_of(session))
+
+
+def read_state(directory):
+    try:
+        data = json.loads((directory / "session.json").read_text())
+    except FileNotFoundError:
+        return {}
+    except ValueError:
+        fail(f"{directory / 'session.json'} is not valid JSON; not touching it")
+    if not isinstance(data, dict):
+        fail(f"{directory / 'session.json'} is not a JSON object; not touching it")
+    return data
+
+
+_LOCAL = threading.local()
+
+
+@contextlib.contextmanager
+def session_lock(directory):
+    """The session's lock; re-entrant within one thread."""
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    key = str(directory.resolve())
+    held = _LOCAL.__dict__.setdefault("held", set())
+    if key in held:
+        yield
+        return
+    with open(directory / ".lock", "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        held.add(key)
+        try:
+            yield
+        finally:
+            held.discard(key)
+
+
+def update_state(directory, **updates):
+    with session_lock(directory):
+        data = merge_state(read_state(directory), updates)
+        tmp = directory / f"session.json.{os.getpid()}.tmp"
+        tmp.write_text(json.dumps(data, indent=2) + "\n")
+        tmp.replace(directory / "session.json")
+    return data
+
+
+def write_objectives(directory, label, ticket=None, url=None):
+    path = directory / "objectives.md"
+    if not path.exists():
+        path.write_text(objectives_skeleton(label, ticket, url))
+    return path
+
+
+# ---- processes --------------------------------------------------------------
+
+def run(args, cwd=None, timeout=60, input_text=None):
+    try:
+        return subprocess.run(args, capture_output=True, text=True, timeout=timeout, cwd=cwd,
+                              input=input_text, stdin=None if input_text is not None else subprocess.DEVNULL)
+    except FileNotFoundError:
+        fail(f"{args[0]}: not found")
+    except subprocess.TimeoutExpired:
+        fail(f"{' '.join(args[:3])}: timed out after {timeout}s")
+
+
+def rex(*args, timeout=30):
+    out = run(["rex", *args], timeout=timeout)
+    if out.returncode != 0:
+        fail(f"rex {' '.join(args[:3])}: {out.stderr.strip()}")
+    text = out.stdout.strip()
+    if not text:
+        return {}
+    try:
+        return json.loads(text)
+    except ValueError:
+        return {"output": text}
+
+
+def rex_sessions():
+    out = rex("ls", "--json")
+    return out.get("sessions", []) if isinstance(out, dict) else out
+
+
+def live_sessions():
+    return {s["session_id"]: s for s in rex_sessions() if s.get("session_id")}
+
+
+def inspect(session):
+    return rex("session", "inspect", session, "--json")
+
+
+def tiled_blocks(window):
+    for layer in window.get("layers", []):
+        if layer.get("kind") == "tiled":
+            yield from layer.get("blocks", [])
+
+
+def window_of(view, block):
+    for window in view.get("windows", []):
+        for layer in window.get("layers", []):
+            if any(b.get("block_id") == block for b in layer.get("blocks", [])):
+                return window
+    return None
+
+
+def git(*args, cwd=None, check=True, timeout=60):
+    out = run(["git", *args], cwd=cwd, timeout=timeout)
+    if check and out.returncode != 0:
+        fail(f"git {' '.join(args)}: {out.stderr.strip()}")
+    return out.stdout.strip() if out.returncode == 0 else None
+
+
+# ---- Linear -----------------------------------------------------------------
+
+def linear(query, variables=None):
+    key_file = Path(os.environ.get("LINEAR_KEY_FILE", Path.home() / ".linear_key"))
+    try:
+        key = key_file.read_text().strip()
+    except OSError:
+        fail(f"no Linear key at {key_file}")
+    request = urllib.request.Request(
+        LINEAR_API, data=json.dumps({"query": query, "variables": variables or {}}).encode(),
+        headers={"Content-Type": "application/json", "Authorization": key})
+    try:
+        with urllib.request.urlopen(request, timeout=30) as r:
+            data = json.load(r)
+    except urllib.error.HTTPError as e:
+        fail(f"Linear: HTTP {e.code}: {e.read().decode(errors='replace')[:300]}")
+    except (urllib.error.URLError, TimeoutError) as e:
+        fail(f"Linear: {e}")
+    if data.get("errors"):
+        fail(f"Linear: {data['errors'][0].get('message', data['errors'])}")
+    return data["data"]
+
+
+def get_issue(ticket):
+    q = ("query($id:String!){issue(id:$id){id identifier title url "
+         "state{id name type} team{id key}}}")
+    issue = linear(q, {"id": ticket}).get("issue")
+    if not issue:
+        fail(f"no Linear issue {ticket}")
+    return issue
+
+
+def team_info(key=TEAM):
+    q = ("query($key:String!){viewer{id name} teams(filter:{key:{eq:$key}})"
+         "{nodes{id key states{nodes{id name type}}}}}")
+    data = linear(q, {"key": key})
+    teams = data["teams"]["nodes"]
+    if not teams:
+        fail(f"no Linear team {key}")
+    team = teams[0]
+    states = {s["name"]: s for s in team["states"]["nodes"]}
+    return {"team_id": team["id"], "states": states, "viewer": data["viewer"]}
+
+
+def state_id(info, name):
+    state = info["states"].get(name)
+    if not state:
+        fail(f"team {TEAM} has no state {name!r}")
+    return state["id"]
+
+
+def set_issue_state(issue, name, info=None):
+    info = info or team_info(issue["team"]["key"])
+    m = "mutation($id:String!,$s:String!){issueUpdate(id:$id,input:{stateId:$s}){success}}"
+    if not linear(m, {"id": issue["id"], "s": state_id(info, name)})["issueUpdate"]["success"]:
+        fail(f"Linear: could not move {issue['identifier']} to {name}")
+
+
+def comment_issue(issue, body):
+    m = "mutation($i:String!,$b:String!){commentCreate(input:{issueId:$i,body:$b}){success}}"
+    if not linear(m, {"i": issue["id"], "b": body})["commentCreate"]["success"]:
+        fail(f"Linear: could not comment on {issue['identifier']}")
+
+
+def build_issue_input(title, description):
+    """Everything up to the write: read-only lookups, then the issueCreate input."""
+    info = team_info()
+    payload = {"teamId": info["team_id"], "title": title, "description": description,
+               "assigneeId": info["viewer"]["id"], "stateId": state_id(info, "In Progress")}
+    # No labelIds: an `agent` label would hand the ticket to Symphony.
+    assert "labelIds" not in payload
+    return payload, info
+
+
+def create_issue(payload):
+    m = ("mutation($input:IssueCreateInput!){issueCreate(input:$input)"
+         "{success issue{id identifier title url state{name} team{key}}}}")
+    result = linear(m, {"input": payload})["issueCreate"]
+    if not result["success"] or not result.get("issue"):
+        fail("Linear: issueCreate failed")
+    return result["issue"]
+
+
+ISSUE_FIELDS = "id identifier title url createdAt state{name} team{key}"
+
+
+def find_filed_issue(filing):
+    """Read-only: the issue an earlier filing attempt created, or None. Looks it up only by
+    the client-chosen id the attempt sent as issueCreate's `id`; never by title, so an
+    issue Tal made by hand with the same title is never adopted."""
+    if not filing.get("issue_uuid"):
+        fail("the interrupted filing has no recorded issue id, so it can not be matched in Linear; "
+             "check Linear by hand, then run `rexwork promote --clear-filing` in a terminal")
+    try:
+        issue = linear("query($id:String!){issue(id:$id){%s}}" % ISSUE_FIELDS,
+                       {"id": filing["issue_uuid"]}).get("issue")
+    except Failure as e:
+        if "not found" not in str(e).lower():
+            raise
+        return None
+    if issue and issue.get("id") != filing["issue_uuid"]:
+        return None
+    return issue
+
+
+# ---- git worktrees ----------------------------------------------------------
+
+def repo_root(path):
+    top = git("rev-parse", "--show-toplevel", cwd=path, check=False)
+    if not top:
+        fail(f"not a git repository: {path}")
+    common = git("rev-parse", "--path-format=absolute", "--git-common-dir", cwd=top)
+    main = Path(common)
+    main = main.parent if main.name == ".git" else main
+    return Path(top).resolve(), main.resolve()
+
+
+def worktrees(repo):
+    rows, row = [], {}
+    for line in (git("worktree", "list", "--porcelain", cwd=repo) or "").splitlines() + [""]:
+        if not line:
+            if row:
+                rows.append(row)
+            row = {}
+        elif " " in line:
+            k, v = line.split(" ", 1)
+            row[k] = v
+        else:
+            row[line] = True
+    return rows
+
+
+def default_base(repo):
+    head = git("symbolic-ref", "-q", "--short", "refs/remotes/origin/HEAD", cwd=repo, check=False)
+    for ref in [head, "origin/main", "origin/master", "main", "master", "HEAD"]:
+        if ref and git("rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}", cwd=repo, check=False):
+            return ref
+    fail(f"{repo}: no commit to branch from")
+
+
+def plan_worktree(repo_path, ticket, title):
+    """Where the ticket's worktree is or would be. Reuses an existing branch for the ticket."""
+    _, main = repo_root(repo_path)
+    branches = (git("for-each-ref", "--format=%(refname:short)", f"refs/heads/{BRANCH_PREFIX}", cwd=main,
+                    check=False) or "").splitlines()
+    existing = [b for b in branches if branch_matches_ticket(b, ticket)]
+    branch = existing[0] if existing else branch_name(ticket, title)
+    for row in worktrees(main):
+        if row.get("branch") == f"refs/heads/{branch}":
+            return {"repo": str(main), "branch": branch, "worktree": row["worktree"], "action": "reuse"}
+    path = WORKTREES / f"{main.name}-{ticket.lower()}"
+    action = "add existing branch" if existing else "create branch"
+    if not existing and git("rev-parse", "--verify", "--quiet", f"refs/remotes/origin/{branch}", cwd=main,
+                            check=False):
+        action = "track remote branch"
+    return {"repo": str(main), "branch": branch, "worktree": str(path), "action": action}
+
+
+class WorktreeIncomplete(Failure):
+    """A worktree step failed after something was acquired (a treehouse lease). `tree`
+    holds what exists, so it is recorded and a retry reuses it instead of leasing again."""
+
+    def __init__(self, message, tree):
+        super().__init__(message)
+        self.tree = tree
+
+
+# Providers rexwork created the worktree with, so `release` may remove it. A worktree
+# rexwork found (Tal's own, another agent's) is "adopted" and never removed.
+OWNED_PROVIDERS = ("git", "treehouse")
+TREEHOUSE_TIMEOUT = 900  # `treehouse get` warms a cold slot; that can take minutes
+
+
+def config_paths():
+    """$XDG_CONFIG_HOME/rexwork/config.json, then ~/.config/rexwork/config.json (Rex runs
+    actions without XDG_CONFIG_HOME). $REXWORK_CONFIG replaces both (tests)."""
+    if os.environ.get("REXWORK_CONFIG"):
+        return [Path(os.environ["REXWORK_CONFIG"])]
+    paths = []
+    if os.environ.get("XDG_CONFIG_HOME"):
+        paths.append(Path(os.environ["XDG_CONFIG_HOME"]) / "rexwork" / "config.json")
+    paths.append(Path.home() / ".config" / "rexwork" / "config.json")
+    return paths
+
+
+def load_config():
+    for path in config_paths():
+        try:
+            data = json.loads(path.read_text())
+        except FileNotFoundError:
+            continue
+        except (OSError, ValueError) as e:
+            fail(f"{path}: {e}")
+        if not isinstance(data, dict) or not isinstance(data.get("repos", {}), dict):
+            fail(f"{path}: expected {{\"repos\": {{\"/path/to/repo\": {{\"worktrees\": \"treehouse\"}}}}}}")
+        return data
+    return {}
+
+
+def repo_config(main, top=None):
+    """The config entry for a repo, matched by its main checkout or its top level."""
+    wanted = {str(Path(main).resolve())} | ({str(Path(top).resolve())} if top else set())
+    for key, value in (load_config().get("repos") or {}).items():
+        if str(Path(key).expanduser().resolve()) in wanted:
+            return value if isinstance(value, dict) else {}
+    return {}
+
+
+def worktree_provider(main, top=None):
+    provider = repo_config(main, top).get("worktrees", "git")
+    if provider not in OWNED_PROVIDERS:
+        fail(f"rexwork config: worktrees for {main} must be \"git\" or \"treehouse\", not {provider!r}")
+    return provider
+
+
+def lease_holder(ticket):
+    return f"rexwork:{ticket}"
+
+
+def treehouse(*args, cwd, timeout=60):
+    prog = os.environ.get("REXWORK_TREEHOUSE") or shutil.which("treehouse") or str(Path.home() / ".local/bin/treehouse")
+    try:
+        out = run([prog, *args], cwd=cwd, timeout=timeout)
+    except Failure as e:
+        fail(f"treehouse {' '.join(args[:2])}: {e}")
+    if out.returncode != 0:
+        fail(f"treehouse {' '.join(args[:2])}: {(out.stderr or out.stdout).strip()}")
+    return out.stdout
+
+
+def treehouse_status(repo):
+    try:
+        rows = json.loads(treehouse("status", "--json", cwd=repo) or "[]")
+    except ValueError:
+        fail("treehouse status --json printed no JSON")
+    return [r for r in rows if isinstance(r, dict)] if isinstance(rows, list) else []
+
+
+def held_leases(repo, ticket):
+    """Slots of REPO's pool leased by rexwork for TICKET (never anyone else's)."""
+    return [r for r in treehouse_status(repo) if r.get("lease_holder") == lease_holder(ticket) and r.get("lease_id")]
+
+
+def same_path(a, b):
+    return bool(a and b) and str(Path(a).resolve()) == str(Path(b).resolve())
+
+
+class WorktreeBlocked(Failure):
+    """A worktree path that belongs to someone else (a treehouse slot another holder
+    leased). Nothing runs there and nothing touches it."""
+
+    def __init__(self, message, path):
+        super().__init__(message)
+        self.path = path
+
+
+def treehouse_root():
+    return Path(os.environ.get("REXWORK_TREEHOUSE_ROOT") or Path.home() / ".treehouse")
+
+
+def in_treehouse_root(path):
+    try:
+        Path(path).resolve().relative_to(treehouse_root().resolve())
+        return True
+    except ValueError:
+        return False
+
+
+def pool_row(main, path, provider):
+    """The treehouse pool row for PATH, or None when PATH is not a pool slot. Asks
+    treehouse for opted-in repos and for any path under the treehouse root."""
+    if provider != "treehouse" and not in_treehouse_root(path):
+        return None
+    try:
+        rows = treehouse_status(main)
+    except Failure as e:
+        if in_treehouse_root(path):
+            raise WorktreeBlocked(f"{path} looks like a treehouse slot and its lease can not be checked ({e}); "
+                                  "not using it", path) from None
+        raise
+    row = next((r for r in rows if same_path(r.get("path"), path)), None)
+    if row is None and in_treehouse_root(path):
+        return {"path": str(path), "lease_holder": "", "lease_id": ""}  # a slot treehouse did not list
+    return row
+
+
+def check_slot(main, path, ticket, provider, lease_id=None):
+    """None if PATH is not a pool slot; the row if rexwork holds it for TICKET (with
+    LEASE_ID when one is recorded). Any other slot raises WorktreeBlocked."""
+    row = pool_row(main, path, provider)
+    if row is None:
+        return None
+    holder, current = row.get("lease_holder") or "", row.get("lease_id") or ""
+    if holder != lease_holder(ticket) or not current or (lease_id and current != lease_id):
+        who = f"leased by {holder!r} (lease {current})" if current else "not leased by rexwork"
+        raise WorktreeBlocked(f"{path} is a treehouse slot {who}, not by {lease_holder(ticket)}"
+                              + (f" with lease {lease_id}" if lease_id else "")
+                              + "; rexwork leaves it alone and starts nothing there", path)
+    return row
+
+
+def git_identity(path, branch):
+    """What makes a git worktree this one: its path, main repo, branch, and the git dir
+    (path and inode) git made for it."""
+    gitdir = git("rev-parse", "--absolute-git-dir", cwd=path)
+    _, main = repo_root(path)
+    return {"path": str(Path(path).resolve()), "repo": str(main), "branch": branch, "gitdir": gitdir,
+            "gitdir_ino": os.stat(gitdir).st_ino}
+
+
+def identity_problem(record):
+    """None if the live worktree at the record's path is still the one rexwork created;
+    else what differs."""
+    path = record.get("path")
+    if not path or not Path(path).is_dir():
+        return f"{path} is gone"
+    try:
+        now = git_identity(path, git("symbolic-ref", "-q", "--short", "HEAD", cwd=path, check=False))
+    except (Failure, OSError) as e:
+        return f"{path} is not a readable git worktree ({e})"
+    for key in ("repo", "gitdir", "gitdir_ino", "branch"):
+        if now.get(key) != record.get(key):
+            return (f"{path} is not the worktree rexwork created ({key} is {now.get(key)!r}, "
+                    f"recorded {record.get(key)!r})")
+    return None
+
+
+def created_record(provider, path, main, branch, lease_id=None):
+    """`worktree_created`: written only when rexwork itself made the worktree (or holds its
+    lease). Without it a worktree is adopted, and `release` never removes it."""
+    if provider == "git":
+        record = git_identity(path, branch)
+    else:
+        record = {"path": str(Path(path).resolve()), "repo": str(main), "branch": branch, "lease_id": lease_id}
+    return {**record, "provider": provider, "at": int(time.time())}
+
+
+def prior_record(ticket, path):
+    """A git `worktree_created` record for PATH in a session dir of TICKET whose worktree is
+    still that same checkout, or None."""
+    for state_file in sorted(SESSIONS.glob("*/session.json")) if SESSIONS.exists() else []:
+        try:
+            data = json.loads(state_file.read_text())
+        except (OSError, ValueError):
+            continue
+        record = data.get("worktree_created") if isinstance(data, dict) else None
+        if (isinstance(record, dict) and data.get("ticket") == ticket and same_path(record.get("path"), path)
+                and record.get("provider") == "git" and not identity_problem(record)):
+            return record
+    return None
+
+
+def tree_of(main, branch, path, action, provider, lease_id=None, created=None):
+    return {"repo": str(main), "branch": branch, "worktree": str(path), "action": action,
+            "worktree_provider": provider, "lease_id": lease_id, "worktree_at": int(time.time()),
+            "worktree_created": created}
+
+
+def found_worktree(main, path, branch, ticket, provider, action):
+    """A worktree rexwork did not just create: a pool slot must be rexwork's lease for
+    TICKET (else WorktreeBlocked); a git worktree is owned only by an earlier creation
+    record that still matches, else adopted."""
+    row = check_slot(main, path, ticket, provider)
+    if row:
+        return tree_of(main, branch, path, action, "treehouse", row["lease_id"],
+                       created_record("treehouse", path, main, branch, row["lease_id"]))
+    prior = prior_record(ticket, path)
+    if prior:
+        return tree_of(main, branch, path, action, "git", None, prior)
+    return tree_of(main, branch, path, action, "adopted")
+
+
+def checkout_ticket_branch(path, plan):
+    """Put the leased slot at PATH on the ticket's branch. A fresh slot is detached at the
+    pool's base; an existing branch is checked out, a remote one tracked, else created."""
+    branch, main = plan["branch"], plan["repo"]
+    if git("symbolic-ref", "-q", "--short", "HEAD", cwd=path, check=False) == branch:
+        return
+    if git("rev-parse", "--verify", "--quiet", f"refs/heads/{branch}", cwd=main, check=False):
+        git("checkout", "-q", branch, cwd=path)
+    elif git("rev-parse", "--verify", "--quiet", f"refs/remotes/origin/{branch}", cwd=main, check=False):
+        git("checkout", "-q", "--track", "-b", branch, f"origin/{branch}", cwd=path)
+    else:
+        git("checkout", "-q", "-b", branch, cwd=path)
+
+
+def treehouse_worktree(plan, ticket):
+    """Lease a slot for TICKET (or reuse the one rexwork already holds for it) and put it on
+    the ticket's branch. Never leases twice; never falls back to plain git."""
+    main, branch = plan["repo"], plan["branch"]
+    mine = held_leases(main, ticket)
+    if len(mine) > 1:
+        fail(f"treehouse has {len(mine)} slots leased by {lease_holder(ticket)} "
+             f"({', '.join(r.get('path', '?') for r in mine)}); return the extra ones by hand")
+    if mine:
+        path, lease_id, action = mine[0]["path"], mine[0]["lease_id"], "reuse lease"
+    else:
+        args = ["get", "--lease", "--json", "--lease-holder", lease_holder(ticket)]
+        if plan["action"] == "create branch":
+            args += ["-b", branch]
+        try:
+            out = treehouse(*args, cwd=main, timeout=TREEHOUSE_TIMEOUT)
+        except Failure as e:
+            if "timed out" in str(e):
+                fail(f"{e}. The slot may still be warming: check `treehouse status` in {main}, then run "
+                     f"the same command again; it reuses a slot leased by {lease_holder(ticket)}")
+            raise
+        try:
+            data = json.loads(out)
+        except ValueError:
+            data = {"path": out.strip().splitlines()[-1] if out.strip() else None}
+        path, lease_id = data.get("path"), data.get("lease_id")
+        if not path:
+            fail(f"treehouse get printed no path: {out.strip()[:200]!r}")
+        if not lease_id:
+            lease_id = next((r.get("lease_id") for r in treehouse_status(main) if same_path(r.get("path"), path)), None)
+        action = "lease"
+    tree = tree_of(main, branch, path, action, "treehouse", lease_id,
+                   created_record("treehouse", path, main, branch, lease_id))
+    try:
+        checkout_ticket_branch(path, plan)
+    except Failure as e:
+        raise WorktreeIncomplete(f"leased {path} (lease {lease_id}) but could not check out {branch}: {e}; "
+                                 "the lease is recorded and kept, and a retry reuses it", tree) from None
+    return tree
+
+
+def ensure_worktree(repo_path, ticket, title, state=None):
+    """The ticket's worktree: the live one recorded in STATE (a pool slot only while
+    rexwork still holds its recorded lease), else (treehouse) the slot rexwork leased for
+    the ticket, else any worktree already on the ticket's branch (never someone else's
+    pool slot), else a new one from the repo's provider."""
+    state = state or {}
+    recorded = state.get("worktree")
+    if (recorded and Path(recorded).is_dir() and branch_matches_ticket(state.get("branch"), ticket)
+            and git("symbolic-ref", "-q", "--short", "HEAD", cwd=recorded, check=False) == state["branch"]):
+        main = state.get("repo") or str(repo_root(recorded)[1])
+        provider = state.get("worktree_provider")
+        # A pool slot is reused only while rexwork holds its recorded lease (else WorktreeBlocked).
+        check_slot(main, recorded, ticket, provider or "git", state.get("lease_id"))
+        return {"repo": main, "branch": state["branch"], "worktree": recorded, "action": "reuse",
+                "worktree_provider": provider, "lease_id": state.get("lease_id"),
+                "worktree_at": state.get("worktree_at"), "worktree_created": state.get("worktree_created")}
+    top, main = repo_root(repo_path)
+    provider = worktree_provider(main, top)
+    plan = plan_worktree(repo_path, ticket, title)
+    if provider == "treehouse" and held_leases(main, ticket):
+        return treehouse_worktree(plan, ticket)
+    if plan["action"] == "reuse":
+        return found_worktree(main, plan["worktree"], plan["branch"], ticket, provider, "reuse")
+    if provider == "treehouse":
+        return treehouse_worktree(plan, ticket)
+    branch, path = plan["branch"], Path(plan["worktree"])
+    if path.exists():
+        fail(f"{path} exists and is not the worktree of {branch}; move it or pass another --repo")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if plan["action"] == "add existing branch":
+        git("worktree", "add", str(path), branch, cwd=main)
+    elif plan["action"] == "track remote branch":
+        git("worktree", "add", "--track", "-b", branch, str(path), f"origin/{branch}", cwd=main)
+    else:
+        git("worktree", "add", "--no-track", "-b", branch, str(path), default_base(main), cwd=main)
+    return tree_of(main, branch, path, plan["action"], "git", None, created_record("git", path, main, branch))
+
+
+TREE_KEYS = ("repo", "worktree", "branch", "worktree_provider", "lease_id", "worktree_at", "worktree_created")
+
+
+def tree_fields(tree):
+    """session.json fields for a worktree from ensure_worktree."""
+    return {k: tree.get(k) for k in TREE_KEYS}
+
+
+def default_repo(args, base):
+    """--repo, else (default on) the git repo BASE is in. None with --no-worktree, for
+    Symphony's sessions (Symphony owns its workspace) and outside a git repo."""
+    if args.repo:
+        return str(Path(args.repo).expanduser().resolve())
+    if getattr(args, "no_worktree", False) or getattr(args, "owner", None) == "symphony":
+        return None
+    if base and Path(base).is_dir() and git("rev-parse", "--show-toplevel", cwd=base, check=False):
+        return str(Path(base).resolve())
+    return None
+
+
+def worktree_for_start(repo, ticket, title):
+    """(tree, pending, error, blocked_path) for `start`: a failure is recorded as pending,
+    not fatal, so the session still starts and a retry finishes it. The caller's directory,
+    when it is already a worktree on the ticket's branch, is adopted as it is, unless it is
+    a pool slot someone else holds."""
+    try:
+        info = git_branch_info(repo)
+        if branch_matches_ticket(info.get("branch"), ticket):
+            top, main = repo_root(repo)
+            return (found_worktree(main, top, info["branch"], ticket, worktree_provider(main, top), "adopt"),
+                    [], None, None)
+        return ensure_worktree(repo, ticket, title), [], None, None
+    except WorktreeIncomplete as e:
+        return e.tree, ["worktree"], str(e), None
+    except WorktreeBlocked as e:
+        return {}, ["worktree"], str(e), e.path
+    except Failure as e:
+        return {}, ["worktree"], str(e), None
+
+
+# ---- panes ------------------------------------------------------------------
+
+def open_show(session, block):
+    show = os.environ.get("REXWORK_SHOW") or str(SHOW)  # tests point this at a failing program
+    out = run([sys.executable, show, "--open-pane", "--session", session, "--block", block], timeout=40)
+    if out.returncode != 0:
+        fail(f"show --open-pane: {out.stderr.strip()}")
+    try:
+        data = json.loads(out.stdout)
+    except ValueError:
+        fail("show --open-pane printed no JSON")
+    if not isinstance(data, dict) or not data.get("pane"):
+        fail("show --open-pane returned no pane")
+    return data
+
+
+def soft(warnings, what, fn, *args):
+    """Run a cosmetic step after the command is running: a failure is a warning, not an error."""
+    try:
+        return fn(*args)
+    except Failure as e:
+        message = f"{what}: {e}"
+        warnings.append(message)
+        note(f"warning: {message}")
+        return None
+    except Exception as e:  # noqa: BLE001 - the command is already running; never fail the start
+        message = f"{what}: {type(e).__name__}: {e}"
+        warnings.append(message)
+        note(f"warning: {message}")
+        return None
+
+
+def show_pane(warnings, session, block):
+    """The Show pane's block id, or None (with a warning) if it could not be opened."""
+    show = soft(warnings, "Show pane not opened", open_show, session, block)
+    return show["pane"] if show else None
+
+
+def open_bar(session, window):
+    """`rexbar open` for the tab: the status bar along its bottom (idempotent). Call it
+    without the session lock held: rexbar takes that lock itself."""
+    bar = os.environ.get("REXWORK_BAR") or str(REXBAR)  # tests point this at a stub
+    out = run([sys.executable, bar, "open", "--session", session, "--window", window], timeout=40)
+    if out.returncode != 0:
+        fail(f"rexbar open: {out.stderr.strip()}")
+    try:
+        data = json.loads(out.stdout)
+    except ValueError:
+        fail("rexbar open printed no JSON")
+    if not isinstance(data, dict) or not data.get("pane"):
+        fail("rexbar open returned no pane")
+    return data
+
+
+def bar_pane(warnings, args, session, window):
+    """The bar's block id; None with --no-bar, without a tab, or (with a warning) on failure."""
+    if getattr(args, "no_bar", False) or not window:
+        return None
+    bar = soft(warnings, "status bar not opened", open_bar, session, window)
+    return bar["pane"] if bar else None
+
+
+STATE_MARK = "@STATE_DIR@"
+
+# Replaces @STATE_DIR@ in the prompt with the pane's state directory (only
+# known once the session exists), runs the agent, then keeps the pane at a
+# login shell after the agent exits.
+AGENT_WRAPPER = (
+    'if [ -n "$REXWORK_PROMPT" ]; then '
+    'dir="$HOME/.local/state/rexwork/sessions/${REX_SESSION#session:}"; '
+    'set -- "$@" "$(printf %s "$REXWORK_PROMPT" | sed "s|@STATE_DIR@|$dir|g")"; fi; '
+    '"$@"; exec "${SHELL:-/bin/zsh}" -l'
+)
+
+
+def agent_command(agent, prompt=None):
+    stub = os.environ.get("REXWORK_AGENT_STUB")
+    argv = [stub, agent] if stub else [agent]
+    env = [f"REXWORK_PROMPT={prompt}"] if prompt else ["-u", "REXWORK_PROMPT"]
+    return ["/usr/bin/env", *env, "/bin/sh", "-c", AGENT_WRAPPER, "sh", *argv]
+
+
+def app_client():
+    client = os.environ.get("REX_CLIENT")
+    if client:
+        return client
+    out = rex("client", "ls", "--json")
+    clients = out.get("clients", []) if isinstance(out, dict) else out
+    apps = [c["client_id"] for c in clients if (c.get("info") or {}).get("kind") == "app"
+            and c.get("connection_state") == "connected"]
+    return apps[0] if apps else None
+
+
+def focus_session(session, window):
+    client = app_client()
+    if not client:
+        note("no Rex app connected; not switching to the new session")
+        return False
+    out = run(["rex", "-C", client, "do", "session.select", f"session_id={session}", f"window_id={window}"])
+    if out.returncode != 0:
+        note(f"could not switch to the session: {out.stderr.strip()}")
+        return False
+    return True
+
+
+def create_session(label, tab, cwd, command, warnings):
+    """A new session running COMMAND. If it can not be read back, the session is closed
+    again and this fails, so nothing is left running. Once it runs, a failed Show pane is
+    a warning: show_block is None."""
+    args = ["new", label, "--window", tab, "-c", str(cwd), "--json"]
+    if command:
+        args += ["--", *command]
+    out = rex(*args)
+    try:
+        window = out["initial_windows"][0]
+        session, main, window_id = out["session_id"], window["block_ids"][0], window["window_id"]
+        session_id(session)
+    except (KeyError, IndexError, TypeError, Failure) as e:
+        sid = out.get("session_id") if isinstance(out, dict) else None
+        if isinstance(sid, str) and is_session_id(sid):
+            with contextlib.suppress(Failure):
+                rex("kill", sid)
+        fail(f"rex new returned an unexpected result ({type(e).__name__}: {e}); closed what it made")
+    return session, window_id, main, show_pane(warnings, session, main)
+
+
+def pane_cwd(session, block):
+    """A pane's working directory: its foreground program's, else its shell's. None if unknown."""
+    if not block:
+        return None
+    out = run(["rex", "block", "call", "-s", session, "-b", block, "process"], timeout=15)
+    try:
+        info = json.loads(out.stdout) if out.returncode == 0 else {}
+    except ValueError:
+        info = {}
+    fg = info.get("foreground") if isinstance(info, dict) else None
+    if isinstance(fg, dict) and fg.get("cwd"):
+        return fg["cwd"]
+    for proc in (info.get("ancestors") or []) if isinstance(info, dict) else []:
+        if isinstance(proc, dict) and proc.get("cwd"):
+            return proc["cwd"]
+    return None
+
+
+def caller_cwd():
+    try:
+        return Path.cwd()
+    except OSError:
+        return Path.home()
+
+
+# ---- start ------------------------------------------------------------------
+
+DRAFT_PROMPT = (
+    "This Rex session was started to draft a Linear ticket with Tal. "
+    "1) Ask Tal what the work is: a few short questions at most (goal, done-when, constraints). "
+    "2) Write nested goals with a status each to {objectives}. "
+    "3) Run `rexwork promote --template`, fill it in from the conversation, and save it to {draft}. "
+    "4) Run `rexwork promote` to open the draft for Tal in Neovim. Tal files it from there; "
+    "never file it yourself. Start with your first question."
+)
+
+
+def recorded_ticket(sid):
+    """The ticket in SID's session.json; None if it has none. An unreadable or invalid
+    session.json counts as a different ticket ('?'), so its session is never matched."""
+    try:
+        path = state_dir(sid) / "session.json"
+    except Failure:
+        return "?"
+    try:
+        data = json.loads(path.read_text())
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError):
+        return "?"
+    return data.get("ticket") if isinstance(data, dict) else "?"
+
+
+def find_ticket_session(ticket):
+    """The live session for TICKET: by session.json, else by label. Durable state wins: a
+    session whose session.json records another ticket is never matched by its label."""
+    live = live_sessions()
+    for path in sorted(SESSIONS.glob("*/session.json")) if SESSIONS.exists() else []:
+        if not is_session_id(path.parent.name):
+            continue
+        try:
+            data = json.loads(path.read_text())
+        except (OSError, ValueError):
+            continue
+        sid = session_id(path.parent.name)
+        if isinstance(data, dict) and data.get("ticket") == ticket and sid in live:
+            return sid
+    for sid, s in live.items():
+        if is_session_id(sid) and label_matches_ticket(s.get("label"), ticket):
+            if recorded_ticket(sid) in (None, ticket):
+                return sid
+            note(f"session {s.get('label')!r} ({sid}) is labelled {ticket} but its session.json records "
+                 f"{recorded_ticket(sid)}; not reusing it")
+    return None
+
+
+def main_block_of(session, state):
+    view = inspect(session)
+    recorded = state.get("main_block")
+    if recorded and window_of(view, recorded):
+        return recorded, window_of(view, recorded)["window_id"]
+    window = next((w for w in view.get("windows", []) if w["window_id"] == view.get("active_window_id")),
+                  (view.get("windows") or [None])[0])
+    if not window:
+        fail(f"{session} has no tabs")
+    blocks = [b for b in tiled_blocks(window) if b.get("label") != "Show"]
+    if not blocks:
+        fail(f"{session} has no main pane")
+    return blocks[0]["block_id"], window["window_id"]
+
+
+SESSION_LOCK_WAIT = 25   # Symphony gives `rexwork start` 60 s in all
+WORKTREE_LOCK_WAIT = 30
+
+
+@contextlib.contextmanager
+def ticket_lock(ticket, kind, wait):
+    """A per-ticket flock under the state root (`locks/TAL-N.<kind>.lock`). "session" is
+    held only across discovery and registration, so it is short; "worktree" across
+    worktree acquisition, which can take minutes, and Symphony never takes it."""
+    directory = SESSIONS.parent / "locks"
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with open(directory / f"{ticket}.{kind}.lock", "w") as lock:
+        deadline = time.monotonic() + wait
+        while True:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    what = ("acquiring its worktree (a treehouse lease can take minutes)" if kind == "worktree"
+                            else "registering its session")
+                    fail(f"another `rexwork start {ticket}` is {what}; waited {wait}s. Run it again when "
+                         "that one has finished")
+                time.sleep(0.2)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+
+
+def start_ticket(args):
+    ticket = normalize_ticket(args.ticket)
+    if not ticket:
+        fail(f"not a ticket id: {args.ticket}")
+    if args.owner == "symphony" and args.repo:
+        fail("--owner symphony never creates a worktree (Symphony owns its workspace); drop --repo")
+    # Symphony's path acquires no worktree, so it never waits behind a long treehouse lease.
+    worktree_lock = (contextlib.nullcontext() if args.owner == "symphony"
+                     else ticket_lock(ticket, "worktree", WORKTREE_LOCK_WAIT))
+    with worktree_lock:
+        with ticket_lock(ticket, "session", SESSION_LOCK_WAIT):
+            existing = find_ticket_session(ticket)
+            if existing and args.reuse_tab:
+                return on_existing(args, ticket, existing)
+        if existing:
+            return on_existing(args, ticket, existing)
+        return start_new(args, ticket)
+
+
+def on_existing(args, ticket, existing, tree=None):
+    """The one dispatch for "the ticket's session exists", at the first lookup and at the
+    recheck after the worktree: --reuse-tab runs COMMAND in a new tab, else the session is
+    reused. A worktree TREE this start just acquired that the session can not take is given
+    back, never dropped."""
+    if args.reuse_tab:
+        returned = give_back(tree) if tree else None
+        return reuse_in_new_tab(args, ticket, existing, returned)
+    return start_existing(args, ticket, existing, tree)
+
+
+JUST_MADE = ("lease", "create branch", "add existing branch", "track remote branch")
+
+
+def give_back(tree):
+    """Undo a worktree this start just made (a fresh lease or `git worktree add`, so it
+    is clean) because no session can record it. Returns what happened, or None when TREE
+    holds nothing this start made."""
+    if not tree or not tree.get("worktree_created") or tree.get("action") not in JUST_MADE:
+        return None
+    path, repo, lease_id = tree["worktree"], tree.get("repo"), tree.get("lease_id")
+    try:
+        if tree.get("worktree_provider") == "treehouse":
+            treehouse("return", "--if-lease-id", lease_id, path, cwd=repo, timeout=300)
+            what = f"returned treehouse slot {path} (lease {lease_id})"
+        else:
+            git("worktree", "remove", path, cwd=repo)
+            what = f"removed worktree {path} (branch {tree.get('branch')} kept)"
+        note(f"{what}: the session that appeared meanwhile does not take it")
+        return what
+    except Failure as e:
+        how = (f"treehouse return --if-lease-id {lease_id} {path}" if tree.get("worktree_provider") == "treehouse"
+               else f"git worktree remove {path}")
+        note(f"could not give back {path} ({e}); nothing records it, so run `{how}` by hand")
+        return f"not given back: {e}; run `{how}`"
+
+
+def no_worktree_message(ticket, cause, base):
+    return (f"{ticket} expects a worktree and has none, so no session or agent was started: {cause}. "
+            f"Fix that and run `rexwork start {ticket}` again (it reuses a lease already taken), or pass "
+            f"--no-worktree to work in {base} deliberately")
+
+
+def launch_dir(cwd, ticket, tree=None, strict=False):
+    """CWD, unless it is inside a treehouse slot not held by rexwork for TICKET (any slot
+    for a scratch session): then the slot's main checkout. Every start checks the final
+    launch directory with this, so an agent never starts in someone else's slot."""
+    path = Path(cwd)
+    top = git("rev-parse", "--show-toplevel", cwd=path, check=False) if path.is_dir() else None
+    if not top:
+        if in_treehouse_root(path):
+            fail(f"{path} is under the treehouse root but is not a readable checkout; not starting there")
+        return path
+    try:
+        _, main = repo_root(top)
+    except Failure:
+        return path
+    if same_path(top, main):
+        return path  # the main checkout is never a pool slot
+    try:
+        provider = worktree_provider(main, top)
+    except Failure:
+        provider = "git"
+    lease = tree.get("lease_id") if tree and same_path(tree.get("worktree"), top) else None
+    try:
+        if ticket:
+            check_slot(main, top, ticket, provider, lease)
+        elif pool_row(main, top, provider) is not None:
+            raise WorktreeBlocked(f"{top} is a treehouse slot and this session has no lease on it", top)
+    except WorktreeBlocked as e:
+        if strict:  # a ticket's worktree: never redirect to the main checkout
+            raise
+        note(f"{e}; starting in the main checkout {main} instead")
+        return Path(main)
+    except Failure as e:  # treehouse status failed for a worktree outside the pool root
+        note(f"could not check whether {top} is a treehouse slot ({e}); it is outside {treehouse_root()}")
+    return path
+
+
+def start_existing(args, ticket, existing, tree=None):
+    """The ticket's session exists: re-add its Show pane and bar, finish a pending
+    worktree, and (with TREE, a worktree acquired while it appeared) record it if the
+    session has none."""
+    if args.command:
+        note("the ticket's session exists; -- COMMAND was not run (pass --reuse-tab NAME to run it in a new tab)")
+    warnings = []
+    directory = state_dir(existing)
+    state = read_state(directory)
+    main, window = main_block_of(existing, state)
+    show = show_pane(warnings, existing, main) or state.get("show_block")
+    bar = bar_pane(warnings, args, existing, window) or state.get("bar_block")
+    label = (live_sessions().get(existing) or {}).get("label") or state.get("label") or ticket
+    # find_ticket_session never returns a session recording another ticket.
+    updates = {"session_id": existing, "window_id": window, "main_block": main, "show_block": show,
+               "bar_block": bar, "label": label, "kind": "ticketed", "ticket": ticket}
+    if not state.get("created_at"):
+        updates["created_at"] = int(time.time())
+    if tree and tree.get("worktree") and not state.get("worktree") and state.get("owner") != "symphony":
+        updates.update(tree_fields(tree), pending=None, worktree_error=None)
+    else:
+        returned = give_back(tree)
+        if returned:
+            warnings.append(returned)
+    state = update_state(directory, **updates)
+    pending = retry_pending_worktree(directory, state, ticket)
+    state = read_state(directory)
+    write_objectives(directory, label, ticket, state.get("url"))
+    note(f"reusing session {label!r} ({existing}) for {ticket}")
+    if args.focus:
+        focus_session(existing, window)
+    emit({**result_of(existing, state, directory), "reused": True, "warnings": warnings,
+          "pending": pending})
+    if pending:
+        fail(f"worktree still pending: {state.get('worktree_error')}")
+
+
+def start_new(args, ticket):
+    if args.title:
+        title, url, issue = args.title, None, None
+    else:
+        issue = get_issue(ticket)
+        title, url = issue["title"], issue["url"]
+    label = ticket_label(ticket, title)
+    base = Path(args.cwd or caller_cwd()).expanduser()
+    repo = default_repo(args, base)
+    tree, pending, tree_error, _ = worktree_for_start(repo, ticket, title) if repo else ({}, [], None, None)
+    if repo and (pending or not tree.get("worktree")):
+        # A ticket that expects a worktree never starts without one: the agent would run in
+        # the main checkout. Nothing is created; a lease already taken is reused on rerun.
+        fail(no_worktree_message(ticket, tree_error or "no worktree was found or made", base))
+    cwd = Path(tree.get("worktree") or base).expanduser()
+    if repo:
+        try:
+            cwd = launch_dir(cwd, ticket, tree, strict=True)
+        except WorktreeBlocked as e:
+            fail(no_worktree_message(ticket, str(e), base))
+    else:
+        cwd = launch_dir(cwd, ticket, tree)
+    if args.command:
+        command, agent = args.command, None
+    elif args.no_agent:
+        command, agent = None, None
+    else:
+        agent = args.agent
+        command = agent_command(agent, args.prompt)
+
+    linear_note = "skipped (--no-linear)"
+    if not args.no_linear:
+        issue = issue or get_issue(ticket)
+        if issue["state"]["type"] in ("backlog", "unstarted", "triage"):
+            set_issue_state(issue, "In Progress")
+            linear_note = "set In Progress"
+        else:
+            linear_note = f"left at {issue['state']['name']}"
+
+    warnings = []
+    with ticket_lock(ticket, "session", SESSION_LOCK_WAIT):
+        again = find_ticket_session(ticket)  # one may have started while the worktree was made
+        if again:
+            return on_existing(args, ticket, again, tree)
+        session, window, main, show = create_session(label, ticket, cwd, command, warnings)
+        # The command is running from here on: every later failure is a warning.
+        directory = state_dir(session)
+        fields = dict(session_id=session, window_id=window, main_block=main, show_block=show,
+                      label=label, kind="ticketed", ticket=ticket, title=title, url=url,
+                      **tree_fields(tree), agent=agent, cwd=str(cwd), owner=args.owner,
+                      created_at=int(time.time()), pending=pending or None, worktree_error=tree_error)
+        state = soft(warnings, "session.json not written", lambda: update_state(directory, **fields)) or fields
+    bar = bar_pane(warnings, args, session, window)
+    if bar:
+        state = soft(warnings, "session.json not written", lambda: update_state(directory, bar_block=bar)) or {
+            **state, "bar_block": bar}
+    if tree.get("worktree_created"):
+        soft(warnings, "older sessions not updated", hand_over_worktree, directory, tree["worktree"])
+    soft(warnings, "objectives.md not written", write_objectives, directory, label, ticket, url)
+    if args.focus:
+        soft(warnings, "focus", focus_session, session, window)
+    emit({**result_of(session, state, directory), "reused": False, "linear": linear_note,
+          "worktree_action": tree.get("action"), "pending": pending, "warnings": warnings})
+    if pending:
+        fail(f"{ticket} started without its worktree: {tree_error}. Fix that, then run "
+             f"`rexwork start {ticket}` again; it finishes only the worktree")
+
+
+def retry_pending_worktree(directory, state, ticket):
+    """A reused session whose worktree step is pending: try it again. Returns what is
+    still pending."""
+    if "worktree" not in (state.get("pending") or []):
+        return []
+    repo = state.get("repo")
+    if not repo:
+        return ["worktree"]
+    try:
+        tree = ensure_worktree(repo, ticket, state.get("title") or ticket, state)
+    except WorktreeIncomplete as e:
+        update_state(directory, **tree_fields(e.tree), worktree_error=str(e))
+        return ["worktree"]
+    except Failure as e:
+        update_state(directory, worktree_error=str(e))
+        return ["worktree"]
+    update_state(directory, **tree_fields(tree), pending=None, worktree_error=None)
+    if tree.get("worktree_created"):
+        hand_over_worktree(directory, tree["worktree"])
+    note(f"worktree ready at {tree['worktree']}; the agent pane still runs in {state.get('cwd')}")
+    return []
+
+
+def hand_over_worktree(directory, worktree):
+    """An older session dir of this rexwork that records the same owned worktree gives it
+    up, so only one session claims (and later releases) it."""
+    for path in sorted(SESSIONS.glob("*/session.json")) if SESSIONS.exists() else []:
+        other = path.parent
+        if other.name == directory.name or not is_session_id(other.name):
+            continue
+        try:
+            data = json.loads(path.read_text())
+        except (OSError, ValueError):
+            continue
+        if (isinstance(data, dict) and held_worktree(data) and same_path(data.get("worktree"), worktree)):
+            update_state(other, worktree=None, lease_id=None, worktree_provider=None, worktree_created=None,
+                         worktree_moved_to=session_id(directory.name))
+
+
+def reuse_in_new_tab(args, ticket, session, returned=None):
+    """--reuse-tab: leave the reused session alone. Open COMMAND in a new background tab
+    with its own Show pane. Nothing in the session's state directory is written: its
+    session.json belongs to the session, not to this tab."""
+    if not args.command:
+        fail("--reuse-tab needs -- COMMAND")
+    tab = check_name(args.reuse_tab, "tab name")
+    cwd = launch_dir(Path(args.cwd or caller_cwd()).expanduser(), ticket)
+    directory = state_dir(session)
+    state = read_state(directory)  # read only
+    if state.get("ticket") not in (None, ticket):
+        fail(f"{session} records {state.get('ticket')}, not {ticket}")  # find_ticket_session prevents this
+    # The command is passed as separate words after `--`; Rex never re-splits it.
+    out = rex("window", "new", "-s", session, tab, "-c", str(cwd), "--focus=false", "--json",
+              "--", *args.command)
+    try:
+        block = out["block_ids"][0]
+    except (KeyError, IndexError, TypeError):
+        window = out.get("window_id") if isinstance(out, dict) else None
+        if window:
+            with contextlib.suppress(Failure):
+                rex("window", "close", "-s", session, window)
+        fail(f"rex window new returned no pane: {out!r}; closed what it made")
+    # COMMAND is running from here on: every later failure is a warning.
+    warnings = [returned] if returned else []
+    window = out.get("window_id") or (soft(warnings, "tab id not found", window_of, inspect_safe(session), block)
+                                      or {}).get("window_id")
+    show = show_pane(warnings, session, block)
+    bar = bar_pane(warnings, args, session, window)
+    live = soft(warnings, "rex ls", live_sessions) or {}
+    label = (live.get(session) or {}).get("label") or state.get("label") or ticket
+    note(f"reusing session {label!r} ({session}) for {ticket}: new tab {tab!r}")
+    emit({**result_of(session, {**state, "label": label, "ticket": state.get("ticket") or ticket}, directory),
+          "reused": True, "warnings": warnings,
+          "tab": {"window_id": window, "main_block": block, "show_block": show, "bar_block": bar}})
+
+
+def inspect_safe(session):
+    try:
+        return inspect(session)
+    except Failure:
+        return {}
+
+
+def start_named(args, kind):
+    name = check_name(args.scratch or args.draft)
+    if ticket_of_label(name):
+        fail(f"{name!r} looks like a ticket id; use `rexwork start {name}`")
+    cwd = Path(args.cwd or caller_cwd()).expanduser().resolve()
+    if not cwd.is_dir():
+        fail(f"no such directory: {cwd}")
+    cwd = launch_dir(cwd, None)
+    base = STATE_MARK  # filled in by the pane's wrapper
+    agent = None if args.no_agent else args.agent
+    if args.command:
+        command, agent = args.command, None
+    elif agent:
+        prompt = DRAFT_PROMPT.format(objectives=f"{base}/objectives.md",
+                                     draft=f"{base}/ticket-draft.md") if args.draft else args.prompt
+        command = agent_command(agent, prompt)
+    else:
+        if args.draft:
+            fail("--draft needs an agent")
+        command = None
+    warnings = []
+    session, window, main, show = create_session(name, "main", cwd, command, warnings)
+    # The command is running from here on: every later failure is a warning.
+    bar = bar_pane(warnings, args, session, window)
+    directory = state_dir(session)
+    fields = dict(session_id=session, window_id=window, main_block=main, show_block=show, bar_block=bar,
+                  label=name, kind="scratch", ticket=None, agent=agent, cwd=str(cwd),
+                  drafting=True if args.draft else None, created_at=int(time.time()))
+    state = soft(warnings, "session.json not written", lambda: update_state(directory, **fields)) or fields
+    soft(warnings, "objectives.md not written", write_objectives, directory, name)
+    if args.focus:
+        soft(warnings, "focus", focus_session, session, window)
+    emit({**result_of(session, state, directory), "reused": False, "warnings": warnings})
+
+
+def start_ask(args):
+    """Terminal fallback for the picker: ask on the tty, then start."""
+    print("Start work\n  1) Scratch session\n  2) Draft a ticket with an agent")
+    choice = input("Choose 1 or 2: ").strip()
+    if choice not in ("1", "2"):
+        print("Cancelled.")
+        return
+    name = input("Short name: ").strip()
+    if not name:
+        print("Cancelled.")
+        return
+    if choice == "1":
+        args.scratch = name
+    else:
+        args.draft = name
+    start_named(args, "scratch" if choice == "1" else "draft")
+
+
+def result_of(session, state, directory):
+    return {"session_id": session, "label": state.get("label"), "kind": state.get("kind"),
+            "ticket": state.get("ticket"), "title": state.get("title"), "url": state.get("url"),
+            "window_id": state.get("window_id"), "main_block": state.get("main_block"),
+            "show_block": state.get("show_block"), "bar_block": state.get("bar_block"), "state_dir": str(directory),
+            "repo": state.get("repo"), "worktree": state.get("worktree"), "branch": state.get("branch"),
+            "worktree_provider": state.get("worktree_provider"), "lease_id": state.get("lease_id"),
+            "agent": state.get("agent")}
+
+
+def cmd_start(args):
+    picked = [x for x in (args.scratch, args.draft, args.ticket) if x]
+    if args.ask:
+        return start_ask(args)
+    if len(picked) != 1:
+        fail("give exactly one of --scratch NAME, --draft NAME, or a ticket id")
+    if args.ticket:
+        return start_ticket(args)
+    if args.repo:
+        fail("--repo is only for ticketed sessions; a scratch or draft session never gets a worktree")
+    return start_named(args, "scratch" if args.scratch else "draft")
+
+
+# ---- adopt ------------------------------------------------------------------
+
+def caller(args, need_block=False):
+    session = args.session or os.environ.get("REX_SESSION")
+    if not session:
+        fail("not in Rex: pass --session")
+    session = session_id(session)
+    block = getattr(args, "block", None) or os.environ.get("REX_BLOCK")
+    if block and not block.startswith("block:"):
+        block = "block:" + block
+    if block and not BLOCK_RE.match(block):
+        fail(f"not a Rex block id: {block!r}")
+    if need_block and not block:
+        fail("not in a Rex pane: pass --block")
+    return session, block
+
+
+def git_branch_info(path):
+    top = git("rev-parse", "--show-toplevel", cwd=path, check=False)
+    if not top:
+        return {}
+    branch = git("symbolic-ref", "-q", "--short", "HEAD", cwd=top, check=False)
+    _, main = repo_root(top)
+    return {"repo": str(main), "worktree": top, "branch": branch}
+
+
+def cmd_adopt(args):
+    session, block = caller(args, need_block=True)
+    view = inspect(session)
+    window = window_of(view, block)
+    if not window:
+        fail(f"{block} is not in a tab of {session}")
+    directory = state_dir(session)
+    state = read_state(directory)
+    current = label = view.get("label") or ""
+    if args.name:
+        label = check_name(args.name)
+    elif is_generated_label(label) and not state.get("label"):
+        fail(f"session still has a generated name ({label}); pass --name NAME")
+    ticket = ticket_of_label(label)
+    stale = ticket_change(state, ticket)
+    if stale and held_worktree(state):
+        fail(f"this session holds {state['worktree']} ({state['worktree_provider']}) for {state.get('ticket')}; "
+             "run `rexwork release` before changing its ticket")
+    if stale:
+        note(f"ticket changed from {state.get('ticket')} to {ticket or 'none'}; "
+             "dropped the old ticket's title, url, repo, worktree and branch")
+    updates = {**stale, "session_id": session, "window_id": window["window_id"], "main_block": block,
+               "label": label, "kind": "ticketed" if ticket else state.get("kind", "scratch"), "ticket": ticket}
+    if ticket and (stale or not state.get("title")):
+        if args.title:
+            updates["title"] = args.title
+        else:
+            try:
+                issue = get_issue(ticket)
+                updates.update(title=issue["title"], url=issue["url"])
+            except Failure as e:
+                note(f"no title for {ticket}: {e}")
+    if ticket:
+        info = git_branch_info(args.repo or caller_cwd())
+        if branch_matches_ticket(info.get("branch"), ticket):
+            updates.update(info)
+            if not same_path(info["worktree"], state.get("worktree")) or not state.get("worktree_provider"):
+                try:
+                    found = found_worktree(info["repo"], info["worktree"], info["branch"], ticket,
+                                           worktree_provider(info["repo"], info["worktree"]), "adopt")
+                except Failure as e:  # someone else's slot, or unreadable: never released by rexwork
+                    note(f"recording {info['worktree']} as adopted: {e}")
+                    found = tree_of(info["repo"], info["branch"], info["worktree"], "adopt", "adopted")
+                updates.update(worktree_provider=found["worktree_provider"], lease_id=found["lease_id"],
+                               worktree_created=found["worktree_created"],
+                               worktree_at=state.get("worktree_at") or int(time.time()))
+        elif args.repo:
+            fail(f"{args.repo} is on branch {info.get('branch')!r}, which is not a {ticket} branch "
+                 f"({BRANCH_PREFIX}{ticket.lower()} or {BRANCH_PREFIX}{ticket.lower()}-...)")
+    if not state.get("created_at"):
+        updates["created_at"] = int(time.time())
+    if args.agent:
+        updates["agent"] = args.agent
+    if label != current:  # rename only after every check passed
+        rex("session", "rename", session, label)
+    show = open_show(session, block)
+    updates["show_block"] = show["pane"]
+    warnings = []
+    updates["bar_block"] = bar_pane(warnings, args, session, window["window_id"]) or state.get("bar_block")
+    state = update_state(directory, **updates)
+    write_objectives(directory, label, ticket, state.get("url"))
+    emit({**result_of(session, state, directory), "show_created": show.get("created_pane", False),
+          "warnings": warnings})
+
+
+# ---- promote ----------------------------------------------------------------
+
+REQUEST_DRAFT = (
+    "Tal asked to turn this session into a Linear ticket. Run `rexwork promote --template`, "
+    "fill it in from this conversation and {objectives}, save it to {draft}, then run "
+    "`rexwork promote`. Tal files it from the Neovim float; do not file it yourself."
+)
+
+
+def token_hash(token):
+    return hashlib.sha256(token.encode()).hexdigest()
+
+
+def content_digest(content):
+    return hashlib.sha256(content.encode()).hexdigest()
+
+
+def require_state(session):
+    directory = state_dir(session)
+    state = read_state(directory)
+    if not state:
+        fail(f"no rexwork state for {session}; run `rexwork adopt` in that session first")
+    return directory, state
+
+
+def describe_input(payload, info):
+    shown = dict(payload)
+    shown["assigneeId"] = f"{payload['assigneeId']} ({info['viewer']['name']}, me)"
+    shown["stateId"] = f"{payload['stateId']} (In Progress)"
+    shown["teamId"] = f"{payload['teamId']} ({TEAM})"
+    return shown
+
+
+def detect_repo(session, state):
+    """The main repo of the session's directory (session.json cwd, else the main pane's), or None."""
+    for path in (state.get("cwd"), pane_cwd(session, state.get("main_block"))):
+        if path and Path(path).is_dir() and git("rev-parse", "--show-toplevel", cwd=path, check=False):
+            try:
+                return str(repo_root(path)[1])
+            except Failure:
+                continue
+    return None
+
+
+def branch_hint(repo):
+    return (f"No branch will be attached. The session's directory is in {repo}: create a "
+            f"{BRANCH_PREFIX}tal-<n>-... worktree there, then run `rexwork adopt --repo WORKTREE` "
+            "from the agent pane to attach it.")
+
+
+def preview_of(title, description, record):
+    lines = description.rstrip("\n").splitlines()
+    preview = {"title": title, "description_lines": len(lines), "description_chars": len(description),
+               "description_head": lines[:4]}
+    if record.get("repo"):
+        preview["branch"] = f"a worktree and branch in {record['repo']}"
+    elif record.get("detected_repo"):
+        preview["branch"] = branch_hint(record["detected_repo"])
+    else:
+        preview["branch"] = "no repo: no branch will be attached"
+    return preview
+
+
+def post_filing_steps(filing):
+    """What promotion does after issueCreate: relabel the session and tab, and with a repo,
+    the worktree."""
+    return ["label"] + (["worktree"] if filing.get("repo") else [])
+
+
+def pending_steps(state):
+    """Post-filing steps not yet done for a recorded ticket; [] when nothing is pending."""
+    filing = state.get("filing") or {}
+    if not filing.get("ticket") or filing.get("dry_run"):
+        return []
+    if "done" not in filing and state.get("kind") == "ticketed":
+        return []  # recorded by an older rexwork, which finished in one go
+    return [s for s in post_filing_steps(filing) if s not in filing.get("done", [])]
+
+
+def interrupted_filing(state):
+    """A real filing attempt that recorded no ticket (it failed or timed out), or None."""
+    filing = state.get("filing")
+    if isinstance(filing, dict) and not filing.get("dry_run") and not filing.get("ticket"):
+        return filing
+    return None
+
+
+def pending_note(state):
+    """One line about an unfinished earlier attempt, or None."""
+    filing = interrupted_filing(state)
+    if filing:
+        return (f"an earlier filing attempt ({describe_when(filing)}, title {filing.get('title')!r}) recorded "
+                f"no ticket; confirming looks up its issue id {filing.get('issue_uuid')} in Linear and adopts "
+                "it if it exists. Nothing new is created.")
+    steps = pending_steps(state)
+    if steps:
+        return (f"{state['filing']['ticket']} was filed but promotion did not finish ({', '.join(steps)}); "
+                "run `rexwork promote --recover` to finish it")
+    return None
+
+
+def describe_when(filing):
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(filing.get("at", 0)))
+
+
+def cmd_promote(args):
+    session, block = caller(args)
+    directory, state = require_state(session)
+    if args.clear_filing:
+        return clear_filing(directory)
+    if args.recover:
+        return recover_promotion(args, session, directory)
+    draft = directory / "ticket-draft.md"
+    if args.template:
+        objectives = directory / "objectives.md"
+        sys.stdout.write(draft_template(objectives.read_text() if objectives.exists() else ""))
+        return
+    if args.preview:
+        return preview_request(directory)
+    if args.file:
+        return file_ticket(args, session, directory, draft)
+    if pending_steps(state):
+        fail(pending_note(state))
+    if state.get("kind") == "ticketed":
+        fail(f"this session is already ticketed ({state.get('ticket')})")
+    if args.draft:
+        src = Path(args.draft).expanduser().resolve()
+        if not src.is_file():
+            fail(f"no such file: {src}")
+        if src != draft.resolve():
+            shutil.copyfile(src, draft)
+    if not draft.exists():
+        if args.request_draft:
+            return request_draft(session, directory, state)
+        fail(f"no draft at {draft}; write it first (`rexwork promote --template` prints the skeleton)")
+    try:
+        title, description = parse_draft(draft.read_text())
+    except ValueError as e:
+        fail(f"{draft}: {e}")
+    payload, info = build_issue_input(title, description)
+    detected = None if args.repo else detect_repo(session, state)
+    # Default on: the session's repo gets the ticket's worktree, unless --no-worktree.
+    repo = str(Path(args.repo).expanduser().resolve()) if args.repo else (None if args.no_worktree else detected)
+    detected = None if repo else detected
+    agent_block = block or state.get("main_block")
+    if not agent_block:
+        fail("no agent pane: pass --block or run `rexwork adopt` first")
+
+    # The authorization: its hash and mode on disk, the token in a 0600 one-shot file
+    # that the draft's Neovim reads and deletes. The token never travels in argv.
+    token = secrets.token_urlsafe(24)
+    record = {"token_sha256": token_hash(token), "created_at": int(time.time()), "dry_run": bool(args.dry_run),
+              "repo": repo, "detected_repo": detected}
+    token_file = directory / "promote.token"
+    with session_lock(directory):
+        (directory / "promote.json").write_text(json.dumps(record, indent=2) + "\n")
+        token_file.unlink(missing_ok=True)
+        fd = os.open(token_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(token)
+    try:
+        sock = prepare_viewer(draft.resolve(), session, agent_block)
+        install_confirm_key(sock, {"draft": str(draft.resolve()), "token_file": str(token_file),
+                                   "session": session, "rexwork": str(Path(__file__).resolve()),
+                                   "dry_run": bool(args.dry_run), "python": sys.executable})
+    except Failure:
+        token_file.unlink(missing_ok=True)
+        (directory / "promote.json").unlink(missing_ok=True)
+        raise
+    token_file.unlink(missing_ok=True)  # Neovim has read it; normally already gone
+
+    docview_args = [sys.executable, str(DOCVIEW), "open", str(draft.resolve()), "--session", session,
+                    "--agent-block", agent_block, "--title", "Ticket draft", "--tab-label", "Ticket: draft",
+                    "--kind", "ticket"]
+    if args.no_focus:
+        docview_args.append("--no-focus")
+    out = run(docview_args, timeout=60)
+    if out.returncode != 0:
+        fail(f"docview: {out.stderr.strip()}")
+    view = json.loads(out.stdout)
+    result = {"draft": str(draft), "viewer": view.get("viewer"), "confirm_key": True,
+              "dry_run": bool(args.dry_run), "would_create": describe_input(payload, info),
+              "repo": repo, "detected_repo": detected,
+              "message": "The draft is open in Neovim. Tal files it with Space r L (or :RexworkFile) and "
+                         "typing yes; closing the float files nothing."}
+    if detected:
+        result["branch_hint"] = branch_hint(detected)
+        note(branch_hint(detected))
+    if pending_note(state):
+        result["pending"] = pending_note(state)
+        note(result["pending"])
+    emit(result)
+
+
+def prepare_viewer(draft, session, agent_block):
+    """Start the session's shared editor Neovim (docview's) if needed; its socket. The draft
+    becomes a tab there when `docview open` shows it; its comments go to AGENT_BLOCK."""
+    dv = importlib_docview()
+    try:
+        sock, _ = dv.ensure_server(session, cwd=draft.parent)
+    except SystemExit:
+        fail(f"could not start the editor Neovim for {draft}")
+    return sock
+
+
+def install_confirm_key(sock, params):
+    """Load promote.lua into the draft's Neovim. Values travel as JSON data (docview's `arg`),
+    never inside the Lua source. Fails, before any float opens, if it does not load."""
+    dv = importlib_docview()
+    code = ("(function() local ok, r = pcall(function() return dofile(_A.lua)(_A.params) end) "
+            "if ok then return r end return 'error: ' .. tostring(r) end)()")
+    result = None
+    for _ in range(3):
+        result = dv.lua(Path(sock), code, timeout=5, arg={"lua": str(PROMOTE_LUA), "params": params})
+        if result == 1:
+            return True
+        if isinstance(result, str):
+            break
+        time.sleep(0.3)
+    fail(f"could not install the confirm key in the draft's Neovim: {result!r}; no float opened")
+
+
+_DOCVIEW = None
+
+
+def importlib_docview():
+    global _DOCVIEW
+    if _DOCVIEW is None:
+        import importlib.util
+        from importlib.machinery import SourceFileLoader
+        loader = SourceFileLoader("docview", str(DOCVIEW))
+        module = importlib.util.module_from_spec(importlib.util.spec_from_loader("docview", loader))
+        loader.exec_module(module)
+        _DOCVIEW = module
+    return _DOCVIEW
+
+
+def request_draft(session, directory, state):
+    main = state.get("main_block")
+    if not main:
+        fail("no main pane recorded; run `rexwork adopt` from the agent pane")
+    text = REQUEST_DRAFT.format(objectives=directory / "objectives.md", draft=directory / "ticket-draft.md")
+    rex("send", "-s", session, "-b", main, text)
+    rex("send-key", "-s", session, "-b", main, "enter")
+    emit({"requested": True, "agent_block": main,
+          "message": "No draft yet; asked the agent to write one and run `rexwork promote`."})
+
+
+def read_json_stdin():
+    try:
+        data = json.loads(sys.stdin.read())
+    except ValueError:
+        fail("expected a JSON object on stdin")
+    if not isinstance(data, dict):
+        fail("expected a JSON object on stdin")
+    return data
+
+
+def preview_request(directory):
+    """`--preview`: parse the content on stdin (what the float is about to confirm) and
+    report what would be filed. No network, no authorization, nothing written."""
+    req = read_json_stdin()
+    content = req.get("content")
+    if not isinstance(content, str):
+        fail("no content on stdin")
+    try:
+        title, description = parse_draft(content)
+    except ValueError as e:
+        fail(str(e))
+    try:
+        record = json.loads((directory / "promote.json").read_text())
+    except (OSError, ValueError):
+        record = {}
+    out = {**preview_of(title, description, record), "digest": content_digest(content),
+           "dry_run": bool(record.get("dry_run"))}
+    pending = pending_note(read_state(directory))
+    if pending:
+        out["pending"] = pending
+    emit(out)
+
+
+def load_authorization(directory):
+    try:
+        record = json.loads((directory / "promote.json").read_text())
+    except (OSError, ValueError):
+        fail("no open authorization for this session (already used, or never opened); "
+             "run `rexwork promote` again")
+    if not isinstance(record, dict):
+        fail("promote.json is not a JSON object; run `rexwork promote` again")
+    return record
+
+
+def filing_request(args, directory, draft, pending=None):
+    """What to file and whether Tal confirmed it: (content, digest, record).
+
+    From the float (--stdin): the request carries the token, the exact content Tal
+    confirmed and its digest. The content must match the digest, the token must match
+    the open authorization, and the mode (real or dry run) must match the one recorded.
+    The draft file on disk is never read. From a terminal: the file is read once, shown,
+    and that same text is filed after Tal types yes."""
+    if args.stdin:
+        req = read_json_stdin()
+        record = load_authorization(directory)
+        token, content, digest = req.get("token"), req.get("content"), req.get("digest")
+        if not (isinstance(token, str) and isinstance(content, str) and isinstance(digest, str)):
+            fail("the request needs token, content and digest")
+        if not secrets.compare_digest(record.get("token_sha256", ""), token_hash(token)):
+            fail("the confirm token does not match the open authorization; run `rexwork promote` again")
+        if time.time() - int(record.get("created_at", 0)) > AUTH_TTL:
+            fail("the authorization has expired; run `rexwork promote` again")
+        mode = bool(req.get("dry_run"))
+        if mode != bool(record.get("dry_run")) or mode != bool(args.dry_run):
+            fail(f"mode mismatch: the authorization is for {'a dry run' if record.get('dry_run') else 'real filing'}")
+        if not secrets.compare_digest(content_digest(content), digest):
+            fail("the content does not match the digest Tal confirmed; nothing filed")
+        return content, digest, record
+    if sys.stdin.isatty() and sys.stderr.isatty():
+        if args.draft:
+            draft = Path(args.draft).expanduser().resolve()
+        if not draft.exists():
+            fail(f"no draft at {draft}")
+        content = draft.read_text()
+        try:
+            title, description = parse_draft(content)
+        except ValueError as e:
+            fail(f"{draft}: {e}")
+        record = {"dry_run": bool(args.dry_run),
+                  "repo": str(Path(args.repo).expanduser().resolve()) if args.repo else None}
+        ask = (f"Note: {pending}\nReconcile that attempt (nothing new is created)? Type yes: " if pending
+               else f"Create this issue in {TEAM}, assigned to you, In Progress? Type yes: ")
+        sys.stderr.write(("DRY RUN (nothing is written)\n" if args.dry_run else "")
+                         + f"Title: {title}\n\n{description}\n" + ask)
+        sys.stderr.flush()
+        if sys.stdin.readline().strip() != "yes":
+            fail("not filed")
+        return content, content_digest(content), record
+    fail("refusing to file without Tal's confirmation: Tal files from the draft float "
+         "(Space r L) or runs `rexwork promote --file` in a terminal")
+
+
+def file_ticket(args, session, directory, draft):
+    """The one place an issue is created. Under the session lock, in order: refuse a
+    finished promotion; check the request (token, digest and mode, or Tal's yes in a
+    terminal) before anything else; a dry run then reports and writes nothing (it only
+    uses up the authorization). A real, confirmed attempt with an earlier unfinished one
+    reconciles that by its recorded issue id and creates nothing. Otherwise: use up the
+    authorization, record the attempt (with the issue id chosen here, so Linear can not
+    create it twice), issueCreate, then the post-filing steps."""
+    with session_lock(directory):
+        state = read_state(directory)
+        if state.get("kind") == "ticketed" and not pending_steps(state):
+            fail(f"this session is already ticketed ({state.get('ticket')})")
+        earlier = state.get("filing") if isinstance(state.get("filing"), dict) else None
+        earlier = earlier if earlier and not earlier.get("dry_run") else None
+        content, digest, record = filing_request(args, directory, draft,
+                                                 pending=pending_note(state) if earlier else None)
+        if not args.stdin and not record.get("repo") and not args.no_worktree:
+            record["repo"] = detect_repo(session, state)  # default on, as `rexwork promote` does
+        try:
+            title, description = parse_draft(content)
+        except ValueError as e:
+            fail(str(e))
+        dry_run = bool(record.get("dry_run"))
+        if dry_run:
+            payload, info = build_issue_input(title, description)  # read-only lookups
+            if args.stdin:
+                (directory / "promote.json").unlink(missing_ok=True)  # one use only
+            payload["id"] = "<chosen when filing>"
+            tree = plan_worktree(record["repo"], f"{TEAM}-0", title) if record.get("repo") else None
+            if tree:
+                tree["worktree_provider"] = worktree_provider(tree["repo"])
+                if tree["worktree_provider"] == "treehouse":
+                    tree["worktree"] = f"a treehouse slot leased by {lease_holder(TEAM + '-<n>')}"
+            out = {"dry_run": True, "digest": digest, "would_create": describe_input(payload, info),
+                   "preview": preview_of(title, description, record),
+                   "then": {"session_label": ticket_label(f"{TEAM}-<n>", title), "tab_label": f"{TEAM}-<n>",
+                            "state": {"kind": "ticketed"},
+                            "worktree": tree and {**tree, "note": "branch uses the real ticket number"}}}
+            if earlier:
+                out["pending"] = pending_note(state)
+                out["would_create"] = None
+            emit(out)
+            return
+        if earlier:
+            # Confirmed for real: finish the earlier attempt; never create a second issue.
+            reconcile_filing(session, directory, state, earlier)
+            if args.stdin:
+                (directory / "promote.json").unlink(missing_ok=True)
+            return
+        payload, info = build_issue_input(title, description)
+        if args.stdin:
+            (directory / "promote.json").unlink(missing_ok=True)  # one use only
+        filing = {"at": int(time.time()), "title": title, "digest": digest, "issue_uuid": str(uuid.uuid4()),
+                  "dry_run": False, "repo": record.get("repo"), "detected_repo": record.get("detected_repo")}
+        payload["id"] = filing["issue_uuid"]
+        update_state(directory, filing=filing)
+        (directory / "ticket-filed.md").write_text(content)
+        try:
+            issue = create_issue(payload)
+        except Failure as e:
+            fail(f"{e}. The filing record stays in session.json, so this can not file twice: run "
+                 "`rexwork promote --recover` in a terminal to look the issue up in Linear by its id and adopt it")
+        record_ticket(directory, filing, issue)
+        finish_promote(session, directory, issue)
+
+
+def record_ticket(directory, filing, issue):
+    """The issue exists: the session is ticketed from here on, whatever happens next.
+    `filing.done` lists the post-filing steps finished so far."""
+    update_state(directory, filing={**filing, "issue_id": issue["id"], "ticket": issue["identifier"], "done": []},
+                 kind="ticketed", ticket=issue["identifier"], title=issue["title"], url=issue["url"], drafting=None)
+
+
+def reconcile_filing(session, directory, state, filing, adopted=True):
+    """Finish an earlier real attempt without creating anything: adopt the issue Linear has
+    under the attempt's recorded id, or finish the steps for the recorded ticket."""
+    if filing.get("ticket"):
+        issue = get_issue(filing.get("issue_id") or filing["ticket"])
+        if state.get("kind") != "ticketed" or "done" not in filing:
+            # Recorded by an older rexwork that stopped before relabelling.
+            update_state(directory, filing={**filing, "done": filing.get("done", [])}, kind="ticketed",
+                         ticket=issue["identifier"], title=issue["title"], url=issue["url"], drafting=None)
+    else:
+        issue = find_filed_issue(filing)
+        if not issue:
+            fail(no_issue_message(session, filing))
+        note(f"an earlier filing attempt created {issue['identifier']}; adopting it")
+        record_ticket(directory, filing, issue)
+    return finish_promote(session, directory, issue, adopted=adopted)
+
+
+def no_issue_message(session, filing):
+    return (f"Linear has no issue with id {filing.get('issue_uuid')}, the id the earlier filing attempt "
+            f"({describe_when(filing)}, title {filing.get('title')!r}) sent, so that attempt filed nothing. "
+            "Nothing was filed now. To retry: run `rexwork promote --clear-filing "
+            f"--session {session}` in a terminal (type yes), then `rexwork promote` and confirm again")
+
+
+def recover_promotion(args, session, directory):
+    """`promote --recover`: the explicit way to finish an earlier real attempt. Read-only
+    lookups first; then, after Tal types yes in a terminal, adopt and finish. Creates
+    nothing in Linear. With --dry-run it reports and writes nothing."""
+    with session_lock(directory):
+        state = read_state(directory)
+        filing = state.get("filing") if isinstance(state.get("filing"), dict) else None
+        steps = pending_steps(state)
+        if not filing or filing.get("dry_run") or (filing.get("ticket") and not steps):
+            fail("nothing to recover: no interrupted filing or unfinished promotion in session.json")
+        if filing.get("ticket"):
+            issue = get_issue(filing.get("issue_id") or filing["ticket"])
+            what = f"finish promoting {issue['identifier']}: {', '.join(steps)}"
+        else:
+            issue = find_filed_issue(filing)
+            if not issue:
+                fail(no_issue_message(session, filing))
+            what = (f"adopt {issue['identifier']} ({issue['title']!r}, issue id {issue['id']}, created by the "
+                    f"attempt at {describe_when(filing)}), then: {', '.join(post_filing_steps(filing))}")
+        if args.dry_run:
+            emit({"dry_run": True, "recover": what, "ticket": issue["identifier"], "url": issue.get("url")})
+            return
+        if not (sys.stdin.isatty() and sys.stderr.isatty()):
+            fail(f"--recover asks for confirmation; run it in a terminal. It would {what}")
+        sys.stderr.write(f"Recover: {what}. Nothing is created in Linear. Type yes: ")
+        sys.stderr.flush()
+        if sys.stdin.readline().strip() != "yes":
+            fail("not recovered")
+        return reconcile_filing(session, directory, state, filing)
+
+
+def clear_filing(directory):
+    with session_lock(directory):
+        state = read_state(directory)
+        filing = interrupted_filing(state)
+        if not filing:
+            fail("no interrupted filing to clear")
+        if filing.get("issue_uuid"):
+            issue = find_filed_issue(filing)
+            if issue:
+                fail(f"Linear has {issue['identifier']} from that attempt; run `rexwork promote --recover` "
+                     "in a terminal to adopt it")
+            known = f"Linear has no issue with its id {filing['issue_uuid']}."
+        else:
+            known = "It recorded no issue id; check Linear by hand first."
+        if not (sys.stdin.isatty() and sys.stderr.isatty()):
+            fail("--clear-filing asks for confirmation; run it in a terminal")
+        sys.stderr.write(f"Clear the interrupted filing of {filing.get('title')!r}? {known} Type yes: ")
+        sys.stderr.flush()
+        if sys.stdin.readline().strip() != "yes":
+            fail("not cleared")
+        update_state(directory, filing=None)
+    emit({"cleared": True})
+
+
+def finish_promote(session, directory, issue, adopted=False):
+    """The post-filing steps still pending for the recorded ticket, each recorded in
+    `filing.done` as it completes, so a retry does only what is left. Creates nothing in
+    Linear."""
+    ticket, title = issue["identifier"], issue["title"]
+    label = ticket_label(ticket, title)
+    errors, notes = [], []
+    state = read_state(directory)
+    filing = dict(state["filing"])
+    done = list(filing.get("done", []))
+
+    def mark(step, **updates):
+        nonlocal filing
+        done.append(step)
+        filing = {**filing, "done": list(done)}
+        update_state(directory, filing=filing, **updates)
+
+    if "label" not in done:
+        try:
+            rex("session", "rename", session, label)
+            if state.get("window_id"):
+                rex("window", "rename", "-s", session, state["window_id"], ticket)
+            mark("label", label=label)
+        except Failure as e:
+            errors.append(str(e))
+    repo = filing.get("repo")
+    if repo and "worktree" not in done:
+        try:
+            tree = ensure_worktree(repo, ticket, title, read_state(directory))
+            mark("worktree", **tree_fields(tree))
+            if tree.get("worktree_created"):
+                hand_over_worktree(directory, tree["worktree"])
+        except WorktreeIncomplete as e:
+            update_state(directory, **tree_fields(e.tree))  # keep the lease so a retry reuses it
+            errors.append(str(e))
+        except Failure as e:
+            errors.append(str(e))
+    elif not repo and filing.get("detected_repo"):
+        notes.append(branch_hint(filing["detected_repo"]).replace("No branch will be attached", "No branch attached")
+                     .replace("tal-<n>", ticket.lower()))
+        if not state.get("repo"):
+            update_state(directory, repo=filing["detected_repo"])
+    pending = [s for s in post_filing_steps(filing) if s not in done]
+    if not pending:
+        update_state(directory, promoted_at=int(time.time()))
+    state = read_state(directory)
+    (directory / "promote.json").unlink(missing_ok=True)
+    for n in notes:
+        note(n)
+    emit({"ticket": ticket, "url": issue["url"], "label": state.get("label"), "worktree": state.get("worktree"),
+          "branch": state.get("branch"), "repo": state.get("repo"), "adopted": adopted, "notes": notes,
+          "errors": errors, "pending": pending})
+    if pending:
+        fail(f"{ticket} is filed, but {', '.join(pending)} did not finish: {'; '.join(errors)}. Fix that, then "
+             "run `rexwork promote --recover` in a terminal; it finishes only what is left and creates nothing")
+
+
+# ---- land -------------------------------------------------------------------
+
+def open_pr(worktree, branch):
+    out = run(["gh", "pr", "list", "--head", branch, "--state", "open", "--json", "url,number"], cwd=worktree)
+    if out.returncode != 0:
+        fail(f"gh pr list: {out.stderr.strip()}")
+    prs = json.loads(out.stdout or "[]")
+    return prs[0]["url"] if prs else None
+
+
+def pr_body(directory, state):
+    objectives = directory / "objectives.md"
+    body = objectives.read_text().strip() if objectives.exists() else ""
+    link = f"Linear: [{state.get('ticket')}]({state['url']})" if state.get("url") else f"Linear: {state.get('ticket')}"
+    return (body + "\n\n" if body else "") + link + "\n"
+
+
+def own_session():
+    env = os.environ.get("REX_SESSION")
+    return session_id(env) if env and is_session_id(env) else None
+
+
+def close_session(session):
+    """Close the session after this process has printed its result."""
+    if session == own_session():
+        # Closing our own session ends this process; let it finish first.
+        subprocess.Popen(["/bin/sh", "-c", 'sleep 1; rex kill "$0"', session], start_new_session=True,
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return "closing"
+    rex("kill", session)
+    return "closed"
+
+
+def archive(directory):
+    check_state_dir(directory)
+    ARCHIVE.mkdir(parents=True, exist_ok=True, mode=0o700)
+    target = ARCHIVE / directory.name
+    if target.exists():
+        target = ARCHIVE / f"{directory.name}-{int(time.time())}"
+    directory.replace(target)
+    return target
+
+
+def verify_branch(state, ticket, worktree, branch):
+    """The session's worktree really is this ticket's branch, in the recorded repo."""
+    if not branch_matches_ticket(branch, ticket):
+        fail(f"branch {branch} is not a {ticket} branch; fix it with `rexwork adopt --repo WORKTREE`")
+    if not Path(worktree).is_dir():
+        fail(f"worktree {worktree} is missing")
+    current = git("symbolic-ref", "-q", "--short", "HEAD", cwd=worktree, check=False)
+    if current != branch:
+        fail(f"{worktree} is on {current}, not {branch}")
+    if state.get("repo"):
+        _, main = repo_root(worktree)
+        if str(main) != str(Path(state["repo"]).resolve()):
+            fail(f"{worktree} belongs to {main}, not the recorded repo {state['repo']}")
+
+
+def land_plan(args, session, directory):
+    """What land would do, from state and git read now: (plan, digest, state). Read-only.
+    The digest covers the session's live association (kind, ticket, repo, worktree, branch
+    and branch head) whatever the chosen variant does, the commit that would be pushed and
+    every action, so a plan Tal saw can be checked before it runs."""
+    state = read_state(directory)
+    if not state:
+        fail(f"no rexwork state for {session}; run `rexwork adopt` in that session first")
+    if state.get("owner") == "symphony":
+        fail("this session is owned by Symphony, which lands its own work (PR and Linear state); "
+             "rexwork land does not touch it")
+    label = state.get("label") or session
+    alive = session in live_sessions()
+    close = not args.keep and alive
+    ticketed = state.get("kind") == "ticketed"
+    actions = []
+    plan = {"session_id": session, "label": label, "kind": state.get("kind"), "ticket": None, "repo": None,
+            "worktree": None, "branch": None, "head": None, "no_branch": False, "publish": False,
+            "close": close, "archive": not ticketed and not args.keep, "push": False, "pr": False,
+            "linear": False, "live": live_association(state), "actions": actions}
+
+    if ticketed:
+        ticket, worktree, branch = state.get("ticket"), state.get("worktree"), state.get("branch")
+        if not ticket:
+            fail("ticketed session without a ticket in session.json")
+        plan["ticket"] = ticket
+        has_branch = bool(worktree and branch)
+        if has_branch and args.linear_only:
+            fail(f"{ticket} has branch {branch} attached (in {worktree}); --linear-only is only for a "
+                 "ticket without a branch. Land without it to push and open the PR, or with --no-pr "
+                 "to push without a PR")
+        if has_branch:
+            verify_branch(state, ticket, worktree, branch)
+            changes = git("status", "--porcelain", cwd=worktree, check=False)
+            if changes:
+                fail(f"{worktree} has uncommitted changes; commit or remove them first:\n{changes}")
+            if "origin" not in (git("remote", cwd=worktree) or "").split():
+                fail(f"{worktree} has no origin remote")
+            head = git("rev-parse", "--verify", "--quiet", f"refs/heads/{branch}", cwd=worktree, check=False)
+            if not head:
+                fail(f"{branch} has no commit in {worktree}; nothing to push")
+            plan.update(repo=state.get("repo"), worktree=worktree, branch=branch, head=head, push=True,
+                        pr=not args.no_pr, publish=True)
+            actions.append(f"git push origin {head[:12]}:refs/heads/{branch} (exactly that commit, "
+                           f"in {worktree}; never forced)")
+            actions.append("skip the PR (--no-pr)" if args.no_pr else
+                           f"open a PR for {branch} if none is open: title {pr_title(state)!r}")
+        else:
+            plan["no_branch"] = True
+            if args.linear_only:
+                actions.append("no branch or PR: Linear only (--linear-only)")
+            elif args.no_linear:
+                actions.append("no branch or PR, and Linear skipped (--no-linear)")
+            elif args.dry_run:
+                actions.append("no branch or PR: land refuses without --linear-only")
+            else:
+                fail(f"{ticket} has no branch attached, so land would push nothing and open no PR. "
+                     "Attach one with `rexwork adopt --repo WORKTREE`, or pass --linear-only to move "
+                     f"{ticket} to In Review without a PR")
+        if args.no_linear:
+            actions.append("skip Linear (--no-linear)")
+        else:
+            actions.append(f"{'comment the PR link on ' + ticket + ' and ' if has_branch and not args.no_pr else ''}"
+                           f"move {ticket} to In Review")
+            plan.update(linear=True, publish=True)
+    elif args.keep:
+        actions.append(f"keep {directory} (scratch with --keep: nothing is archived while the session stays open)")
+    else:
+        actions.append(f"move {directory} to {ARCHIVE}/")
+    kept = held_worktree(state)
+    if kept and plan["archive"]:
+        fail(f"this session holds {kept['worktree']}; run `rexwork release` before archiving it")
+    if kept:
+        plan["worktree_kept"] = kept["worktree"]
+        actions.append(f"keep the worktree {kept['worktree']} ({kept['provider']}) for review fixes; "
+                       f"`rexwork release --session {session}` frees it once the PR is merged")
+
+    if close:
+        actions.append(f"close Rex session {label!r} ({session})")
+    elif not alive:
+        actions.append("the Rex session is already gone")
+    else:
+        actions.append("keep the session open (--keep)")
+    digest = hashlib.sha256(json.dumps(plan, sort_keys=True).encode()).hexdigest()
+    return plan, digest, state
+
+
+def live_association(state):
+    """The session's association as it is now, for the digest: any change to it (a branch
+    attached, a different worktree, a new commit) invalidates a confirmation."""
+    worktree, branch = state.get("worktree"), state.get("branch")
+    head = None
+    if worktree and branch and Path(worktree).is_dir():
+        head = git("rev-parse", "--verify", "--quiet", f"refs/heads/{branch}", cwd=worktree, check=False)
+    return {"kind": state.get("kind"), "ticket": state.get("ticket"), "repo": state.get("repo"),
+            "worktree": worktree, "branch": branch, "head": head}
+
+
+def pr_title(state):
+    return f"{state.get('ticket')}: {state.get('title') or state.get('ticket')}"
+
+
+def confirm_land_tty(label, plan):
+    sys.stderr.write(f"Land {label!r}:\n" + "".join(f"  - {p}\n" for p in plan["actions"]) + "Proceed? [y/N] ")
+    sys.stderr.flush()
+    if sys.stdin.readline().strip().lower() not in ("y", "yes"):
+        fail("not landed")
+
+
+# Fields of session.json a running land depends on; checked again before each external write.
+LAND_FIELDS = ("kind", "ticket", "repo", "worktree", "branch", "owner", "label", "title", "url")
+
+
+def recheck(directory, planned, before, plan=None):
+    """Stop before BEFORE if session.json (or the branch head) no longer matches the plan."""
+    now = read_state(directory)
+    changed = [k for k in LAND_FIELDS if now.get(k) != planned.get(k)]
+    if changed:
+        fail(f"session.json changed ({', '.join(changed)}) while landing; stopped before {before}. "
+             "The plan changed; look again")
+    if plan and plan.get("push"):
+        head = git("rev-parse", "--verify", "--quiet", f"refs/heads/{plan['branch']}", cwd=plan["worktree"],
+                   check=False)
+        if head != plan["head"]:
+            fail(f"{plan['branch']} moved from {plan['head']} to {head}; stopped before {before}. "
+                 "The plan changed; look again")
+
+
+def cmd_land(args):
+    """Plan, show, confirm, then recompute the plan under the session lock and run it only
+    if it is the plan that was shown (or the one --expect names)."""
+    session, _ = caller(args)
+    directory, _ = require_state(session)
+    if args.dry_run:
+        plan, digest, _ = land_plan(args, session, directory)
+        emit(land_result(plan, digest, dry_run=True))
+        return
+    shown = args.expect
+    if not args.yes:
+        plan, digest, _ = land_plan(args, session, directory)
+        if not plan_does_anything(plan):
+            return report_noop(plan, digest)
+        if not (sys.stdin.isatty() and sys.stderr.isatty()):
+            fail("land publishes or closes: pass --yes after checking `rexwork land --dry-run`, "
+                 "or run it in a terminal")
+        if shown and shown != digest:
+            fail("the plan changed since --expect was computed; look again (`rexwork land --dry-run`)")
+        confirm_land_tty(plan["label"], plan)
+        shown = digest
+    with session_lock(directory):
+        plan, digest, state = land_plan(args, session, directory)
+        if shown and not secrets.compare_digest(shown, digest):
+            fail("the plan changed; look again. Now it is:\n" + "\n".join(f"  - {a}" for a in plan["actions"]))
+        if not plan_does_anything(plan):
+            return report_noop(plan, digest)
+        run_land(args, session, directory, plan, digest, state)
+
+
+def plan_does_anything(plan):
+    return plan["publish"] or plan["close"] or plan["archive"]
+
+
+def report_noop(plan, digest):
+    note("nothing to do: " + "; ".join(plan["actions"]))
+    emit({**land_result(plan, digest, dry_run=False), "noop": True})
+
+
+def land_result(plan, digest, dry_run):
+    out = {"session_id": plan["session_id"], "label": plan["label"], "kind": plan["kind"], "dry_run": dry_run,
+           "plan": plan["actions"], "digest": digest,
+           "planned": {k: plan[k] for k in ("ticket", "repo", "worktree", "branch", "head", "close", "archive")}}
+    if plan["no_branch"]:
+        out["no_branch"] = True
+    if plan.get("worktree_kept"):
+        out["worktree_kept"] = plan["worktree_kept"]
+    return out
+
+
+def run_land(args, session, directory, plan, digest, state):
+    """Runs under the session lock, after the plan was checked."""
+    result = land_result(plan, digest, dry_run=False)
+    ticket, worktree, branch = plan["ticket"], plan["worktree"], plan["branch"]
+    if plan["kind"] == "ticketed":
+        pr_url = None
+        if plan["push"]:
+            recheck(directory, state, "git push", plan)
+            verify_branch(read_state(directory), ticket, worktree, branch)  # again, just before pushing
+            sha = plan["head"]
+            # Push exactly the confirmed commit; no `+`, no --force, so a non-fast-forward fails.
+            out = run(["git", "push", "origin", f"{sha}:refs/heads/{branch}"], cwd=worktree, timeout=180)
+            if out.returncode != 0:
+                fail(f"git push: {out.stderr.strip()}")
+            result["pushed"] = branch
+            result["pushed_sha"] = sha
+            up = run(["git", "branch", f"--set-upstream-to=origin/{branch}", branch], cwd=worktree)
+            if up.returncode != 0:
+                note(f"pushed, but could not set the upstream of {branch}: {up.stderr.strip()}")
+            now = git("rev-parse", "--verify", "--quiet", f"refs/heads/{branch}", cwd=worktree, check=False)
+            if now and now != sha:
+                result["local_ahead"] = now
+                note(f"pushed {sha[:12]}; local {branch} is now at {now[:12]}, not pushed")
+            if plan["pr"]:
+                pr_url = open_pr(worktree, branch)
+                if not pr_url:
+                    recheck(directory, state, "gh pr create")
+                    with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False) as f:
+                        f.write(pr_body(directory, state))
+                    out = run(["gh", "pr", "create", "--head", branch, "--title", pr_title(state),
+                               "--body-file", f.name], cwd=worktree, timeout=120)
+                    os.unlink(f.name)
+                    if out.returncode != 0:
+                        fail(f"gh pr create: {out.stderr.strip()}")
+                    pr_url = out.stdout.strip().splitlines()[-1]
+                result["pr_url"] = pr_url
+        if plan["linear"]:
+            recheck(directory, state, "the Linear update")
+            issue = get_issue(ticket)
+            if pr_url:
+                comment_issue(issue, f"PR: {pr_url}")
+            set_issue_state(issue, "In Review")
+            result["linear"] = "In Review"
+        update_state(directory, landed_at=int(time.time()), pr_url=pr_url)
+    if plan.get("worktree_kept"):
+        note(f"kept {plan['worktree_kept']}; run `rexwork release --session {session}` once the PR is merged")
+    if plan["archive"]:
+        recheck(directory, state, "archiving")
+        result["archived_to"] = str(archive(directory))
+    if plan["close"] and session == own_session():
+        result["session"] = "closing"
+        emit(result)
+        close_session(session)
+        return
+    if plan["close"]:
+        result["session"] = close_session(session)
+    emit(result)
+
+
+# ---- release ----------------------------------------------------------------
+
+def held_worktree(state):
+    """The worktree rexwork created (or leased) for this session and still holds, or None.
+    Only a `worktree_created` record for the recorded path counts; a path name alone never
+    makes a worktree rexwork's."""
+    record = state.get("worktree_created")
+    if (state.get("worktree") and isinstance(record, dict) and record.get("provider") in OWNED_PROVIDERS
+            and same_path(record.get("path"), state["worktree"])):
+        return {"worktree": state["worktree"], "provider": record["provider"],
+                "lease_id": state.get("lease_id") or record.get("lease_id"), "branch": state.get("branch"),
+                "repo": state.get("repo") or record.get("repo"), "since": record.get("at") or state.get("worktree_at"),
+                "record": record}
+    return None
+
+
+def describe_age(since):
+    if not since:
+        return "unknown age"
+    s = max(0, int(time.time()) - int(since))
+    for unit, size in (("d", 86400), ("h", 3600), ("m", 60)):
+        if s >= size:
+            return f"{s // size}{unit}"
+    return f"{s}s"
+
+
+def release_session(args):
+    """The state dir to release: by ticket (any session dir that holds its worktree), else
+    the caller's session (--session or $REX_SESSION)."""
+    if args.ticket:
+        ticket = normalize_ticket(args.ticket)
+        if not ticket:
+            fail(f"not a ticket id: {args.ticket}")
+        found = []
+        for path in sorted(SESSIONS.glob("*/session.json")) if SESSIONS.exists() else []:
+            if not is_session_id(path.parent.name):
+                continue
+            try:
+                data = json.loads(path.read_text())
+            except (OSError, ValueError):
+                continue
+            if isinstance(data, dict) and data.get("ticket") == ticket and held_worktree(data):
+                found.append(path.parent)
+        if not found:
+            fail(f"no rexwork session holds a worktree for {ticket}")
+        if len(found) > 1:
+            fail(f"several sessions hold a worktree for {ticket}: "
+                 + ", ".join(session_id(d.name) for d in found) + "; pass --session")
+        return session_id(found[0].name), check_state_dir(found[0])
+    session, _ = caller(args)
+    return session, state_dir(session)
+
+
+def worktree_risks(path):
+    """What removing PATH would lose: uncommitted changes, commits on no origin branch."""
+    risks = []
+    changes = git("status", "--porcelain", cwd=path, check=False)
+    if changes is None:
+        return [f"{path} is not a readable git worktree"]
+    if changes:
+        risks.append(f"uncommitted changes:\n{changes}")
+    if "origin" not in (git("remote", cwd=path, check=False) or "").split():
+        risks.append("no origin remote, so its commits can not be checked against it")
+    else:
+        unpushed = git("log", "--oneline", "HEAD", "--not", "--remotes=origin", cwd=path, check=False)
+        if unpushed:
+            risks.append(f"commits on no origin branch:\n{unpushed}")
+    return risks
+
+
+def release_plan(session, directory, state, force):
+    held = held_worktree(state)
+    if not held:
+        if state.get("worktree"):
+            fail(f"rexwork did not create {state['worktree']} ({state.get('worktree_provider') or 'adopted'}); "
+                 "it leaves it alone")
+        fail("this session holds no worktree")
+    if state.get("owner") == "symphony":
+        fail("this session is owned by Symphony, which manages its own workspace")
+    path, provider, lease_id = held["worktree"], held["provider"], held["lease_id"]
+    plan = {"session_id": session, "worktree": path, "provider": provider, "lease_id": lease_id,
+            "branch": held["branch"], "repo": held["repo"], "exists": Path(path).is_dir(), "risks": [],
+            "lease": None, "actions": []}
+    actions = plan["actions"]
+    if provider == "treehouse":
+        if not lease_id:
+            fail(f"no lease id recorded for {path}; return it by hand (`treehouse return` in {path})")
+        rows = treehouse_status(held["repo"] or path)
+        row = next((r for r in rows if same_path(r.get("path"), path)), None)
+        current = (row or {}).get("lease_id")
+        if current and current != lease_id:
+            fail(f"{path} is now leased by {row.get('lease_holder')!r} (lease {current}), not by this session; "
+                 "not touching it")
+        plan["lease"] = "held" if current == lease_id else "gone"
+    if provider == "git" and plan["exists"]:
+        problem = identity_problem(held["record"])
+        if problem:
+            fail(f"{problem}; rexwork removes only the worktree it created, so it leaves this one alone "
+                 "(remove it by hand if it should go)")
+    if plan["exists"]:
+        plan["risks"] = worktree_risks(path)
+    if plan["risks"] and not force:
+        fail(f"{path} has work that would be lost; commit and push it first, or pass --force (asks in a "
+             "terminal):\n" + "\n".join(plan["risks"]))
+    if provider == "treehouse" and plan["lease"] == "gone":
+        actions.append(f"forget {path}: treehouse no longer has lease {lease_id} on it")
+    elif provider == "treehouse":
+        actions.append(f"treehouse return {'--force ' if force else ''}--if-lease-id {lease_id} {path}"
+                       + (" (discards the work listed above)" if force and plan["risks"] else ""))
+    elif plan["exists"]:
+        actions.append(f"git worktree remove {'--force ' if force else ''}{path}"
+                       + (" (discards the work listed above)" if force and plan["risks"] else ""))
+    else:
+        actions.append(f"forget {path} (already gone); run `git worktree prune` in {held['repo']} yourself "
+                       "if its metadata should go too")
+    actions.append(f"keep branch {held['branch']} (never deleted)")
+    return plan
+
+
+def cmd_release(args):
+    """Free the worktree rexwork made for a ticket: treehouse return by lease id, or
+    git worktree remove. Refuses when work would be lost, unless --force after a typed yes."""
+    session, directory = release_session(args)
+    with session_lock(directory):
+        state = read_state(directory)
+        plan = release_plan(session, directory, state, args.force)
+        if args.dry_run:
+            emit({"dry_run": True, **plan})
+            return
+        if args.force and plan["risks"]:
+            if not (sys.stdin.isatty() and sys.stderr.isatty()):
+                fail("--force discards work; run it in a terminal and type yes")
+            sys.stderr.write(f"Release {plan['worktree']} and DISCARD:\n" + "\n".join(plan["risks"])
+                             + "\n" + "".join(f"  - {a}\n" for a in plan["actions"]) + "Type yes: ")
+            sys.stderr.flush()
+            if sys.stdin.readline().strip() != "yes":
+                fail("not released")
+        elif not args.yes:
+            if not (sys.stdin.isatty() and sys.stderr.isatty()):
+                fail("release removes a worktree: pass --yes after checking `rexwork release --dry-run`, "
+                     "or run it in a terminal")
+            sys.stderr.write(f"Release {plan['worktree']}:\n" + "".join(f"  - {a}\n" for a in plan["actions"])
+                             + "Proceed? [y/N] ")
+            sys.stderr.flush()
+            if sys.stdin.readline().strip().lower() not in ("y", "yes"):
+                fail("not released")
+        force = bool(args.force and plan["risks"])
+        path, repo = plan["worktree"], plan["repo"] or plan["worktree"]
+        if plan["provider"] == "treehouse":
+            if plan["lease"] == "held":
+                treehouse("return", *(["--force"] if force else []), "--if-lease-id", plan["lease_id"], path,
+                          cwd=repo if Path(repo).is_dir() else None, timeout=300)
+        elif plan["exists"]:
+            git("worktree", "remove", *(["--force"] if force else []), path, cwd=repo)
+        # A worktree already gone: only the record is cleared; never a repo-wide prune.
+        left = [s for s in (state.get("pending") or []) if s != "worktree"]
+        update_state(directory, worktree=None, lease_id=None, worktree_provider=None, worktree_created=None,
+                     pending=left or None, worktree_error=None,
+                     released={"worktree": path, "provider": plan["provider"], "lease_id": plan["lease_id"],
+                               "branch": plan["branch"], "at": int(time.time())})
+    emit({"released": path, "provider": plan["provider"], "lease_id": plan["lease_id"], "branch": plan["branch"],
+          "actions": plan["actions"]})
+
+
+# ---- status / ls ------------------------------------------------------------
+
+def cmd_status(args):
+    session, _ = caller(args)
+    directory = state_dir(session)
+    state = read_state(directory)
+    live = live_sessions()
+    data = {**state, "state_dir": str(directory), "alive": session in live,
+            "rex_label": (live.get(session) or {}).get("label")}
+    if args.json:
+        emit(data)
+        return
+    if not state:
+        print(f"No rexwork state for {session}. Run `rexwork adopt` to add it.")
+        return
+    print(f"{state.get('label')}  ({state.get('kind')})")
+    for key in ("ticket", "title", "url", "branch", "worktree", "worktree_provider", "lease_id", "agent", "pr_url",
+                "pending", "worktree_error"):
+        if state.get(key):
+            print(f"  {key}: {state[key]}")
+    print(f"  state: {directory}")
+    if not data["alive"]:
+        print("  the Rex session no longer exists")
+
+
+def cmd_ls(args):
+    live = live_sessions()
+    rows = []
+    for directory in sorted(SESSIONS.glob("*")) if SESSIONS.exists() else []:
+        if not directory.is_dir() or not is_session_id(directory.name):
+            continue
+        try:
+            state = read_state(directory)
+        except Failure:
+            state = {"label": "(unreadable session.json)"}
+        sid = session_id(directory.name)
+        held = held_worktree(state)
+        if held:
+            held = {**held, "age": describe_age(held["since"])}
+        rows.append({"session_id": sid, "label": state.get("label") or (live.get(sid) or {}).get("label"),
+                     "kind": state.get("kind"), "ticket": state.get("ticket"), "alive": sid in live,
+                     "state_dir": str(directory), "holds_worktree": held})
+    if args.json:
+        emit(rows)
+        return
+    for r in rows:
+        print(f"{'live' if r['alive'] else 'gone':4}  {r['kind'] or '-':8}  {r['ticket'] or '-':8}  "
+              f"{r['label'] or '-':40}  {r['session_id']}")
+        held = r["holds_worktree"]
+        if held:
+            what = f"treehouse lease {held['lease_id']}" if held["provider"] == "treehouse" else "git worktree"
+            print(f"      holds {what} at {held['worktree']} for {held['age']}; "
+                  f"`rexwork release --session {r['session_id']}` once its PR is merged")
+
+
+# ---- main -------------------------------------------------------------------
+
+# Options that take a value, so `--title --` is a title, not the start of COMMAND.
+VALUE_OPTIONS = {"--scratch", "--draft", "--cwd", "--repo", "--title", "--agent", "--prompt", "--owner",
+                 "--reuse-tab", "--name", "--session", "--block"}
+
+
+def split_command(argv):
+    """rexwork's own arguments, and the words after the first bare `--` (passed on unchanged).
+    A value option becomes `--opt=VALUE`, so argparse accepts values such as `-x` or `--`."""
+    own, i = [], 0
+    while i < len(argv):
+        if argv[i] == "--":
+            return own, argv[i + 1:]
+        if argv[i] in VALUE_OPTIONS and i + 1 < len(argv):
+            own.append(f"{argv[i]}={argv[i + 1]}")
+            i += 2
+        else:
+            own.append(argv[i])
+            i += 1
+    return own, []
+
+
+def main(argv=None):
+    argv, command = split_command(list(sys.argv[1:] if argv is None else argv))
+    parser = argparse.ArgumentParser(prog="rexwork", description=__doc__.split("\n\n")[0])
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("start", help="start a session in the standard layout")
+    p.add_argument("ticket", nargs="?", help="ticket id, such as TAL-123")
+    p.add_argument("--scratch", metavar="NAME")
+    p.add_argument("--draft", metavar="NAME")
+    p.add_argument("--ask", action="store_true", help="ask for the kind and name on the terminal")
+    p.add_argument("--cwd")
+    p.add_argument("--repo", help="git repo for the ticket's worktree (default: the repo --cwd is in)")
+    p.add_argument("--no-worktree", action="store_true", help="never create or adopt a worktree")
+    p.add_argument("--no-bar", action="store_true", help="do not open the status bar")
+    p.add_argument("--title", help="ticket title (skips the Linear lookup)")
+    p.add_argument("--agent", choices=AGENTS, default="claude")
+    p.add_argument("--no-agent", action="store_true")
+    p.add_argument("--prompt", help="first prompt for the agent")
+    p.add_argument("--no-linear", action="store_true", help="do not change the ticket in Linear")
+    p.add_argument("--focus", action="store_true", help="show the new session in the Rex app")
+    p.add_argument("--owner", help="who started the session (such as symphony); kept in session.json")
+    p.add_argument("--reuse-tab", metavar="NAME",
+                   help="if the ticket's session exists, run COMMAND in a new tab NAME and leave its tabs alone")
+    p.set_defaults(func=cmd_start)
+
+    p = sub.add_parser("adopt", help="add rexwork state to the caller's existing session")
+    p.add_argument("--name")
+    p.add_argument("--title")
+    p.add_argument("--repo")
+    p.add_argument("--agent", choices=AGENTS)
+    p.add_argument("--no-bar", action="store_true", help="do not open the status bar")
+    p.add_argument("--session")
+    p.add_argument("--block")
+    p.set_defaults(func=cmd_adopt)
+
+    p = sub.add_parser("promote", help="turn a scratch session into a Linear ticket")
+    p.add_argument("--template", action="store_true", help="print the draft skeleton")
+    p.add_argument("--file", action="store_true", help="file the draft (needs Tal's confirmation)")
+    p.add_argument("--clear-filing", action="store_true",
+                   help="clear an interrupted filing that Linear has no issue for (asks in a terminal)")
+    p.add_argument("--recover", action="store_true",
+                   help="finish an interrupted or partial promotion by its recorded issue id (asks in a terminal)")
+    p.add_argument("--draft", help="draft file (default: <state dir>/ticket-draft.md)")
+    p.add_argument("--repo", help="git repo for the ticket's worktree (default: the session's repo)")
+    p.add_argument("--no-worktree", action="store_true", help="file the ticket without creating a worktree")
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--no-focus", action="store_true")
+    p.add_argument("--request-draft", action="store_true", help="with no draft, ask the agent to write one")
+    p.add_argument("--stdin", action="store_true", help=argparse.SUPPRESS)  # the float's request
+    p.add_argument("--preview", action="store_true", help=argparse.SUPPRESS)  # parse stdin, write nothing
+    p.add_argument("--session")
+    p.add_argument("--block")
+    p.set_defaults(func=cmd_promote)
+
+    p = sub.add_parser("land", help="push, open the PR, update Linear, close the session")
+    p.add_argument("--yes", action="store_true", help="confirm: push, open the PR, update Linear, close")
+    p.add_argument("--keep", action="store_true", help="leave the session open (still needs --yes to publish)")
+    p.add_argument("--linear-only", action="store_true",
+                   help="no push or PR: only move the ticket to In Review (only for a ticket with no branch attached)")
+    p.add_argument("--dry-run", action="store_true", help="print the plan and its digest; change nothing")
+    p.add_argument("--json", action="store_true", help="accepted for clarity; output is always JSON")
+    p.add_argument("--expect", metavar="DIGEST",
+                   help="with --yes: run only if the plan's digest (from --dry-run) is unchanged")
+    p.add_argument("--no-pr", action="store_true")
+    p.add_argument("--no-linear", action="store_true")
+    p.add_argument("--session")
+    p.set_defaults(func=cmd_land)
+
+    p = sub.add_parser("release", help="free the worktree or treehouse slot rexwork made for a ticket")
+    p.add_argument("ticket", nargs="?", help="ticket id; finds the session dir that holds its worktree")
+    p.add_argument("--yes", action="store_true", help="confirm without a terminal prompt")
+    p.add_argument("--dry-run", action="store_true", help="print the plan; change nothing")
+    p.add_argument("--force", action="store_true",
+                   help="discard uncommitted or unpushed work (asks for a typed yes in a terminal)")
+    p.add_argument("--session")
+    p.set_defaults(func=cmd_release)
+
+    p = sub.add_parser("status", help="this session's state")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--session")
+    p.set_defaults(func=cmd_status)
+
+    p = sub.add_parser("ls", help="every session with rexwork state")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_ls)
+
+    args = parser.parse_args(argv)
+    if command and args.cmd != "start":
+        parser.error("only `start` takes -- COMMAND")
+    args.command = command
+    try:
+        args.func(args)
+    except Failure as e:
+        note(str(e))
+        return 1
+    except KeyboardInterrupt:
+        return 130
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

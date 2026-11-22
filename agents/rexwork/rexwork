@@ -1164,12 +1164,51 @@ def no_worktree_message(ticket, cause, base):
             f"--no-worktree to work in {base} deliberately")
 
 
+def enclosing_slot(path):
+    """The outermost linked worktree (a `.git` file) between the treehouse root and PATH:
+    the pool slot PATH is in, whatever is nested inside it. None outside the root."""
+    path = Path(path).resolve()
+    if not in_treehouse_root(path):
+        return None
+    slot = None
+    for directory in [path, *path.parents]:
+        if not in_treehouse_root(directory):
+            break
+        if (directory / ".git").is_file():
+            slot = directory
+    return str(slot) if slot else None
+
+
+def usable_problem(tree, ticket):
+    """None if TREE's worktree is a live checkout the agent may start in: its own git top
+    level, of the expected repo, on the ticket's branch. Else what is wrong."""
+    path, branch = tree.get("worktree"), tree.get("branch")
+    if not path or not Path(path).is_dir():
+        return f"{path} does not exist"
+    top = git("rev-parse", "--show-toplevel", cwd=path, check=False)
+    if not top or not same_path(top, path):
+        return (f"{path} is not a git checkout of its own (git top level: {top or 'none'}); a stale "
+                "`git worktree list` entry? Check it and run `git worktree prune` by hand")
+    try:
+        _, main = repo_root(path)
+    except Failure as e:
+        return f"{path}: {e}"
+    if tree.get("repo") and not same_path(main, tree["repo"]):
+        return f"{path} belongs to {main}, not {tree['repo']}"
+    current = git("symbolic-ref", "-q", "--short", "HEAD", cwd=path, check=False)
+    if current != branch or not branch_matches_ticket(branch, ticket):
+        return f"{path} is on {current or 'a detached HEAD'}, not the {ticket} branch {branch}"
+    return None
+
+
 def launch_dir(cwd, ticket, tree=None, strict=False):
     """CWD, unless it is inside a treehouse slot not held by rexwork for TICKET (any slot
     for a scratch session): then the slot's main checkout. Every start checks the final
     launch directory with this, so an agent never starts in someone else's slot."""
     path = Path(cwd)
-    top = git("rev-parse", "--show-toplevel", cwd=path, check=False) if path.is_dir() else None
+    # The slot by path first: a clone nested in a slot reports itself as its own main checkout.
+    top = enclosing_slot(path) or (git("rev-parse", "--show-toplevel", cwd=path, check=False)
+                                   if path.is_dir() else None)
     if not top:
         if in_treehouse_root(path):
             fail(f"{path} is under the treehouse root but is not a readable checkout; not starting there")
@@ -1177,8 +1216,10 @@ def launch_dir(cwd, ticket, tree=None, strict=False):
     try:
         _, main = repo_root(top)
     except Failure:
+        if in_treehouse_root(path):
+            fail(f"{top} is under the treehouse root but is not a readable checkout; not starting there")
         return path
-    if same_path(top, main):
+    if same_path(top, main) and not in_treehouse_root(path):
         return path  # the main checkout is never a pool slot
     try:
         provider = worktree_provider(main, top)
@@ -1207,8 +1248,19 @@ def start_existing(args, ticket, existing, tree=None):
     if args.command:
         note("the ticket's session exists; -- COMMAND was not run (pass --reuse-tab NAME to run it in a new tab)")
     warnings = []
-    directory = state_dir(existing)
-    state = read_state(directory)
+    # A worktree this start just acquired is settled before anything that can fail.
+    try:
+        directory = state_dir(existing)
+        state = read_state(directory)
+        if tree and tree.get("worktree") and not state.get("worktree") and state.get("owner") != "symphony":
+            state = update_state(directory, **tree_fields(tree), pending=None, worktree_error=None)
+        elif tree:
+            returned = give_back(tree)
+            if returned:
+                warnings.append(returned)
+    except BaseException:
+        give_back(tree)
+        raise
     main, window = main_block_of(existing, state)
     show = show_pane(warnings, existing, main) or state.get("show_block")
     bar = bar_pane(warnings, args, existing, window) or state.get("bar_block")
@@ -1218,12 +1270,6 @@ def start_existing(args, ticket, existing, tree=None):
                "bar_block": bar, "label": label, "kind": "ticketed", "ticket": ticket}
     if not state.get("created_at"):
         updates["created_at"] = int(time.time())
-    if tree and tree.get("worktree") and not state.get("worktree") and state.get("owner") != "symphony":
-        updates.update(tree_fields(tree), pending=None, worktree_error=None)
-    else:
-        returned = give_back(tree)
-        if returned:
-            warnings.append(returned)
     state = update_state(directory, **updates)
     pending = retry_pending_worktree(directory, state, ticket)
     state = read_state(directory)
@@ -1251,8 +1297,22 @@ def start_new(args, ticket):
         # A ticket that expects a worktree never starts without one: the agent would run in
         # the main checkout. Nothing is created; a lease already taken is reused on rerun.
         fail(no_worktree_message(ticket, tree_error or "no worktree was found or made", base))
+    # From here a fresh worktree is either recorded on a session, passed to one, or given
+    # back, whatever exits: never left where nothing records it.
+    handed = []
+    try:
+        return launch_new(args, ticket, title, url, issue, label, base, repo, tree, handed)
+    finally:
+        if not handed and tree:
+            give_back(tree)
+
+
+def launch_new(args, ticket, title, url, issue, label, base, repo, tree, handed):
     cwd = Path(tree.get("worktree") or base).expanduser()
     if repo:
+        problem = usable_problem(tree, ticket)
+        if problem:
+            fail(no_worktree_message(ticket, problem, base))
         try:
             cwd = launch_dir(cwd, ticket, tree, strict=True)
         except WorktreeBlocked as e:
@@ -1264,7 +1324,7 @@ def start_new(args, ticket):
     elif args.no_agent:
         command, agent = None, None
     else:
-        agent = args.agent
+        agent = args.agent or "claude"
         command = agent_command(agent, args.prompt)
 
     linear_note = "skipped (--no-linear)"
@@ -1280,14 +1340,15 @@ def start_new(args, ticket):
     with ticket_lock(ticket, "session", SESSION_LOCK_WAIT):
         again = find_ticket_session(ticket)  # one may have started while the worktree was made
         if again:
+            handed.append(again)  # on_existing records the worktree or gives it back, first thing
             return on_existing(args, ticket, again, tree)
         session, window, main, show = create_session(label, ticket, cwd, command, warnings)
-        # The command is running from here on: every later failure is a warning.
+        handed.append(session)  # the agent runs in the worktree from here on
         directory = state_dir(session)
         fields = dict(session_id=session, window_id=window, main_block=main, show_block=show,
                       label=label, kind="ticketed", ticket=ticket, title=title, url=url,
                       **tree_fields(tree), agent=agent, cwd=str(cwd), owner=args.owner,
-                      created_at=int(time.time()), pending=pending or None, worktree_error=tree_error)
+                      created_at=int(time.time()))
         state = soft(warnings, "session.json not written", lambda: update_state(directory, **fields)) or fields
     bar = bar_pane(warnings, args, session, window)
     if bar:
@@ -1299,10 +1360,7 @@ def start_new(args, ticket):
     if args.focus:
         soft(warnings, "focus", focus_session, session, window)
     emit({**result_of(session, state, directory), "reused": False, "linear": linear_note,
-          "worktree_action": tree.get("action"), "pending": pending, "warnings": warnings})
-    if pending:
-        fail(f"{ticket} started without its worktree: {tree_error}. Fix that, then run "
-             f"`rexwork start {ticket}` again; it finishes only the worktree")
+          "worktree_action": tree.get("action"), "pending": [], "warnings": warnings})
 
 
 def retry_pending_worktree(directory, state, ticket):
@@ -1397,7 +1455,7 @@ def start_named(args, kind):
         fail(f"no such directory: {cwd}")
     cwd = launch_dir(cwd, None)
     base = STATE_MARK  # filled in by the pane's wrapper
-    agent = None if args.no_agent else args.agent
+    agent = None if args.no_agent else (args.agent or "claude")
     if args.command:
         command, agent = args.command, None
     elif agent:
@@ -1434,6 +1492,12 @@ def start_ask(args):
     if not name:
         print("Cancelled.")
         return
+    if not args.agent and not args.no_agent:
+        answer = input(f"Agent ({'/'.join(AGENTS)}, default claude): ").strip().lower()
+        if answer and answer not in AGENTS:
+            print(f"Unknown agent {answer!r}. Cancelled.")
+            return
+        args.agent = answer or "claude"
     if choice == "1":
         args.scratch = name
     else:
@@ -2657,7 +2721,7 @@ def main(argv=None):
     p.add_argument("--no-worktree", action="store_true", help="never create or adopt a worktree")
     p.add_argument("--no-bar", action="store_true", help="do not open the status bar")
     p.add_argument("--title", help="ticket title (skips the Linear lookup)")
-    p.add_argument("--agent", choices=AGENTS, default="claude")
+    p.add_argument("--agent", choices=AGENTS, help="default claude; with --ask it preselects (else asked)")
     p.add_argument("--no-agent", action="store_true")
     p.add_argument("--prompt", help="first prompt for the agent")
     p.add_argument("--no-linear", action="store_true", help="do not change the ticket in Linear")

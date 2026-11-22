@@ -49,6 +49,9 @@ unless `--focus` is given.
 
 - `--scratch NAME`: a session with an agent (default `claude`) in `--cwd`
   (default: the caller's directory, else `$HOME`). `--no-agent` gives a shell.
+- `--ask` (the terminal fallback for the Rex picker): asks for the kind, the
+  name and the agent (`claude` or `codex`, Enter for claude); `--agent`
+  preselects the agent and skips that question.
 - `--draft NAME`: the same, and the agent's first prompt asks it to interview
   Tal briefly, write `objectives.md`, write the draft ticket and run
   `rexwork promote`.
@@ -291,7 +294,9 @@ refuses (see below) if that directory is inside a slot not held by
 `rexwork:TAL-123`. A scratch or draft session, a `--no-worktree` start and
 Symphony's `--reuse-tab` tab expect no ticket worktree, so for them a launch
 directory inside any slot they do not hold is redirected to that repo's main
-checkout, with a note.
+checkout, with a note. The slot is found by path first (the outermost linked
+worktree between the treehouse root and the directory), so a clone nested in
+someone else's slot counts as that slot, not as a main checkout of its own.
 
 **Ownership.** rexwork owns a worktree only when it made it: right after its
 own `git worktree add` it records `worktree_created` (`path`, `repo`, `branch`,
@@ -351,12 +356,22 @@ in a repo, or `--repo`) and does not end up with a usable one, it starts
 nothing: no Rex session, no agent, nothing in the main checkout. That covers a
 lease that failed or timed out, a slot held by someone else, a failed
 `git worktree add`, a failed checkout in the slot, and a launch directory that
-would have been redirected to the main checkout. It exits non-zero naming the
+would have been redirected to the main checkout. A worktree is usable only if
+the live directory's git top level is that path, its common git dir is the
+expected repo's, and it is on the ticket's branch; a stale `git worktree list`
+entry whose directory was recreated for other work fails this, and the message
+suggests `git worktree prune` by hand. It exits non-zero naming the
 cause and the two ways forward: fix it and run `rexwork start TAL-123` again,
 or pass `--no-worktree` to work in the current checkout deliberately. It never
 falls back to the other provider. A lease already taken stays held by
 `rexwork:TAL-123`, so the rerun reuses it instead of leasing again, then starts
 the agent in the worktree. An existing session for the ticket is left as it is.
+Once a fresh worktree (a new lease or `git worktree add`) exists, every exit
+either records it on a session or gives it back: a failure before the session
+is created (Linear, the session lock, `rex new`) returns the lease or removes
+the worktree (keeping the branch), and a session that appeared meanwhile
+records or declines it before anything that can fail. If giving it back fails,
+the note gives the exact command to run by hand.
 Such a session can still have `pending: ["worktree"]` (from an older rexwork);
 rerunning `start` retries only the worktree. In `promote`, which launches no
 agent, the step is `worktree` in `filing.done`, finished by

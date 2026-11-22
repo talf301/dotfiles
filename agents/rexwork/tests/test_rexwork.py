@@ -1694,6 +1694,85 @@ class Worktrees(unittest.TestCase):
         pool = json.loads((self.th / "pool.json").read_text())
         self.assertEqual(pool[0]["lease_id"], "")  # nothing stranded
 
+    def racing(self, **extra):
+        real = rw.worktree_for_start
+
+        def race(*a):
+            out = real(*a)
+            make_state(self.root, {"kind": "ticketed", "ticket": "TAL-5", "label": "TAL-5 Fix it", **extra})
+            self.live = {SID: {"session_id": SID, "label": "TAL-5 Fix it"}}
+            return out
+        return race
+
+    def inspect_fails(self, *a):
+        raise rw.Failure("rex session inspect: timed out")
+
+    def test_winning_session_takes_the_lease_before_inspection_can_fail(self):
+        self.treehouse_on()
+        with patched(worktree_for_start=self.racing(), main_block_of=self.inspect_fails):
+            self.assertEqual(self.start(), 1)
+        self.assertEqual(self.state()["lease_id"], "lease1")  # recorded, so `release TAL-5` finds it
+        self.assertEqual(self.calls("return"), [])
+
+    def test_lease_declined_by_symphony_is_returned_even_if_inspection_fails(self):
+        self.treehouse_on()
+        with patched(worktree_for_start=self.racing(owner="symphony"), main_block_of=self.inspect_fails):
+            self.assertEqual(self.start(), 1)
+        self.assertEqual([c[:3] for c in self.calls("return")], [["return", "--if-lease-id", "lease1"]])
+        self.assertNotIn("worktree", self.state())
+
+    def test_fresh_lease_given_back_when_linear_fails(self):
+        self.treehouse_on()
+        with patched(get_issue=lambda t: (_ for _ in ()).throw(rw.Failure("Linear: down"))):
+            rc = rw.main(["start", "TAL-5", "--title", "Fix it", "--cwd", str(self.repo), "--", "true"])
+        self.assertEqual(rc, 1)
+        self.assertEqual([c[:3] for c in self.calls("return")], [["return", "--if-lease-id", "lease1"]])
+        self.assertEqual(self.new_cwds, [])
+
+    def test_fresh_git_worktree_removed_when_the_session_can_not_be_made(self):
+        def bad_rex(*a, **k):
+            return {"session_id": SID} if a[0] == "new" else {}
+        with patched(rex=bad_rex):
+            self.assertEqual(self.start(), 1)
+        self.assertFalse((self.tmp / "worktrees" / "proj-tal-5").exists())
+        self.assertTrue(self.git("rev-parse", "--verify", f"refs/heads/{self.BRANCH}"))  # branch kept
+
+    def test_stale_worktree_entry_is_not_a_usable_worktree(self):
+        import shutil
+        stale = self.tmp / "stale"
+        self.git("worktree", "add", "-q", "-b", self.BRANCH, str(stale), "main")
+        shutil.rmtree(stale)  # deleted outside git, then reused for other work
+        stale.mkdir()
+        (stale / "notes.txt").write_text("unrelated")
+        self.assertEqual(self.start(), 1)
+        self.assertIn("git worktree prune", self.notes[-1])
+        self.assertIn("--no-worktree", self.notes[-1])
+        self.assertEqual(self.new_cwds, [])
+
+    def test_clone_nested_in_another_holders_slot_is_still_that_slot(self):
+        self.treehouse_on()
+        slot = self.th / "pool" / "9" / "proj"
+        slot.parent.mkdir(parents=True)
+        self.git("worktree", "add", "-q", "-b", "u/tfriedman/tal-159-x", str(slot), "main")
+        (self.th / "pool.json").write_text(json.dumps([{"name": "9", "path": str(slot), "status": "leased",
+                                                        "lease_id": "theirs", "lease_holder": "agent:TAL-159-x"}]))
+        os.environ["REXWORK_TREEHOUSE_ROOT"] = str(self.th / "pool")
+        self.ctx.callback(os.environ.pop, "REXWORK_TREEHOUSE_ROOT", None)
+        inner = slot / "inner"
+        self.git("init", "-q", "-b", "main", str(inner))
+        self.assertEqual(rw.main(["start", "--scratch", "notes", "--cwd", str(inner), "--", "true"]), 0)
+        self.assertEqual(self.new_cwds, [str(self.repo)])  # the slot's main checkout, not the clone
+
+    def test_ask_offers_the_agent(self):
+        from unittest import mock
+        for answers, flags, agent in ((["1", "notes", "codex"], [], "codex"), (["1", "notes", ""], [], "claude"),
+                                      (["2", "draft"], ["--agent", "codex"], "codex")):
+            with mock.patch("builtins.input", side_effect=answers), contextlib.redirect_stdout(io.StringIO()):
+                rc = rw.main(["start", "--ask", "--cwd", str(self.tmp), *flags])
+            self.assertEqual(rc, 0)
+            self.assertEqual(self.state()["agent"], agent)
+            (self.root / "sessions" / UUID / "session.json").unlink()
+
     # -- bar -----------------------------------------------------------------
 
     def test_bar_failure_is_a_warning(self):

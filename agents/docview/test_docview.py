@@ -146,6 +146,13 @@ class Shared(unittest.TestCase):
     def labeled(self):
         return [t for t in self.state()["tabs"] if t.get("label")]
 
+    def test_documents_open_wrapped(self):
+        # -u NONE has no FileType autocmd for wrap, like a headless server before VeryLazy.
+        self.open("plan", A)
+        self.open("notes", B)
+        for tab in (1, 2):
+            self.assertEqual(dv.lua(self.sock, f"vim.wo[vim.api.nvim_tabpage_get_win({tab})].wrap"), True)
+
     def test_two_docs_two_tabs_one_server_one_viewer(self):
         first = self.open("plan", A, "--title", "Plan")
         second = self.open("notes", B)

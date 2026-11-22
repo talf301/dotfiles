@@ -132,6 +132,11 @@ function M.open_doc(a)
       return { error = tostring(err) }
     end
     vim.cmd.tcd(vim.fn.fnameescape(vim.fn.fnamemodify(a.path, ":h")))
+    -- Documents are prose: wrap them. The config's own FileType autocmd for this loads
+    -- on VeryLazy, which a headless server reaches only once a viewer attaches, so the
+    -- first document would otherwise open unwrapped.
+    vim.wo.wrap = true
+    vim.wo.linebreak = true
   end
   vim.t.docview_path = a.path
   vim.t.docview_kind = a.kind or "doc"

@@ -5,10 +5,10 @@ standard layout, turns a scratch session into a Linear ticket, and lands it.
 It is linked as `~/.local/bin/rexwork`.
 
 ```sh
-rexwork start --scratch NAME [--cwd DIR] [--agent claude|codex] [--no-agent] [--no-bar] [--focus]
-rexwork start --draft NAME   [--cwd DIR] [--agent claude|codex] [--no-bar] [--focus]
-rexwork start TAL-123 [--repo PATH | --cwd DIR] [--no-worktree] [--title T] [--agent ...] [--no-agent] [--no-linear] [--prompt TEXT] [--owner NAME] [--reuse-tab NAME] [--no-bar] [--focus] [-- COMMAND...]
-rexwork adopt [--name NAME] [--repo PATH] [--no-bar]
+rexwork start --scratch NAME [--cwd DIR] [--agent claude|codex] [--no-agent] [--no-bar] [--show] [--focus]
+rexwork start --draft NAME   [--cwd DIR] [--agent claude|codex] [--no-bar] [--show] [--focus]
+rexwork start TAL-123 [--repo PATH | --cwd DIR] [--no-worktree] [--title T] [--agent ...] [--no-agent] [--no-linear] [--prompt TEXT] [--owner NAME] [--reuse-tab NAME] [--no-bar] [--show] [--focus] [-- COMMAND...]
+rexwork adopt [--name NAME] [--repo PATH] [--no-bar] [--show]
 rexwork promote --template
 rexwork promote [--draft FILE] [--repo PATH | --no-worktree] [--dry-run] [--no-focus]
 rexwork promote --file [--dry-run]      # the filing step; see "Filing needs Tal"
@@ -37,12 +37,15 @@ exit. `start`, `adopt`, `promote`, `land` and `release` print JSON on stdout.
 | Branch | none | `u/tfriedman/tal-123-<slug>` |
 | Worktree | never | in a git repo by default: `~/.worktrees/<repo>-tal-123` (git) or a treehouse slot; see [Worktrees](#worktrees) |
 
-Layout, the same for every session: one tab, the agent pane on the left
-(`main_block`), the Show pane on the right at 40% (`show_block`, created with
-`show --open-pane`, so `show` reuses it), and the status bar along the bottom
-(`bar_block`, from `rexbar open --session S --window W`, after the Show pane
-exists; `--no-bar` skips it). A failed Show pane or bar is a warning, never
-fatal. Neovim and the peek open as floats on demand. `start` never moves focus
+Layout, the same for every session: one tab with the agent pane
+(`main_block`) and the status bar along the bottom (`bar_block`, from
+`rexbar open --session S --window W`; `--no-bar` skips it). The Show pane
+starts closed, since the agent has nothing to show yet: it appears on the right
+at 40% with the first `show FILE`, and `show --toggle` (cmd+i, or the
+`work_show_toggle` action) opens and closes it. `--show` on `start` or `adopt`
+opens it up front with `show --open-pane` (`show_block`). The bar stays full
+width below both panes when the Show pane opens later. A failed Show pane or
+bar is a warning, never fatal. Neovim and the peek open as floats on demand. `start` never moves focus
 unless `--focus` is given.
 
 ## start
@@ -64,7 +67,8 @@ unless `--focus` is given.
   is exactly the ticket: `TAL-1` never matches `TAL-10 ...`), it is reused.
   Durable state wins: a session labelled `TAL-1 ...` whose `session.json`
   records another ticket is not reused; a new session starts instead. Reused:
-  its Show pane is added if missing, nothing else changes, and the output has
+  its bar (and with `--show` its Show pane) is added if missing, nothing else
+  changes, `show_block` keeps a recorded pane that is still live, and the output has
   `"reused": true`. Running it twice is safe.
   `--prompt TEXT` gives the agent a first prompt; `-- COMMAND...` runs that
   command in the main pane instead of an agent.
@@ -77,14 +81,14 @@ unless `--focus` is given.
   workspace); `--repo` with it is refused.
   `--reuse-tab NAME` (needs `-- COMMAND`): when the session is reused, its
   tabs are left alone; COMMAND runs in a new background tab NAME with its own
-  Show pane and bar, returned as `"tab": {"window_id", "main_block", "show_block", "bar_block"}`.
+  bar (and with `--show` its own Show pane), returned as `"tab": {"window_id", "main_block", "show_block", "bar_block"}`.
   No existing pane is touched, and nothing in the session's state directory
   is written (its `session.json` stays byte-identical, or absent). Without
   `--reuse-tab`, a reused session does not run COMMAND (a note says so).
-  Once the session or tab exists and COMMAND is running, a failed Show pane
-  (or state write, objectives skeleton or focus) is a warning on stderr: the
-  exit is still 0, the JSON has `show_block: null` (`tab.show_block` with
-  `--reuse-tab`) and the messages in `warnings`. A failure before COMMAND
+  `show_block` (`tab.show_block` with `--reuse-tab`) is null unless a Show
+  pane was opened. Once the session or tab exists and COMMAND is running, a
+  failed Show pane, bar, state write, objectives skeleton or focus is a warning
+  on stderr: the exit is still 0 and the messages are in `warnings`. A failure before COMMAND
   runs leaves nothing running (a half-made session is closed) and exits
   non-zero.
   The words after the first bare `--` reach the program unchanged (no shell
@@ -96,7 +100,7 @@ Output (one JSON object):
 ```json
 {"session_id": "session:...", "label": "TAL-123 Fix login", "kind": "ticketed",
  "ticket": "TAL-123", "title": "...", "url": "...", "window_id": "window:...",
- "main_block": "block:...", "show_block": "block:...",
+ "main_block": "block:...", "show_block": null,
  "bar_block": "block:...", "state_dir": "~/.local/state/rexwork/sessions/<uuid>",
  "repo": "...", "worktree": "...", "branch": "...", "worktree_provider": "git",
  "lease_id": null, "reused": false, "linear": "set In Progress",
@@ -106,9 +110,10 @@ Output (one JSON object):
 ## adopt
 
 For a session that predates rexwork. Writes state for the caller's session
-(`$REX_SESSION`, main pane `$REX_BLOCK`) and adds the Show pane beside the
-caller and the status bar if its tab has none (`--no-bar` skips the bar; a bar
-failure is a warning). Other panes are left alone. It renames the session
+(`$REX_SESSION`, main pane `$REX_BLOCK`) and adds the status bar if its tab
+has none (`--no-bar` skips it; a bar failure is a warning). The Show pane is
+added beside the caller only with `--show` (`show_created` says whether it was
+made); otherwise `show_block` keeps a recorded pane that is still live. Other panes are left alone. It renames the session
 only with `--name`; a session that still has a generated name (such as
 `dawn-grotto`) needs `--name`. A label starting with a ticket ID makes the
 session ticketed, and the branch and worktree are read from the caller's

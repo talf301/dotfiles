@@ -172,7 +172,8 @@ class Commands(unittest.TestCase):
                 before = json.dumps({"main_block": "block:tal", "show_block": "block:show1"})
                 (Path(t) / UUID / "session.json").write_text(before)
                 rc = rw.main(["start", "TAL-9", "--title", "X", "--no-linear", "--cwd", t,
-                              "--owner", "symphony", "--reuse-tab", "symphony", "--", "codex", "resume", "th"])
+                              "--owner", "symphony", "--reuse-tab", "symphony", "--show", "--",
+                              "codex", "resume", "th"])
                 self.assertEqual(rc, 0)
                 self.assertEqual(calls[0][:5], ("window", "new", "-s", SID, "symphony"))
                 self.assertIn("--focus=false", calls[0])
@@ -1004,7 +1005,8 @@ class ShowFailure(unittest.TestCase):
         rex = lambda *a, **k: {"session_id": SID,
                                "initial_windows": [{"window_id": "window:n", "block_ids": ["block:n"]}]}
         with sandbox() as (root, emitted, notes), patched(rex=rex, live_sessions=lambda: {}, open_show=self.boom):
-            rc = rw.main(["start", "TAL-4", "--title", "X", "--no-linear", "--cwd", str(root), "--", "sleep", "1"])
+            rc = rw.main(["start", "TAL-4", "--title", "X", "--no-linear", "--cwd", str(root), "--show",
+                          "--", "sleep", "1"])
             self.assertEqual(rc, 0)
             out = emitted[-1]
             self.assertIsNone(out["show_block"])
@@ -1019,7 +1021,7 @@ class ShowFailure(unittest.TestCase):
                 live_sessions=lambda: live, open_show=self.boom,
                 rex=lambda *a, **k: {"block_ids": ["block:t"], "window_id": "window:t"}):
             rc = rw.main(["start", "TAL-4", "--title", "X", "--no-linear", "--cwd", str(root),
-                          "--reuse-tab", "symphony", "--", "true"])
+                          "--reuse-tab", "symphony", "--show", "--", "true"])
             self.assertEqual(rc, 0)
             self.assertIsNone(emitted[-1]["tab"]["show_block"])
             self.assertEqual(len(emitted[-1]["warnings"]), 1)
@@ -1772,6 +1774,45 @@ class Worktrees(unittest.TestCase):
             self.assertEqual(rc, 0)
             self.assertEqual(self.state()["agent"], agent)
             (self.root / "sessions" / UUID / "session.json").unlink()
+
+    # -- Show pane -------------------------------------------------------------
+
+    def test_show_pane_starts_closed(self):
+        shown = []
+        with patched(open_show=lambda s, b: shown.append(b) or {"pane": "block:show"}):
+            self.assertEqual(self.start("--no-worktree"), 0)
+            out = self.emitted[-1]
+            self.assertIsNone(out["show_block"])
+            self.assertEqual(out["bar_block"], "block:bar")  # the bar still opens
+            self.assertEqual(shown, [])
+            # An existing session keeps a recorded Show pane that is still live, and forgets a gone one.
+            self.live = {SID: {"session_id": SID, "label": "TAL-5 Fix it"}}
+            rw.update_state(self.root / "sessions" / UUID, show_block="block:n")
+            self.assertEqual(self.start("--no-worktree"), 0)
+            self.assertEqual(self.emitted[-1]["show_block"], "block:n")
+            rw.update_state(self.root / "sessions" / UUID, show_block="block:gone")
+            self.assertEqual(self.start("--no-worktree"), 0)
+            self.assertIsNone(self.emitted[-1]["show_block"])
+            self.assertEqual(shown, [])
+            # --show opens it up front, as before.
+            self.assertEqual(self.start("--no-worktree", "--show"), 0)
+            self.assertEqual((shown, self.emitted[-1]["show_block"]), (["block:n"], "block:show"))
+
+    def test_adopt_leaves_the_show_pane_closed(self):
+        shown = []
+        block = "block:0123abcd-0000"
+        view = {"label": "notes", "active_window_id": "window:n", "windows": [
+            {"window_id": "window:n", "layers": [{"kind": "tiled", "blocks": [{"block_id": block}]}]}]}
+        with patched(open_show=lambda s, b: shown.append(b) or {"pane": "block:show", "created_pane": True},
+                     inspect=lambda s: view):
+            make_state(self.root, {"kind": "scratch", "label": "notes"})
+            rc = rw.main(["adopt", "--session", SID, "--block", block, "--name", "notes"])
+            self.assertEqual(rc, 0)
+            self.assertEqual((self.emitted[-1]["show_block"], self.emitted[-1]["show_created"]), (None, False))
+            self.assertEqual(shown, [])
+            rc = rw.main(["adopt", "--session", SID, "--block", block, "--name", "notes", "--show"])
+            self.assertEqual(rc, 0)
+            self.assertEqual((self.emitted[-1]["show_block"], self.emitted[-1]["show_created"]), ("block:show", True))
 
     # -- bar -----------------------------------------------------------------
 

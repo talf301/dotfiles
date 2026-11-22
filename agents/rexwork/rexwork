@@ -887,8 +887,11 @@ def soft(warnings, what, fn, *args):
         return None
 
 
-def show_pane(warnings, session, block):
-    """The Show pane's block id, or None (with a warning) if it could not be opened."""
+def show_pane(warnings, session, block, wanted=True):
+    """The Show pane's block id with --show; None without it (the pane opens with the
+    first `show FILE`, or `show --toggle`), or (with a warning) if it could not be opened."""
+    if not wanted:
+        return None
     show = soft(warnings, "Show pane not opened", open_show, session, block)
     return show["pane"] if show else None
 
@@ -960,7 +963,14 @@ def focus_session(session, window):
     return True
 
 
-def create_session(label, tab, cwd, command, warnings):
+def live_block(session, block):
+    """BLOCK if it is still a pane of SESSION, else None."""
+    if not block:
+        return None
+    return block if window_of(inspect_safe(session), block) else None
+
+
+def create_session(label, tab, cwd, command, warnings, show=False):
     """A new session running COMMAND. If it can not be read back, the session is closed
     again and this fails, so nothing is left running. Once it runs, a failed Show pane is
     a warning: show_block is None."""
@@ -978,7 +988,7 @@ def create_session(label, tab, cwd, command, warnings):
             with contextlib.suppress(Failure):
                 rex("kill", sid)
         fail(f"rex new returned an unexpected result ({type(e).__name__}: {e}); closed what it made")
-    return session, window_id, main, show_pane(warnings, session, main)
+    return session, window_id, main, show_pane(warnings, session, main, show)
 
 
 def pane_cwd(session, block):
@@ -1262,7 +1272,7 @@ def start_existing(args, ticket, existing, tree=None):
         give_back(tree)
         raise
     main, window = main_block_of(existing, state)
-    show = show_pane(warnings, existing, main) or state.get("show_block")
+    show = show_pane(warnings, existing, main, args.show) or live_block(existing, state.get("show_block"))
     bar = bar_pane(warnings, args, existing, window) or state.get("bar_block")
     label = (live_sessions().get(existing) or {}).get("label") or state.get("label") or ticket
     # find_ticket_session never returns a session recording another ticket.
@@ -1342,7 +1352,7 @@ def launch_new(args, ticket, title, url, issue, label, base, repo, tree, handed)
         if again:
             handed.append(again)  # on_existing records the worktree or gives it back, first thing
             return on_existing(args, ticket, again, tree)
-        session, window, main, show = create_session(label, ticket, cwd, command, warnings)
+        session, window, main, show = create_session(label, ticket, cwd, command, warnings, args.show)
         handed.append(session)  # the agent runs in the worktree from here on
         directory = state_dir(session)
         fields = dict(session_id=session, window_id=window, main_block=main, show_block=show,
@@ -1429,7 +1439,7 @@ def reuse_in_new_tab(args, ticket, session, returned=None):
     warnings = [returned] if returned else []
     window = out.get("window_id") or (soft(warnings, "tab id not found", window_of, inspect_safe(session), block)
                                       or {}).get("window_id")
-    show = show_pane(warnings, session, block)
+    show = show_pane(warnings, session, block, args.show)
     bar = bar_pane(warnings, args, session, window)
     live = soft(warnings, "rex ls", live_sessions) or {}
     label = (live.get(session) or {}).get("label") or state.get("label") or ticket
@@ -1467,7 +1477,7 @@ def start_named(args, kind):
             fail("--draft needs an agent")
         command = None
     warnings = []
-    session, window, main, show = create_session(name, "main", cwd, command, warnings)
+    session, window, main, show = create_session(name, "main", cwd, command, warnings, args.show)
     # The command is running from here on: every later failure is a warning.
     bar = bar_pane(warnings, args, session, window)
     directory = state_dir(session)
@@ -1609,8 +1619,9 @@ def cmd_adopt(args):
         updates["agent"] = args.agent
     if label != current:  # rename only after every check passed
         rex("session", "rename", session, label)
-    show = open_show(session, block)
-    updates["show_block"] = show["pane"]
+    show = open_show(session, block) if args.show else {}
+    updates["show_block"] = show.get("pane") or (state.get("show_block") if window_of(view, state.get("show_block"))
+                                                 else None)
     warnings = []
     updates["bar_block"] = bar_pane(warnings, args, session, window["window_id"]) or state.get("bar_block")
     state = update_state(directory, **updates)
@@ -2720,6 +2731,8 @@ def main(argv=None):
     p.add_argument("--repo", help="git repo for the ticket's worktree (default: the repo --cwd is in)")
     p.add_argument("--no-worktree", action="store_true", help="never create or adopt a worktree")
     p.add_argument("--no-bar", action="store_true", help="do not open the status bar")
+    p.add_argument("--show", action="store_true",
+                   help="open the Show pane now (default: it opens with the first picture)")
     p.add_argument("--title", help="ticket title (skips the Linear lookup)")
     p.add_argument("--agent", choices=AGENTS, help="default claude; with --ask it preselects (else asked)")
     p.add_argument("--no-agent", action="store_true")
@@ -2737,6 +2750,8 @@ def main(argv=None):
     p.add_argument("--repo")
     p.add_argument("--agent", choices=AGENTS)
     p.add_argument("--no-bar", action="store_true", help="do not open the status bar")
+    p.add_argument("--show", action="store_true",
+                   help="open the Show pane now (default: it opens with the first picture)")
     p.add_argument("--session")
     p.add_argument("--block")
     p.set_defaults(func=cmd_adopt)

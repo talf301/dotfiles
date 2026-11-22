@@ -25,6 +25,29 @@ api.nvim_create_autocmd("SwapExists", {
 })
 vim.opt.shortmess:append("A")
 
+-- lazy.nvim fires VeryLazy on UIEnter, so a headless Neovim loads the config's late
+-- autocommands and keymaps only when the first viewer attaches. Buffers opened before
+-- that missed the FileType autocommands registered then (wrap and spell for prose,
+-- and whatever else the config adds): run FileType again for them, once.
+api.nvim_create_autocmd("User", {
+  group = group,
+  pattern = "VeryLazy",
+  once = true,
+  callback = function()
+    vim.schedule(function()
+      for _, win in ipairs(api.nvim_list_wins()) do
+        local buf = api.nvim_win_get_buf(win)
+        local ft = vim.bo[buf].filetype
+        if ft ~= "" and vim.bo[buf].buftype == "" then
+          pcall(api.nvim_win_call, win, function()
+            api.nvim_exec_autocmds("FileType", { pattern = ft, modeline = false })
+          end)
+        end
+      end
+    end)
+  end,
+})
+
 local function tvar(tab, name)
   local ok, v = pcall(api.nvim_tabpage_get_var, tab, name)
   if ok then

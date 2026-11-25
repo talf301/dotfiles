@@ -29,6 +29,18 @@ def write_png(path, w=3, h=2):
     return path
 
 
+def make_private_dirs(path):
+    """Create the missing directories of PATH with mode 0700, as the rexchat launcher does
+    (show itself never creates an inbox)."""
+    missing = []
+    p = Path(path)
+    while not os.path.lexists(p) and p != p.parent:
+        missing.append(p)
+        p = p.parent
+    for d in reversed(missing):
+        os.mkdir(d, 0o700)
+
+
 class FitTest(unittest.TestCase):
     def check(self, cols, rows, cw, ch, iw, ih):
         c, r, left, top = viewer.fit(cols, rows, cw, ch, iw, ih)
@@ -146,6 +158,10 @@ class RexFake(unittest.TestCase):
         self.viewers = {}   # block -> the directory its viewer runs on (its cwd)
         self.failures = {}  # block -> number of process queries that fail before one succeeds
         self.n = 0
+        self.floats = 0
+        self.closed_layers = []
+        self.hidden = set()  # blocks `rex block ls` lists but `session inspect` leaves out
+        self.ls = None       # (returncode, stdout, stderr) to answer `rex block ls` with instead
         self.mutex = threading.Lock()
         self.view = {"active_window_id": "window:w", "windows": [
             {"window_id": "window:w", "layers": [{"layer_id": "layer:t", "kind": "tiled", "blocks": [
@@ -169,7 +185,12 @@ class RexFake(unittest.TestCase):
                 if args[:2] == ("block", "close"):
                     self.remove(args[-1])
                 if args[:3] == ("api", "call", "session.new_layer"):
-                    return {"layer_id": "layer:f", "block_ids": ["block:f"]}
+                    self.floats += 1
+                    layer, block = f"layer:f{self.floats}", f"block:f{self.floats}"
+                    window = json.loads(args[3])["window_id"]
+                    w = next(w for w in self.view["windows"] if w["window_id"] == window)
+                    w["layers"].append({"layer_id": layer, "kind": "floating", "blocks": [{"block_id": block}]})
+                    return {"layer_id": layer, "block_ids": [block]}
                 return {}
 
         def fake_run(args, timeout=60):
@@ -186,6 +207,15 @@ class RexFake(unittest.TestCase):
                     out = json.dumps({"foreground": fg})
                 elif args[1:3] == ["block", "close"]:
                     self.remove(args[-1])
+                elif args[1:3] == ["block", "ls"]:
+                    if self.ls is not None:
+                        return show.subprocess.CompletedProcess(args, *self.ls)
+                    blocks = sorted(show.all_blocks(self.view) | self.hidden)
+                    out = json.dumps({"blocks": [{"block_id": b, "placement": "placed"} for b in blocks]})
+                elif args[1:4] == ["api", "call", "session.close_layer"]:
+                    self.closed_layers.append(json.loads(args[4])["layer_id"])
+                    for w in self.view["windows"]:
+                        w["layers"] = [la for la in w["layers"] if la["layer_id"] != self.closed_layers[-1]]
                 return show.subprocess.CompletedProcess(args, 0, out, "")
         show.rex, show.run = fake_rex, fake_run
         show.time.sleep = lambda s: None
@@ -353,6 +383,32 @@ class PanesTest(RexFake):
         r = self.enlarge("block:u")
         self.assertEqual((r["owner"], r["resolved"]), ("block:a", "latest on tab"))
 
+    def test_enlarge_floats_are_per_owner(self):
+        # S9: one agent's --enlarge never closes or replaces another agent's float on the same tab.
+        self.show("block:a")
+        self.show("block:b")
+        ra = self.enlarge("block:a")
+        rb = self.enlarge("block:b")
+        self.assertEqual((ra["owner"], ra["resolved"], rb["owner"], rb["resolved"]),
+                         ("block:a", "caller", "block:b", "caller"))
+        self.assertEqual(self.closed_layers, [])
+        ra2 = self.enlarge("block:a")
+        self.assertEqual(self.closed_layers, [ra["layer"]])  # only a's own old float
+        records = show.enlarge_records(self.state())
+        self.assertEqual({k: r["layer"] for k, r in records.items()},
+                         {"block:a": ra2["layer"], "block:b": rb["layer"]})
+        self.assertEqual(records["block:a"]["window"], "window:w")
+        self.enlarge("block:s2")  # from b's Show pane: b's float is replaced, a's stays
+        self.assertEqual(self.closed_layers, [ra["layer"], rb["layer"]])
+
+    def test_agent_with_own_history_never_gets_another_agents_picture(self):
+        self.show("block:b")
+        self.out(show.cmd_open_pane, "block:a")  # a has a Show pane and an empty history of its own
+        os.utime(self.home("block:a") / "history.json", (1, 1))
+        with self.assertRaises(SystemExit):
+            self.enlarge("block:a")
+        self.assertEqual(self.toggle("block:a")["owner"], "block:a")
+
     def test_labelled_pane_without_state_is_not_ours(self):
         self.add_block("block:x")
         self.viewers["block:x"] = str(self.home("block:a"))  # even running a viewer: not recorded
@@ -479,6 +535,36 @@ class OrphanTest(RexFake):
         self.toggle("block:b")
         self.assertEqual(self.closes(), [("block", "close", "-s", self.SID, "block:s1")])
 
+    def test_owner_missing_from_view_but_listed_is_kept(self):
+        # A live agent on a hidden, floating or zoomed layer that `session inspect` leaves out.
+        self.show("block:a")
+        self.remove("block:a")
+        self.hidden.add("block:a")
+        self.show("block:b")
+        self.assertEqual(self.closes(), [])
+        self.assertEqual(self.state()["owners"]["block:a"], "block:s1")
+        ls = [c for c in self.calls if c[:2] == ("block", "ls")]
+        self.assertEqual(ls[-1], ("block", "ls", "-s", self.SID, "--json", "--short=false"))
+
+    def test_unreadable_or_doubtful_listing_closes_nothing(self):
+        for answer in [(1, "", "rex: timed out"), (0, "not json", ""), (0, "[]", ""),
+                       (0, json.dumps({"blocks": [{"label": "x"}]}), ""),
+                       (0, json.dumps({"blocks": [{"block_id": "block:b"}]}), "")]:  # lacks blocks in view
+            with self.subTest(answer=answer):
+                self.ls = None
+                self.show("block:a")
+                self.remove("block:a")
+                self.ls = answer
+                self.show("block:b")
+                self.assertEqual(self.closes(), [])
+                self.assertIn("block:a", self.state()["owners"])
+                self.add_block("block:a", label="agent")  # back for the next case
+
+    def test_no_listing_needed_when_every_owner_is_in_view(self):
+        self.show("block:a")
+        self.show("block:a")
+        self.assertEqual([c for c in self.calls if c[:2] == ("block", "ls")], [])
+
 
 class LegacyTest(RexFake):
     def setUp(self):
@@ -593,7 +679,7 @@ class RexchatTest(RexFake):
         Returns its inbox under BASE (default <tmp>/rexchat), made as the launcher makes it."""
         inbox = (base or show.REXCHAT_TMP) / name / f"inbox-{os.getpid()}"
         if make:
-            show.make_private_dirs(inbox)
+            make_private_dirs(inbox)
         path = show.REXCHAT_STATE / f"{name}.sock"
         srv = socket.socket(socket.AF_UNIX)
         srv.bind(str(path))
@@ -633,18 +719,23 @@ class RexchatTest(RexFake):
         self.assertEqual(sorted(p.name for p in inbox.iterdir()), sorted([png.name, png.stem + ".json"]))
         self.assertEqual((self.splits(), self.calls), ([], []))  # no Rex at all
 
-    def test_by_rexchat_inbox(self):
-        inbox = Path(self.tmp.name) / "inbox"
+    def env_inbox(self, name="pane", pid=1):
+        """An inbox as the rexchat launcher makes it, named in REXCHAT_INBOX."""
+        inbox = show.REXCHAT_TMP / name / f"inbox-{pid}"
+        make_private_dirs(inbox)
         os.environ["REXCHAT_INBOX"] = str(inbox)
+        return inbox
+
+    def test_by_rexchat_inbox(self):
+        inbox = self.env_inbox()
         self.check_inline(self.main(str(self.png)), inbox)
         for flag in ("--toggle", "--enlarge", "--open-pane"):
             self.assertEqual(self.main(flag), self.INLINE_PANE)
 
     def test_unwritable_inbox_fails_plainly(self):
         # As under Codex's sandbox: no Show pane instead, a plain error the agent can act on.
-        locked = Path(self.tmp.name) / "locked"
-        locked.mkdir(mode=0o500)
-        os.environ["REXCHAT_INBOX"] = str(locked / "inbox")
+        locked = self.env_inbox()
+        locked.chmod(0o500)
         err = io.StringIO()
         try:
             with contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as e:
@@ -656,10 +747,38 @@ class RexchatTest(RexFake):
         self.assertEqual(self.calls, [])
 
     def test_title(self):
-        inbox = Path(self.tmp.name) / "inbox"
-        os.environ["REXCHAT_INBOX"] = str(inbox)
+        self.env_inbox()
         out = self.main(str(self.png), "--title", "Flow")
         self.assertEqual(json.loads(Path(out["image"]).with_suffix(".json").read_text())["title"], "Flow")
+
+    def test_unusable_env_inbox_is_never_created_and_opens_show_pane(self):
+        # S3: a removed, relative, foreign or ".." inbox is not created, and with no live rexchat
+        # in the pane, show behaves as for any pane caller instead of claiming "drawn inline".
+        elsewhere = Path(self.tmp.name) / "elsewhere" / "pane" / "inbox-1"
+        make_private_dirs(elsewhere)
+        cwd = os.getcwd()
+        os.chdir(self.tmp.name)
+        self.addCleanup(os.chdir, cwd)
+        for value in [str(show.REXCHAT_TMP / "gone" / "inbox-1"),  # rexchat already removed it
+                      "rel/pane/inbox-1", str(elsewhere),
+                      str(show.REXCHAT_TMP / "pane" / ".." / "pane" / "inbox-1"),
+                      str(show.REXCHAT_TMP / "inbox-1")]:
+            with self.subTest(value=value):
+                os.environ["REXCHAT_INBOX"] = value
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    out = self.main(str(self.png), "--session", self.SID, "--block", "block:a")
+                self.assertEqual(out["pane"], "block:s1")
+                self.assertIn("ignoring REXCHAT_INBOX", err.getvalue())
+                self.assertFalse((show.REXCHAT_TMP / "gone").exists())
+                self.assertFalse((Path(self.tmp.name) / "rel").exists())
+                self.assertEqual(list(elsewhere.iterdir()), [])
+
+    def test_unusable_env_inbox_falls_back_to_the_live_probe(self):
+        inbox = self.serve("rcb7")
+        os.environ["REXCHAT_INBOX"] = str(show.REXCHAT_TMP / "gone" / "inbox-1")
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.check_inline(self.main(str(self.png), "--session", self.SID, "--block", "block:rcb7"), inbox)
 
     def test_by_rex_block_with_live_instance(self):
         inbox = self.serve("rcb1")
@@ -673,25 +792,21 @@ class RexchatTest(RexFake):
         inbox = self.serve("rcb2", base=show.REXCHAT_STATE / "pictures")
         self.check_inline(self.main(str(self.png), "--session", self.SID, "--block", "block:rcb2"), inbox)
 
-    def test_new_dirs_are_private(self):
-        inbox = Path(self.tmp.name) / "fresh" / "pane" / "inbox-9"
-        os.environ["REXCHAT_INBOX"] = str(inbox)
-        self.main(str(self.png))
-        for d in (inbox, inbox.parent, inbox.parent.parent):
-            self.assertEqual(d.stat().st_mode & 0o777, 0o700, d)
-
     def test_planted_temp_dir_symlink_refused(self):
         other = Path(self.tmp.name) / "elsewhere"
         planted = other / "rcb3" / f"inbox-{os.getpid()}"
-        show.make_private_dirs(planted)
+        make_private_dirs(planted)
         show.REXCHAT_TMP.symlink_to(other)          # <tmp>/rexchat is a symlink
         self.serve("rcb3", make=False)
         msg = self.refused(str(self.png), "--session", self.SID, "--block", "block:rcb3")
         self.assertIn("inbox is missing or not safe", msg)
         self.assertEqual(list(planted.iterdir()), [])
-        # Through REXCHAT_INBOX too: the path is under <tmp>/rexchat, a symlink.
+        # Through REXCHAT_INBOX too: the path is under <tmp>/rexchat, a symlink, so it is
+        # ignored; the live probe then finds no safe inbox either.
         os.environ["REXCHAT_INBOX"] = str(show.REXCHAT_TMP / "rcb3" / f"inbox-{os.getpid()}")
-        self.assertIn("refusing rexchat's picture inbox", self.refused(str(self.png)))
+        msg = self.refused(str(self.png), "--session", self.SID, "--block", "block:rcb3")
+        self.assertIn("ignoring REXCHAT_INBOX", msg)
+        self.assertIn("inbox is missing or not safe", msg)
         self.assertEqual(list(planted.iterdir()), [])
 
     def test_temp_dir_of_another_user_refused(self):
@@ -719,7 +834,7 @@ class RexchatTest(RexFake):
         dead.close()
         left = [show.REXCHAT_STATE / "pictures" / name / "inbox-1", show.REXCHAT_TMP / name / "inbox-1"]
         for d in left:
-            show.make_private_dirs(d)
+            make_private_dirs(d)
         out = self.main(str(self.png), "--session", self.SID, "--block", "block:a")
         self.assertEqual((out["pane"], out["index"], out["created_pane"]), ("block:s1", 1, True))
         for d in left:

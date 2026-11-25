@@ -46,7 +46,14 @@ in `owner` and `resolved` (`caller`, `show pane`, `latest on tab`,
 Under rexchat (`~/src/rexchat`) pictures are drawn inline in the chat, not in
 a Show pane. `show` delivers inline when:
 
-1. `REXCHAT_INBOX` is set (the rexchat launcher sets it for its agent), or
+1. `REXCHAT_INBOX` names an inbox the launcher made (it sets the variable for
+   its agent): an absolute path `<root>/<block>/inbox-<pid>` that already
+   exists, where `<root>` is `<tmp>/rexchat` or rexchat's state `pictures`
+   directory, and that passes the safety check below. `show` never creates the
+   inbox or its parents. Any other value (relative, missing because rexchat
+   already removed it, under another root, with `..`) is ignored with a note on
+   stderr, and `show` goes on to step 2; with no live rexchat there, it opens the
+   normal Show pane instead of claiming "drawn inline". Or
 2. the calling pane (`--block` or `$REX_BLOCK`) runs a live rexchat: its control
    socket `~/.local/state/rexchat/<block>.sock` (or under `$REXCHAT_STATE_DIR`)
    accepts a connection and answers. `show` sends `{}`, which rexchat refuses
@@ -58,9 +65,9 @@ a Show pane. `show` delivers inline when:
    the normal Show pane. A live rexchat with no usable inbox is an error.
 
 A picture is written only into an inbox that is a real directory owned by
-you and not writable by others, as is its parent and, under `<tmp>/rexchat`,
-that directory too (no symlinks): another user cannot plant one. Missing
-directories (for `REXCHAT_INBOX`) are made with mode 0700.
+you and not writable by others, as are its per-pane parent and its root
+(`<tmp>/rexchat` or the state `pictures` directory; no symlinks): another user
+cannot plant one. An inbox under neither root is refused.
 
 Inline, `show FILE` converts the picture, writes `<ns>.json` (`title`,
 `source`) and then `<ns>.png` into the inbox, and prints
@@ -96,7 +103,8 @@ key hints.
   show/
     lock                      one lock for the whole session
     state.json                owners: {agent block: its Show pane block}
-                              enlarge: {tab: the float show last opened there}
+                              enlarge: {owner block: the float show last opened
+                                        for its pictures, with its tab}
                               panes: {tab: Show pane} (old shared panes only)
     panes/<BLOCK>/            one per agent pane (BLOCK is the id without "block:")
       history.json  images/   that pane's pictures, numbered from 1
@@ -120,7 +128,12 @@ key hints.
   the parent directory.
 - Cleanup: each `show FILE`, `--open-pane` and `--toggle` closes the Show panes
   whose owner block is no longer in the session, if they pass the ownership
-  check above, and forgets them. Their histories stay.
+  check above, and forgets them. Their histories stay. "No longer in the
+  session" is decided from `rex block ls -s SESSION --json --short=false`, the
+  full block listing (placed or not, any layer), never from the `session
+  inspect` view, which can leave out hidden, floating or zoomed layers. If that
+  listing fails, has an unexpected shape, or lacks a block the view shows,
+  nothing is closed or forgotten.
 - The session id must match `^[0-9a-fA-F-]{8,64}$` after `session:` is removed,
   and its directory must be a direct child of `~/.local/state/rexwork/sessions/`;
   otherwise `show` exits 1 before writing anything.
@@ -140,10 +153,15 @@ key hints.
   aspect ratio to within half a cell.
 - Enlarge opens a float on the caller's tab running rex-view's viewer
   (`~/.config/rex/extensions/plugins/rex-view/.../viewer`), or `viewer --single`
-  if rex-view is missing. A new enlarge closes the previous float on the same
-  tab only if it is the exact layer and block `show` recorded and that layer holds nothing else;
-  other floats, including hand-made ones labelled "Show: enlarged", are left
-  alone. The float takes focus only when its tab is the
+  if rex-view is missing. Floats are recorded per owner (the agent pane whose
+  picture is shown; the old shared history has one per tab). A new enlarge of
+  the same owner's pictures closes that owner's previous float, on the same tab,
+  only if it is the exact layer and block `show` recorded and that layer holds
+  nothing else; another agent's float, and other floats, including hand-made
+  ones labelled "Show: enlarged", are left alone. Floats recorded per tab by an
+  older `show` are left for you to close. The JSON's `owner` and `resolved` say
+  whose picture is shown; an agent pane with its own Show pane or history always
+  gets its own pictures. The float takes focus only when its tab is the
   session's active tab; the float's command ends with `rex focus` back to the
   pane that had focus.
 
@@ -154,6 +172,11 @@ pane and focuses its owner (for an old shared Show pane: `session.json`'s
 `main_block`) if that block is on the same tab; otherwise Rex picks the focus.
 Bound to Cmd-I in the Rex config (`work_show_toggle`, which passes the focused
 pane as `--block`).
+
+## Known gaps
+
+- Histories are keyed by block id: if rex-resume restores panes under new block ids, each agent starts an empty history and the restored Show pane is neither adopted nor cleaned up (not verified).
+- If Codex changed `TMPDIR` for the agent, `REXCHAT_INBOX` would no longer be under `show`'s `<tmp>/rexchat` and would be ignored, and the probe would fail with "inbox is missing" instead of drawing (not observed).
 
 Install: `ln -s ~/dotfiles/agents/show/show ~/.local/bin/show`.
 

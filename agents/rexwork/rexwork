@@ -20,6 +20,7 @@ import os
 import re
 import secrets
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -869,9 +870,19 @@ def open_show(session, block):
         data = json.loads(out.stdout)
     except ValueError:
         fail("show --open-pane printed no JSON")
+    if isinstance(data, dict) and data.get("inline") is True and not data.get("pane"):
+        return data  # the pane runs rexchat: pictures are drawn inline, there is no Show pane
     if not isinstance(data, dict) or not data.get("pane"):
         fail("show --open-pane returned no pane")
     return data
+
+
+def wants_show(wanted, harness):
+    """--show, except under rexchat, which draws pictures inline: then a note and no Show pane."""
+    if wanted and harness == "rexchat":
+        note("pictures are drawn inline in rexchat; no Show pane opened")
+        return False
+    return wanted
 
 
 def soft(warnings, what, fn, *args):
@@ -896,7 +907,7 @@ def show_pane(warnings, session, block, wanted=True):
     if not wanted:
         return None
     show = soft(warnings, "Show pane not opened", open_show, session, block)
-    return show["pane"] if show else None
+    return show.get("pane") if show else None
 
 
 def open_bar(session, window):
@@ -927,12 +938,15 @@ STATE_MARK = "@STATE_DIR@"
 
 # Replaces @STATE_DIR@ in the prompt with the pane's state directory (only
 # known once the session exists), runs the agent, then keeps the pane at a
-# login shell after the agent exits.
+# login shell after the agent exits. If the agent fails, its exit message
+# (rexchat's names an unsent first prompt) stays on screen above a one-line
+# note; nothing clears it before the shell starts.
 AGENT_WRAPPER = (
     'if [ -n "$REXWORK_PROMPT" ]; then '
     'dir="$HOME/.local/state/rexwork/sessions/${REX_SESSION#session:}"; '
     'set -- "$@" "${REXWORK_PROMPT_OPT}$(printf %s "$REXWORK_PROMPT" | sed "s|@STATE_DIR@|$dir|g")"; fi; '
-    '"$@"; exec "${SHELL:-/bin/zsh}" -l'
+    '"$@" || printf "rexwork: the agent exited with status %s; its message is above\\n" "$?" >&2; '
+    'exec "${SHELL:-/bin/zsh}" -l'
 )
 
 
@@ -943,10 +957,12 @@ def rexchat_program():
 
 
 def pick_harness(args):
-    """--harness, else $REXWORK_HARNESS, else native for an unattended owner (any --owner) and
-    rexchat for Tal. rexchat falls back to native, with a note, when it is not installed."""
-    harness = (getattr(args, "harness", None) or os.environ.get("REXWORK_HARNESS")
-               or ("native" if getattr(args, "owner", None) else "rexchat"))
+    """--harness, else native for an unattended owner (any --owner; $REXWORK_HARNESS never
+    changes that), else $REXWORK_HARNESS, else rexchat for Tal. rexchat falls back to
+    native, with a note, when it is not installed."""
+    harness = getattr(args, "harness", None)
+    if not harness:
+        harness = "native" if getattr(args, "owner", None) else (os.environ.get("REXWORK_HARNESS") or "rexchat")
     if harness not in HARNESSES:
         fail(f"REXWORK_HARNESS={harness!r}: use one of {', '.join(HARNESSES)}")
     if harness == "rexchat" and not rexchat_program():
@@ -967,6 +983,7 @@ def agent_command(agent, prompt=None, harness="native", model=None, cwd=None):
     argv += ["--model", model] if model else []
     stub = os.environ.get("REXWORK_AGENT_STUB")
     argv = [stub, *argv] if stub else argv
+    prompt = prompt if prompt and prompt.strip() else None  # an empty or blank prompt is ignored
     env = [f"REXWORK_PROMPT={prompt}", f"REXWORK_PROMPT_OPT={opt}"] if prompt else ["-u", "REXWORK_PROMPT"]
     return ["/usr/bin/env", *env, "/bin/sh", "-c", AGENT_WRAPPER, "sh", *argv]
 
@@ -1309,7 +1326,8 @@ def start_existing(args, ticket, existing, tree=None):
         give_back(tree)
         raise
     main, window = main_block_of(existing, state)
-    show = show_pane(warnings, existing, main, args.show) or live_block(existing, state.get("show_block"))
+    show = (show_pane(warnings, existing, main, wants_show(args.show, state.get("harness")))
+            or live_block(existing, state.get("show_block")))
     bar = bar_pane(warnings, args, existing, window) or state.get("bar_block")
     label = (live_sessions().get(existing) or {}).get("label") or state.get("label") or ticket
     # find_ticket_session never returns a session recording another ticket.
@@ -1390,7 +1408,8 @@ def launch_new(args, ticket, title, url, issue, label, base, repo, tree, handed)
         if again:
             handed.append(again)  # on_existing records the worktree or gives it back, first thing
             return on_existing(args, ticket, again, tree)
-        session, window, main, show = create_session(label, ticket, cwd, command, warnings, args.show)
+        session, window, main, show = create_session(label, ticket, cwd, command, warnings,
+                                                     wants_show(args.show, harness))
         handed.append(session)  # the agent runs in the worktree from here on
         directory = state_dir(session)
         fields = dict(session_id=session, window_id=window, main_block=main, show_block=show,
@@ -1517,7 +1536,8 @@ def start_named(args, kind):
             fail("--draft needs an agent")
         command = None
     warnings = []
-    session, window, main, show = create_session(name, "main", cwd, command, warnings, args.show)
+    session, window, main, show = create_session(name, "main", cwd, command, warnings,
+                                                 wants_show(args.show, harness))
     # The command is running from here on: every later failure is a warning.
     bar = bar_pane(warnings, args, session, window)
     directory = state_dir(session)
@@ -1607,13 +1627,35 @@ def git_branch_info(path):
     return {"repo": str(main), "worktree": top, "branch": branch}
 
 
+def live_rexchat(block, timeout=1.0):
+    """True if a live rexchat runs in BLOCK: its control socket in rexchat's state directory
+    answers. A socket or status file left by a killed run does not answer. The request sent is
+    "{}", which rexchat refuses ("nothing to send") without acting on it (as show's probe)."""
+    if not isinstance(block, str) or not BLOCK_RE.match(block):
+        return False
+    path = REXCHAT_STATE / f"{block.removeprefix('block:')}.sock"
+    if not path.exists():
+        return False
+    try:
+        with socket.socket(socket.AF_UNIX) as s:
+            s.settimeout(timeout)
+            s.connect(str(path))
+            s.sendall(b"{}\n")
+            reply = json.loads(s.makefile().readline() or "null")
+    except (OSError, ValueError):
+        return False
+    return isinstance(reply, dict)
+
+
 def rexchat_agent(block):
-    """None unless a rexchat runs in BLOCK (its status file in rexchat's state directory);
-    then the agent it runs, claude or codex, or "" if its name says neither."""
+    """None unless a live rexchat runs in BLOCK (live_rexchat); then the agent it runs, claude
+    or codex (from its status file), or "" if that does not say."""
+    if not live_rexchat(block):
+        return None
     try:
         data = json.loads((REXCHAT_STATE / f"{block.removeprefix('block:')}.json").read_text())
     except (OSError, ValueError):
-        return None
+        return ""
     name = str(data.get("agent") or "").lower() if isinstance(data, dict) else ""
     return next((a for a in AGENTS if a in name), "")
 
@@ -1675,9 +1717,11 @@ def cmd_adopt(args):
         updates["harness"] = harness
     if args.agent or found:
         updates["agent"] = args.agent or found
+    # The Show pane first: if it fails, nothing is renamed or written. Under rexchat, show
+    # answers that pictures are inline: no pane, and the adopt goes on.
+    show = open_show(session, block) if args.show else {}
     if label != current:  # rename only after every check passed
         rex("session", "rename", session, label)
-    show = open_show(session, block) if args.show else {}
     updates["show_block"] = show.get("pane") or (state.get("show_block") if window_of(view, state.get("show_block"))
                                                  else None)
     warnings = []
@@ -1930,15 +1974,22 @@ def request_draft(session, directory, state):
     if not main:
         fail("no main pane recorded; run `rexwork adopt` from the agent pane")
     text = REQUEST_DRAFT.format(objectives=directory / "objectives.md", draft=directory / "ticket-draft.md")
-    program = rexchat_program() if state.get("harness") == "rexchat" else None
-    # rexchat takes a prompt over its socket (queued while a turn runs), whatever has focus in it.
-    try:
-        said = bool(program) and run([program, "--block", main, f"--say={text}"], timeout=30).returncode == 0
-    except Failure:
-        said = False
-    if not said:
-        if program:
-            note("rexchat did not take the request; typing it into the pane instead")
+    if live_rexchat(main):
+        # rexchat takes a prompt over its socket (queued while a turn runs), whatever has focus in it.
+        # If it refuses (a dialog is up, the session is starting, a timeout), nothing is typed: typed
+        # text could answer the agent's question, or send the request twice.
+        program = rexchat_program()
+        if not program:
+            fail("a rexchat runs in the agent pane, but the rexchat program was not found; nothing was sent")
+        try:
+            out = run([program, "--block", main, f"--say={text}"], timeout=30)
+        except Failure as e:
+            fail(f"rexchat did not answer: {e}; nothing was typed into the pane, try again")
+        if out.returncode != 0:
+            reason = (out.stderr or "").strip() or f"exit status {out.returncode}"
+            fail(f"rexchat refused the request ({reason}); nothing was typed into the pane, try again")
+    else:
+        # No live rexchat in the pane (a native agent): type the request and press Enter.
         rex("send", "-s", session, "-b", main, text)
         rex("send-key", "-s", session, "-b", main, "enter")
     emit({"requested": True, "agent_block": main,

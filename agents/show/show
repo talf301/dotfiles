@@ -13,13 +13,16 @@ its own Show pane: a split to its right, labelled "Show", created with
 --focus=false. Two agents on one tab have two Show panes. Focus never moves.
 
 Under a live rexchat the picture is drawn inline in the chat instead: when
-REXCHAT_INBOX is set, or when the calling pane runs a live rexchat (its control
-socket answers). The pane subcommands then only answer that pictures are inline.
+REXCHAT_INBOX names an existing private inbox made by the rexchat launcher, or
+when the calling pane runs a live rexchat (its control socket answers). show
+never creates the inbox. The pane subcommands then only answer that pictures
+are inline.
 
 --enlarge opens the caller's current picture (or picture N) in a large floating
 pane on the caller's tab. q or Esc closes it and focus returns to the pane that
-had it. A second --enlarge from the same tab replaces only the float show itself
-recorded in state.json for that tab; other tabs' enlarged pictures stay.
+had it. Enlarge floats are recorded per owner (the pane whose picture it shows):
+a second --enlarge of the same owner's pictures replaces only that owner's float;
+other agents' enlarged pictures stay.
 
 --toggle closes the caller's Show pane if it has one, else opens it
 (--focus=false) on the latest picture.
@@ -449,40 +452,39 @@ def private_dir(path):
     return stat.S_ISDIR(st.st_mode) and st.st_uid == os.getuid() and not st.st_mode & 0o022
 
 
+INBOX_NAME = re.compile(r"^inbox-[0-9]+$")
+
+
 def safe_inbox(inbox):
-    """True if a picture may be written into INBOX: it and its per-pane parent, and rexchat's
-    temp directory when INBOX is under it, are this user's own (see private_dir), so no other
-    user can have planted or swapped them."""
-    checks = [inbox, inbox.parent] + ([REXCHAT_TMP] if REXCHAT_TMP in inbox.parents else [])
-    return all(private_dir(p) for p in checks)
-
-
-def make_private_dirs(path):
-    """Create the missing directories of PATH, each with mode 0700."""
-    missing = []
-    p = path
-    while not os.path.lexists(p) and p != p.parent:
-        missing.append(p)
-        p = p.parent
-    for d in reversed(missing):
-        try:
-            os.mkdir(d, 0o700)
-        except FileExistsError:
-            pass
+    """True if a picture may be written into INBOX. It must be laid out as the rexchat
+    launcher makes it, ROOT/<pane>/inbox-<pid>, where ROOT is <tmp>/rexchat or
+    REXCHAT_STATE/pictures, and the inbox, its per-pane parent and ROOT must all exist
+    and be this user's own (see private_dir), so no other user can have planted or
+    swapped them. Anything else (a relative path, "..", another root) is refused."""
+    if not inbox.is_absolute() or ".." in inbox.parts or not INBOX_NAME.match(inbox.name):
+        return False
+    root = inbox.parent.parent
+    if root not in (REXCHAT_TMP, REXCHAT_STATE / "pictures") or not block_name(inbox.parent.name):
+        return False
+    return all(private_dir(p) for p in (inbox, inbox.parent, root))
 
 
 def rexchat_inbox(block):
     """(inbox, live): where a live rexchat whose agent is calling takes pictures.
 
     REXCHAT_INBOX first (the rexchat launcher sets it for its agent): (that path,
-    True). Else, if the calling pane (--block or REX_BLOCK) runs a live rexchat
+    True), only if it passes safe_inbox (absolute, already made by the launcher,
+    private); show never creates it. An unusable REXCHAT_INBOX is ignored with a
+    note. Then, if the calling pane (--block or REX_BLOCK) runs a live rexchat
     with pid P, the inbox the launcher made: <tmp>/rexchat/<name>/inbox-P, or
-    the older REXCHAT_STATE/pictures/<name>/inbox-P; only one that exists and
-    passes safe_inbox counts, else (None, True). (None, False) if no rexchat.
+    the older REXCHAT_STATE/pictures/<name>/inbox-P; only one that passes
+    safe_inbox counts, else (None, True). (None, False) if no rexchat.
     """
     env = os.environ.get("REXCHAT_INBOX")
     if env:
-        return Path(env), True
+        if safe_inbox(Path(env)):
+            return Path(env), True
+        print(f"show: ignoring REXCHAT_INBOX={env}: not an existing private rexchat inbox", file=sys.stderr)
     name = block_name(block) if block else None
     pid = live_rexchat(name) if name else None
     if not pid:
@@ -499,10 +501,9 @@ def deliver_inline(src, title, inbox):
     if not src.is_file():
         fail(f"no such file: {src}")
     try:
-        make_private_dirs(inbox)
-        if not safe_inbox(inbox):
-            fail(f"refusing rexchat's picture inbox {inbox}: it or its parent is a symlink, "
-                 "or another user's, or writable by others")
+        if not safe_inbox(inbox):  # checked again just before writing
+            fail(f"refusing rexchat's picture inbox {inbox}: it is gone, or it or a parent is a "
+                 "symlink, another user's, or writable by others")
         fd, staged = tempfile.mkstemp(prefix=".staging-", suffix=".png", dir=inbox)
         os.close(fd)
     except OSError as e:
@@ -633,14 +634,39 @@ def find_legacy_pane(view, window, state, session, directory):
     return verified(session, state["panes"].get(window["window_id"]), window, directory)
 
 
+def listed_blocks(session, view):
+    """Every block of SESSION from `rex block ls --json` (all of them, placed or not,
+    on any layer), or None if that listing cannot be read or looks incomplete: not
+    the expected shape, or missing a block the session view shows."""
+    out = run(["rex", "block", "ls", "-s", session, "--json", "--short=false"], timeout=20)
+    if out.returncode != 0:
+        return None
+    try:
+        data = json.loads(out.stdout)
+    except ValueError:
+        return None
+    blocks = data.get("blocks") if isinstance(data, dict) else None
+    if not isinstance(blocks, list) or not all(isinstance(b, dict) and isinstance(b.get("block_id"), str)
+                                               for b in blocks):
+        return None
+    listed = {b["block_id"] for b in blocks}
+    return listed if all_blocks(view) <= listed else None
+
+
 def close_orphans(view, state, session, directory):
     """Close Show panes whose owner pane is gone, and forget them. Returns the closed blocks.
 
-    Only panes recorded in state["owners"] and still running show's viewer on
-    that owner's history are closed. A pane whose program cannot be queried
-    is left alone and stays recorded.
+    An owner counts as gone only if the authoritative block listing
+    (listed_blocks) lacks it; if that listing is unreadable or doubtful,
+    nothing is closed or forgotten. Only panes recorded in state["owners"] and
+    still running show's viewer on that owner's history are closed. A pane
+    whose program cannot be queried is left alone and stays recorded.
     """
-    present = all_blocks(view)
+    if not any(owner not in all_blocks(view) for owner in state["owners"]):
+        return []  # every owner is in view: no need to ask Rex for the full listing
+    present = listed_blocks(session, view)
+    if present is None:
+        return []
     closed = []
     for owner, pane in list(state["owners"].items()):
         if owner in present:
@@ -875,10 +901,18 @@ def own_float(view, record, window_id):
     return None
 
 
-def enlarge_records(state):
-    """state["enlarge"] as {window_id: record}, one enlarge float per tab.
+def enlarge_key(owner, window_id):
+    """The state["enlarge"] key of OWNER's enlarge float: one per owner pane, so one
+    agent's --enlarge never closes another's. The legacy history has one per tab."""
+    return f"{LEGACY}@{window_id}" if owner == LEGACY else owner
 
-    An older state.json held a single record with its "window" inside; it is
+
+def enlarge_records(state):
+    """state["enlarge"] as {key: record}; keys are enlarge_key()s. Records of older
+    state.json files, keyed by window id (one float per tab), load unchanged and are
+    never matched again, so their floats are left for the user to close.
+
+    An even older state.json held a single record with its "window" inside; it is
     read as that window's record.
     """
     records = state.get("enlarge")
@@ -921,7 +955,8 @@ def enlarge(args, session, block, directory):
     back = (window.get("focused_block_id") or block) if focus else ""
     state_path = directory / "state.json"
     state = load_state(state_path)
-    record = enlarge_records(state).get(window["window_id"])
+    key = enlarge_key(owner, window["window_id"])
+    record = enlarge_records(state).get(key)
     old = own_float(view, record, window["window_id"])
     if old and back == record["block"]:
         # Focus is in the float being replaced: return to where it would have.
@@ -946,8 +981,8 @@ def enlarge(args, session, block, directory):
     layer = rex("api", "call", "session.new_layer", json.dumps(request))
     state = load_state(state_path)
     state["enlarge"] = enlarge_records(state)
-    state["enlarge"][window["window_id"]] = {"layer": layer["layer_id"],
-                                             "block": layer["block_ids"][0], "returns_to": back}
+    state["enlarge"][key] = {"layer": layer["layer_id"], "block": layer["block_ids"][0],
+                             "returns_to": back, "window": window["window_id"]}
     write_json(state_path, state)
     print(json.dumps({"image": png, "index": index, "pane": layer["block_ids"][0],
                       "layer": layer["layer_id"], "focused": focus, "returns_to": back or None,

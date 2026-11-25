@@ -43,7 +43,11 @@ Layout, the same for every session: one tab with the agent pane
 starts closed, since the agent has nothing to show yet: it appears on the right
 at 40% with the first `show FILE`, and `show --toggle` (cmd+i, or the
 `work_show_toggle` action) opens and closes it. `--show` on `start` or `adopt`
-opens it up front with `show --open-pane` (`show_block`). The bar stays full
+opens it up front with `show --open-pane` (`show_block`). Under the rexchat
+harness pictures are drawn inline in the chat, so `start --show` opens no Show
+pane: it prints a one-line note and records `show_block: null`. `adopt --show`
+in a rexchat pane takes show's `{"inline": true}` answer as success with no
+pane. The bar stays full
 width below both panes when the Show pane opens later. A failed Show pane or
 bar is a warning, never fatal. Neovim and the peek open as floats on demand. `start` never moves focus
 unless `--focus` is given.
@@ -71,8 +75,9 @@ unless `--focus` is given.
   its bar (and with `--show` its Show pane) is added if missing, nothing else
   changes, `show_block` keeps a recorded pane that is still live, and the output has
   `"reused": true`. Running it twice is safe.
-  `--prompt TEXT` gives the agent a first prompt; `-- COMMAND...` runs that
-  command in the main pane instead of an agent.
+  `--prompt TEXT` gives the agent a first prompt (an empty or whitespace-only
+  one is ignored); `-- COMMAND...` runs that command in the main pane instead
+  of an agent.
   With `--no-worktree`, or outside a git repo, the session runs in `--cwd`
   and records no worktree or branch. If the worktree it expects can not be
   made, nothing starts (see [Worktrees](#worktrees)).
@@ -108,9 +113,14 @@ The agent pane runs the agent in one of two ways (`harness` in `session.json`,
   default when `--owner` is given (any owner, such as `symphony`: unattended
   runs keep the native CLI).
 
-`REXWORK_HARNESS=rexchat|native` overrides the default; `--harness` overrides
-both. If `rexchat` is not on `PATH`, the pane runs natively and a one-line note
-says so. Either way the pane drops to a login shell when the agent exits, and
+`REXWORK_HARNESS=rexchat|native` overrides the default for sessions without
+`--owner`; `--harness` overrides both. The variable never changes the harness
+of a session started with `--owner`: only an explicit `--harness rexchat` puts
+an owned (unattended) session in rexchat. If `rexchat` is not on `PATH`, the
+pane runs natively and a one-line note says so. Either way the pane drops to a
+login shell when the agent exits (after a failed exit, the agent's own message,
+such as rexchat's "the first prompt was not sent: ...", stays on screen above
+a `rexwork: the agent exited with status N` note), and
 `--prompt` (with `@STATE_DIR@` replaced by the session's state directory, as
 `--draft` needs) is the agent's first message: with rexchat it goes through
 rexchat's queue, shows as Tal's message and is not resent on `rexchat
@@ -123,8 +133,12 @@ rexchat's queue, shows as Tal's message and is not resent on `rexchat
 | claude | `claude --model NAME` | `rexchat --model NAME`: claude-agent-acp's `model` option (aliases such as `opus`, or a full id) |
 | codex | `codex --model NAME` | `rexchat --model NAME`: codex-acp's `model` option |
 
-With rexchat, a model the adapter refuses leaves its default model and shows
-an error line in the pane; rexwork cannot see that. `--model` with
+With rexchat, NAME is matched against the adapter's model options: an exact
+match on an option's id or name (ignoring case) first, then a substring match
+only when exactly one option contains NAME; otherwise NAME goes to the adapter
+unchanged, so `--model gpt-5` never picks `gpt-5-codex`. A model the adapter
+refuses leaves its default model and shows an error line in the pane; rexwork
+cannot see that. `--model` with
 `-- COMMAND` or `--no-agent` is refused. The model is recorded as `model`.
 
 Output (one JSON object):
@@ -145,7 +159,10 @@ For a session that predates rexwork. Writes state for the caller's session
 (`$REX_SESSION`, main pane `$REX_BLOCK`) and adds the status bar if its tab
 has none (`--no-bar` skips it; a bar failure is a warning). The Show pane is
 added beside the caller only with `--show` (`show_created` says whether it was
-made); otherwise `show_block` keeps a recorded pane that is still live. Other panes are left alone. It renames the session
+made; in a rexchat pane show answers that pictures are inline, and the adopt
+completes with no Show pane); otherwise `show_block` keeps a recorded pane that
+is still live. The Show pane step runs before the rename and the state write,
+so if it fails nothing is renamed or written. Other panes are left alone. It renames the session
 only with `--name`; a session that still has a generated name (such as
 `dawn-grotto`) needs `--name`. A label starting with a ticket ID makes the
 session ticketed, and the branch and worktree are read from the caller's
@@ -158,9 +175,11 @@ dropped; a session that still holds a worktree rexwork created is refused
 when an earlier session's `worktree_created` record still matches it,
 `treehouse` for a slot leased by `rexwork:TAL-123`, else `adopted` (never
 removed by `release`; someone else's slot is also recorded as `adopted`).
-When a rexchat runs in the pane (its status file
-`~/.local/state/rexchat/<block>.json` exists), `harness` is recorded as
-`rexchat` and `agent` as the agent it names; `--harness` and `--agent` set
+When a live rexchat runs in the pane (its control socket
+`~/.local/state/rexchat/<block>.sock` answers; rexwork sends `{}`, which
+rexchat refuses without acting on it, as `show` does), `harness` is recorded as
+`rexchat` and `agent` as the agent its status file names. A status or socket
+file left by a killed rexchat does not count. `--harness` and `--agent` set
 them by hand. Otherwise neither is guessed.
 
 ## promote
@@ -261,8 +280,12 @@ ticketed".
 
 With the `work_promote` action (or `--request-draft`) and no draft yet,
 rexwork asks the session's agent to write the draft and run
-`rexwork promote` (with the rexchat harness through `rexchat --block B --say`,
-else, or if that fails, by typing into the pane).
+`rexwork promote`. When a live rexchat runs in the agent pane (the same socket
+check as `adopt`), the request goes through `rexchat --block B --say`; if
+rexchat refuses it (a dialog is up, the session is starting, a timeout),
+nothing is typed: rexwork prints rexchat's message and exits non-zero so you
+can retry. Only when no live rexchat runs there is the request typed into the
+pane and Enter pressed.
 
 ## land
 

@@ -27,6 +27,7 @@ os.environ["REXWORK_REXCHAT"] = "/nonexistent/rexchat"
 os.environ.pop("REXWORK_HARNESS", None)
 os.environ.pop("REXWORK_AGENT_STUB", None)
 REAL_OPEN_BAR = rw.open_bar
+REAL_OPEN_SHOW = rw.open_show
 rw.open_bar = lambda session, window: {"pane": "block:bar"}
 
 
@@ -1850,8 +1851,32 @@ class Harness(unittest.TestCase):
                 self.commands.append(list(a[a.index("--") + 1:]) if "--" in a else None)
                 return {"session_id": SID, "initial_windows": [{"window_id": "window:n", "block_ids": ["block:n"]}]}
             return {}
-        self.ctx.enter_context(patched(rex=rex, live_sessions=lambda: {}, open_show=lambda s, b: {"pane": "block:s"},
-                                       REXCHAT_STATE=self.tmp / "rexchat-state"))
+        self.shown = []
+        # Short: a Unix socket path is limited to 104 bytes on macOS.
+        self.rc_state = Path(self.ctx.enter_context(tempfile.TemporaryDirectory(prefix="rc", dir="/tmp")))
+        self.ctx.enter_context(patched(rex=rex, live_sessions=lambda: {},
+                                       open_show=lambda s, b: self.shown.append(b) or {"pane": "block:s"},
+                                       REXCHAT_STATE=self.rc_state))
+
+    def serve(self, block, reply=b'{"error": "nothing to send"}\n'):
+        """A fake live rexchat in BLOCK: its control socket answers each connection with REPLY."""
+        import socket
+        srv = socket.socket(socket.AF_UNIX)
+        srv.bind(str(self.rc_state / f"{block.removeprefix('block:')}.sock"))
+        srv.listen()
+        self.ctx.callback(srv.close)
+        self.requests = []
+
+        def loop():
+            while True:
+                try:
+                    c, _ = srv.accept()
+                except OSError:
+                    return
+                with c:
+                    self.requests.append(c.makefile().readline())
+                    c.sendall(reply)
+        threading.Thread(target=loop, daemon=True).start()
 
     def tearDown(self):
         self.ctx.close()
@@ -1889,7 +1914,13 @@ class Harness(unittest.TestCase):
         self.assertEqual(self.start("--harness", "rexchat"), 0)
         self.assertEqual(self.harness(), "rexchat")
         self.env({"REXWORK_HARNESS": "rexchat"})
+        self.assertEqual(self.start(), 0)
+        self.assertEqual(self.harness(), "rexchat")
+        # An owned (unattended) session never ends up in rexchat through the variable (S2);
+        # only an explicit --harness rexchat puts it there.
         self.assertEqual(self.start("--owner", "symphony"), 0)
+        self.assertEqual(self.harness(), "native")
+        self.assertEqual(self.start("--owner", "symphony", "--harness", "rexchat"), 0)
         self.assertEqual(self.harness(), "rexchat")
         self.assertEqual(self.start("--owner", "symphony", "--harness", "native"), 0)
         self.assertEqual(self.harness(), "native")
@@ -1974,34 +2005,160 @@ class Harness(unittest.TestCase):
         block = "block:0123abcd-0000"
         view = {"label": "notes", "active_window_id": "window:n", "windows": [
             {"window_id": "window:n", "layers": [{"kind": "tiled", "blocks": [{"block_id": block}]}]}]}
-        status = self.tmp / "rexchat-state" / "0123abcd-0000.json"
-        status.parent.mkdir()
+        status = self.rc_state / "0123abcd-0000.json"
         status.write_text(json.dumps({"agent": "@agentclientprotocol/codex-acp", "state": "idle"}))
+        self.serve(block)
         with patched(inspect=lambda s: view):
             make_state(self.root, {"kind": "scratch", "label": "notes"})
             self.assertEqual(rw.main(["adopt", "--session", SID, "--block", block, "--name", "notes"]), 0)
             self.assertEqual((self.emitted[-1]["agent"], self.emitted[-1]["harness"]), ("codex", "rexchat"))
+            self.assertEqual(self.requests, ["{}\n"])  # only the harmless probe
             # Without a rexchat in the pane, nothing is guessed; flags still set both.
             status.unlink()
+            (self.rc_state / "0123abcd-0000.sock").unlink()
             make_state(self.root, {"kind": "scratch", "label": "notes"}, uuid=OTHER)
             self.assertEqual(rw.main(["adopt", "--session", "session:" + OTHER, "--block", block, "--name",
                                       "notes", "--agent", "claude", "--harness", "native"]), 0)
             self.assertEqual((self.emitted[-1]["agent"], self.emitted[-1]["harness"]), ("claude", "native"))
 
+    def test_adopt_ignores_a_stale_rexchat_status_file(self):
+        # S5: a status file and socket file left by a killed rexchat do not make the pane a rexchat pane.
+        import socket
+        block = "block:0123abcd-0000"
+        view = {"label": "notes", "active_window_id": "window:n", "windows": [
+            {"window_id": "window:n", "layers": [{"kind": "tiled", "blocks": [{"block_id": block}]}]}]}
+        (self.rc_state / "0123abcd-0000.json").write_text(json.dumps({"agent": "codex-acp", "state": "idle"}))
+        dead = socket.socket(socket.AF_UNIX)  # bound, never listening: a killed run's socket file
+        dead.bind(str(self.rc_state / "0123abcd-0000.sock"))
+        dead.close()
+        with patched(inspect=lambda s: view):
+            make_state(self.root, {"kind": "scratch", "label": "notes"})
+            self.assertEqual(rw.main(["adopt", "--session", SID, "--block", block, "--name", "notes"]), 0)
+        self.assertEqual((self.emitted[-1]["agent"], self.emitted[-1]["harness"]), (None, None))
+        self.assertFalse(rw.live_rexchat("block:../x"))
+
     def test_request_draft_uses_rexchat_say(self):
         calls, sent = [], []
-        d = make_state(self.root, {"main_block": "block:n", "harness": "rexchat"})
-        ok = type("P", (), {"returncode": 0})()
+        d = make_state(self.root, {"main_block": "block:0123abcd-0001", "harness": "rexchat"})
+        self.serve("block:0123abcd-0001")
+        ok = type("P", (), {"returncode": 0, "stderr": ""})()
         with patched(run=lambda a, **k: calls.append(a) or ok, rex=lambda *a, **k: sent.append(a) or {}):
             rw.request_draft(SID, d, rw.read_state(d))
-        self.assertEqual(calls[0][:3], [str(self.rexchat), "--block", "block:n"])
+        self.assertEqual(calls[0][:3], [str(self.rexchat), "--block", "block:0123abcd-0001"])
         self.assertTrue(calls[0][3].startswith("--say=Tal asked to turn this session into a Linear ticket."))
         self.assertEqual(sent, [])
-        bad = type("P", (), {"returncode": 1})()
+
+    def test_request_draft_refused_by_rexchat_types_nothing(self):
+        # S4: a live rexchat that refuses (a dialog is up, starting, a timeout): report it, type nothing.
+        sent = []
+        d = make_state(self.root, {"main_block": "block:0123abcd-0001", "harness": "rexchat"})
+        self.serve("block:0123abcd-0001")
+        bad = type("P", (), {"returncode": 1, "stderr": "rexchat: a dialog is waiting for an answer\n"})()
         with patched(run=lambda a, **k: bad, rex=lambda *a, **k: sent.append(a) or {}):
+            with self.assertRaises(rw.Failure) as e:
+                rw.request_draft(SID, d, rw.read_state(d))
+        self.assertIn("rexchat: a dialog is waiting for an answer", str(e.exception))
+        self.assertIn("nothing was typed", str(e.exception))
+
+        def timeout(a, **k):
+            raise rw.Failure("rexchat --block block:0123abcd-0001: timed out after 30s")
+        with patched(run=timeout, rex=lambda *a, **k: sent.append(a) or {}):
+            with self.assertRaises(rw.Failure):
+                rw.request_draft(SID, d, rw.read_state(d))
+        self.assertEqual(sent, [])
+        # Through main: a non-zero exit.
+        with patched(run=lambda a, **k: bad, rex=lambda *a, **k: sent.append(a) or {}):
+            self.assertEqual(rw.main(["promote", "--session", SID, "--request-draft"]), 1)
+        self.assertEqual(sent, [])
+
+    def test_request_draft_types_when_no_rexchat_runs(self):
+        # The pane's recorded harness says rexchat, but none is live there (it exited): type it.
+        calls, sent = [], []
+        d = make_state(self.root, {"main_block": "block:0123abcd-0001", "harness": "rexchat"})
+        with patched(run=lambda a, **k: calls.append(a), rex=lambda *a, **k: sent.append(a) or {}):
             rw.request_draft(SID, d, rw.read_state(d))
+        self.assertEqual(calls, [])
         self.assertEqual([a[0] for a in sent], ["send", "send-key"])
-        self.assertIn("typing it into the pane instead", self.notes[-1])
+
+    def test_start_show_under_rexchat_opens_no_show_pane(self):
+        # S1: rexchat draws pictures inline; --show opens nothing and session.json records no Show pane.
+        for ticket in (True, False):
+            rc = rw.main(["start", *(["TAL-7", "--title", "Fix", "--no-linear", "--no-worktree"] if ticket
+                                     else ["--scratch", "notes"]), "--cwd", str(self.tmp), "--show"])
+            self.assertEqual(rc, 0)
+            state = json.loads((self.root / "sessions" / UUID / "session.json").read_text())
+            (self.root / "sessions" / UUID / "session.json").unlink()
+            self.assertEqual((state["harness"], state.get("show_block")), ("rexchat", None))
+            self.assertIsNone(self.emitted[-1]["show_block"])
+            self.assertEqual(self.notes.count("pictures are drawn inline in rexchat; no Show pane opened"),
+                             1 + (not ticket))
+        self.assertEqual(self.shown, [])
+        self.assertEqual(self.start("--show", "--harness", "native"), 0)  # natively, as before
+        self.assertEqual((self.shown, self.emitted[-1]["show_block"]), (["block:n"], "block:s"))
+
+    def test_open_show_accepts_an_inline_answer(self):
+        stub = self.tmp / "show-inline"
+        stub.write_text('import json\nprint(json.dumps({"inline": True, "note": "inline"}))\n')
+        self.env({"REXWORK_SHOW": str(stub)})
+        with patched(open_show=REAL_OPEN_SHOW):
+            self.assertEqual(rw.open_show(SID, "block:n"), {"inline": True, "note": "inline"})
+            warnings = []
+            self.assertIsNone(rw.show_pane(warnings, SID, "block:n"))
+            self.assertEqual(warnings, [])
+        stub.write_text('import json\nprint(json.dumps({"inline": False}))\n')
+        with patched(open_show=REAL_OPEN_SHOW), self.assertRaises(rw.Failure):
+            rw.open_show(SID, "block:n")
+
+    def adopt_view(self, block):
+        return {"label": "old-name", "active_window_id": "window:n", "windows": [
+            {"window_id": "window:n", "layers": [{"kind": "tiled", "blocks": [{"block_id": block}]}]}]}
+
+    def test_adopt_show_in_a_rexchat_pane_completes(self):
+        # S1: show answers inline (no pane): the adopt completes and records no Show pane.
+        block, renames = "block:0123abcd-0000", []
+        self.serve(block)
+        rex = lambda *a, **k: renames.append(a) or {}
+        with patched(inspect=lambda s: self.adopt_view(block), rex=rex,
+                     open_show=lambda s, b: {"inline": True, "note": "inline"}):
+            self.assertEqual(rw.main(["adopt", "--session", SID, "--block", block, "--name", "notes", "--show"]), 0)
+        state = json.loads((self.root / "sessions" / UUID / "session.json").read_text())
+        self.assertEqual((state["label"], state["harness"], state.get("show_block")), ("notes", "rexchat", None))
+        self.assertEqual(self.emitted[-1]["show_created"], False)
+        self.assertEqual(renames, [("session", "rename", SID, "notes")])
+
+    def test_adopt_show_failure_renames_nothing(self):
+        block, renames = "block:0123abcd-0000", []
+
+        def boom(s, b):
+            raise rw.Failure("show --open-pane: broken")
+        with patched(inspect=lambda s: self.adopt_view(block), rex=lambda *a, **k: renames.append(a) or {},
+                     open_show=boom):
+            self.assertEqual(rw.main(["adopt", "--session", SID, "--block", block, "--name", "notes", "--show"]), 1)
+        self.assertEqual(renames, [])
+        self.assertFalse((self.root / "sessions" / UUID / "session.json").exists())
+
+    def test_blank_prompt_is_ignored(self):
+        # S6: an empty or whitespace-only --prompt is not passed on.
+        for prompt in ("", "   ", "\n\t "):
+            self.assertEqual(self.start(f"--prompt={prompt}"), 0)
+            command = self.commands[-1]
+            self.assertEqual(command[1:3], ["-u", "REXWORK_PROMPT"])
+            self.assertFalse(any(a.startswith("REXWORK_PROMPT=") for a in command))
+
+    def test_wrapper_keeps_a_failed_agents_message_visible(self):
+        # S7: the agent's exit message stays, followed by a note, before the login shell.
+        import subprocess
+        argv = rw.agent_command("claude", "first prompt", "rexchat", None, "/w")
+        script = argv[argv.index("-c") + 1].replace('exec "${SHELL:-/bin/zsh}" -l', "echo SHELL-STARTED")
+        agent = "echo 'rexchat: the first prompt was not sent: first prompt' >&2; exit 3"
+        out = subprocess.run(["/bin/sh", "-c", script, "sh", "/bin/sh", "-c", agent],
+                             env={"PATH": os.environ["PATH"], "HOME": "/h"}, capture_output=True, text=True)
+        self.assertEqual(out.stderr, "rexchat: the first prompt was not sent: first prompt\n"
+                                     "rexwork: the agent exited with status 3; its message is above\n")
+        self.assertEqual(out.stdout, "SHELL-STARTED\n")
+        ok = subprocess.run(["/bin/sh", "-c", script, "sh", "true"], env={"PATH": os.environ["PATH"]},
+                            capture_output=True, text=True)
+        self.assertEqual((ok.stdout, ok.stderr), ("SHELL-STARTED\n", ""))
 
 
 if __name__ == "__main__":

@@ -22,6 +22,10 @@ SID = "session:" + UUID
 # Never read Tal's real config, run the real rexbar or the real treehouse.
 os.environ["REXWORK_CONFIG"] = str(HERE / "no-such-config.json")
 os.environ["REXWORK_TREEHOUSE"] = "/nonexistent/treehouse"
+# Nor the real rexchat: without a stub, the rexchat harness falls back to native.
+os.environ["REXWORK_REXCHAT"] = "/nonexistent/rexchat"
+os.environ.pop("REXWORK_HARNESS", None)
+os.environ.pop("REXWORK_AGENT_STUB", None)
 REAL_OPEN_BAR = rw.open_bar
 rw.open_bar = lambda session, window: {"pane": "block:bar"}
 
@@ -1826,6 +1830,178 @@ class Worktrees(unittest.TestCase):
         out = self.emitted[-1]
         self.assertIsNone(out["bar_block"])
         self.assertTrue(any("status bar not opened" in w for w in out["warnings"]))
+
+
+class Harness(unittest.TestCase):
+    """The agent pane runs the agent in rexchat for Tal and natively for unattended owners."""
+
+    def setUp(self):
+        self.ctx = contextlib.ExitStack()
+        self.root, self.emitted, self.notes = self.ctx.enter_context(sandbox())
+        self.tmp = Path(self.ctx.enter_context(tempfile.TemporaryDirectory())).resolve()
+        self.rexchat = self.tmp / "rexchat"
+        self.rexchat.write_text("#!/bin/sh\nexit 0\n")
+        self.rexchat.chmod(0o755)
+        self.env({"REXWORK_REXCHAT": str(self.rexchat), "REXWORK_HARNESS": None})
+        self.commands = []
+
+        def rex(*a, **k):
+            if a[0] == "new":
+                self.commands.append(list(a[a.index("--") + 1:]) if "--" in a else None)
+                return {"session_id": SID, "initial_windows": [{"window_id": "window:n", "block_ids": ["block:n"]}]}
+            return {}
+        self.ctx.enter_context(patched(rex=rex, live_sessions=lambda: {}, open_show=lambda s, b: {"pane": "block:s"},
+                                       REXCHAT_STATE=self.tmp / "rexchat-state"))
+
+    def tearDown(self):
+        self.ctx.close()
+
+    def env(self, values):
+        saved = {k: os.environ.get(k) for k in values}
+        for k, v in values.items():
+            os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+        self.ctx.callback(lambda: [os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+                                   for k, v in saved.items()])
+
+    def start(self, *flags, ticket=True):
+        what = ["TAL-7", "--title", "Fix", "--no-linear", "--no-worktree"] if ticket else ["--scratch", "notes"]
+        rc = rw.main(["start", *what, "--cwd", str(self.tmp), *flags])
+        (self.root / "sessions" / UUID / "session.json").unlink(missing_ok=True)  # each start is a new session
+        return rc
+
+    def tail(self, command):
+        """The program and its arguments, after the wrapper."""
+        return command[command.index("sh", command.index("-c")) + 1:]
+
+    def harness(self):
+        return self.emitted[-1]["harness"]
+
+    def test_default_per_owner(self):
+        for flags, ticket, want in (([], True, "rexchat"), ([], False, "rexchat"),
+                                    (["--owner", "symphony"], True, "native"), (["--owner", "cron"], True, "native")):
+            self.assertEqual(self.start(*flags, ticket=ticket), 0)
+            self.assertEqual(self.harness(), want, flags)
+
+    def test_env_overrides_default_and_flag_overrides_env(self):
+        self.env({"REXWORK_HARNESS": "native"})
+        self.assertEqual(self.start(), 0)
+        self.assertEqual(self.harness(), "native")
+        self.assertEqual(self.start("--harness", "rexchat"), 0)
+        self.assertEqual(self.harness(), "rexchat")
+        self.env({"REXWORK_HARNESS": "rexchat"})
+        self.assertEqual(self.start("--owner", "symphony"), 0)
+        self.assertEqual(self.harness(), "rexchat")
+        self.assertEqual(self.start("--owner", "symphony", "--harness", "native"), 0)
+        self.assertEqual(self.harness(), "native")
+        self.env({"REXWORK_HARNESS": "tmux"})
+        self.assertEqual(self.start(), 1)
+        self.assertIn("REXWORK_HARNESS='tmux'", self.notes[-1])
+
+    def test_exact_commands(self):
+        rc, cwd, wrapper = str(self.rexchat), str(self.tmp), rw.AGENT_WRAPPER
+        cases = [
+            ([], ["-u", "REXWORK_PROMPT"], [rc, "--agent", "claude", "--cwd", cwd]),
+            (["--agent", "codex"], ["-u", "REXWORK_PROMPT"], [rc, "--agent", "codex", "--cwd", cwd]),
+            (["--prompt", "go", "--model", "sonnet"], ["REXWORK_PROMPT=go", "REXWORK_PROMPT_OPT=--prompt="],
+             [rc, "--agent", "claude", "--cwd", cwd, "--model", "sonnet"]),
+            (["--agent", "codex", "--prompt", "go", "--model", "gpt-5"],
+             ["REXWORK_PROMPT=go", "REXWORK_PROMPT_OPT=--prompt="],
+             [rc, "--agent", "codex", "--cwd", cwd, "--model", "gpt-5"]),
+            (["--harness", "native"], ["-u", "REXWORK_PROMPT"], ["claude"]),
+            (["--harness", "native", "--agent", "codex", "--prompt", "go", "--model", "gpt-5"],
+             ["REXWORK_PROMPT=go", "REXWORK_PROMPT_OPT="], ["codex", "--model", "gpt-5"]),
+            (["--harness", "native", "--model", "opus"], ["-u", "REXWORK_PROMPT"], ["claude", "--model", "opus"]),
+        ]
+        for flags, env, tail in cases:
+            self.assertEqual(self.start(*flags), 0)
+            self.assertEqual(self.commands[-1], ["/usr/bin/env", *env, "/bin/sh", "-c", wrapper, "sh", *tail], flags)
+
+    def test_wrapper_passes_the_prompt_to_rexchat_as_one_option(self):
+        import subprocess
+        argv = rw.agent_command("claude", "-see @STATE_DIR@/x", "rexchat", None, "/w")
+        script = argv[argv.index("-c") + 1].replace('exec "${SHELL:-/bin/zsh}" -l', "true")
+        out = subprocess.run(["/bin/sh", "-c", script, "sh", "printf", "[%s]", *self.tail(argv)],
+                             env={"REXWORK_PROMPT": "-see @STATE_DIR@/x", "REXWORK_PROMPT_OPT": "--prompt=",
+                                  "REX_SESSION": "session:abc", "HOME": "/h", "PATH": os.environ["PATH"]},
+                             capture_output=True, text=True)
+        self.assertEqual(out.stdout, f"[{self.rexchat}][--agent][claude][--cwd][/w]"
+                                     "[--prompt=-see /h/.local/state/rexwork/sessions/abc/x]")
+
+    def test_draft_prompt_reaches_rexchat(self):
+        rc = rw.main(["start", "--draft", "idea", "--cwd", str(self.tmp)])
+        self.assertEqual(rc, 0)
+        command = self.commands[-1]
+        self.assertTrue(any(a.startswith("REXWORK_PROMPT=") and "@STATE_DIR@/ticket-draft.md" in a for a in command))
+        self.assertIn("REXWORK_PROMPT_OPT=--prompt=", command)
+        self.assertEqual(self.tail(command)[:3], [str(self.rexchat), "--agent", "claude"])
+
+    def test_fallback_when_rexchat_is_missing(self):
+        from unittest import mock
+        self.env({"REXWORK_REXCHAT": None})
+        with mock.patch.object(rw.shutil, "which", lambda name: None):
+            self.assertEqual(self.start("--prompt", "go"), 0)
+        self.assertEqual(self.harness(), "native")
+        self.assertEqual(self.tail(self.commands[-1]), ["claude"])
+        self.assertIn("rexchat is not installed; running the agent natively", self.notes)
+
+    def test_session_json_fields(self):
+        rc = rw.main(["start", "TAL-7", "--title", "Fix", "--no-linear", "--no-worktree", "--cwd", str(self.tmp),
+                      "--agent", "codex", "--model", "gpt-5"])
+        self.assertEqual(rc, 0)
+        state = json.loads((self.root / "sessions" / UUID / "session.json").read_text())
+        self.assertEqual((state["agent"], state["harness"], state["model"]), ("codex", "rexchat", "gpt-5"))
+        (self.root / "sessions" / UUID / "session.json").unlink()
+        self.assertEqual(rw.main(["start", "--scratch", "s", "--cwd", str(self.tmp), "--", "true"]), 0)
+        state = json.loads((self.root / "sessions" / UUID / "session.json").read_text())
+        for key in ("agent", "harness", "model"):
+            self.assertNotIn(key, state)
+        self.assertEqual(rw.main(["start", "--scratch", "s", "--cwd", str(self.tmp), "--model", "x", "--", "true"]), 1)
+        self.assertIn("--model needs an agent", self.notes[-1])
+
+    def test_status_and_ls_show_the_harness(self):
+        make_state(self.root, {"kind": "scratch", "label": "notes", "agent": "claude", "harness": "rexchat",
+                               "model": "sonnet"})
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(rw.main(["status", "--session", SID]), 0)
+            self.assertEqual(rw.main(["ls"]), 0)
+        text = out.getvalue()
+        self.assertIn("  harness: rexchat\n", text)
+        self.assertIn("  model: sonnet\n", text)
+        self.assertRegex(text, r"gone  scratch\s+-\s+rexchat\s+notes")
+
+    def test_adopt_on_a_rexchat_pane(self):
+        block = "block:0123abcd-0000"
+        view = {"label": "notes", "active_window_id": "window:n", "windows": [
+            {"window_id": "window:n", "layers": [{"kind": "tiled", "blocks": [{"block_id": block}]}]}]}
+        status = self.tmp / "rexchat-state" / "0123abcd-0000.json"
+        status.parent.mkdir()
+        status.write_text(json.dumps({"agent": "@agentclientprotocol/codex-acp", "state": "idle"}))
+        with patched(inspect=lambda s: view):
+            make_state(self.root, {"kind": "scratch", "label": "notes"})
+            self.assertEqual(rw.main(["adopt", "--session", SID, "--block", block, "--name", "notes"]), 0)
+            self.assertEqual((self.emitted[-1]["agent"], self.emitted[-1]["harness"]), ("codex", "rexchat"))
+            # Without a rexchat in the pane, nothing is guessed; flags still set both.
+            status.unlink()
+            make_state(self.root, {"kind": "scratch", "label": "notes"}, uuid=OTHER)
+            self.assertEqual(rw.main(["adopt", "--session", "session:" + OTHER, "--block", block, "--name",
+                                      "notes", "--agent", "claude", "--harness", "native"]), 0)
+            self.assertEqual((self.emitted[-1]["agent"], self.emitted[-1]["harness"]), ("claude", "native"))
+
+    def test_request_draft_uses_rexchat_say(self):
+        calls, sent = [], []
+        d = make_state(self.root, {"main_block": "block:n", "harness": "rexchat"})
+        ok = type("P", (), {"returncode": 0})()
+        with patched(run=lambda a, **k: calls.append(a) or ok, rex=lambda *a, **k: sent.append(a) or {}):
+            rw.request_draft(SID, d, rw.read_state(d))
+        self.assertEqual(calls[0][:3], [str(self.rexchat), "--block", "block:n"])
+        self.assertTrue(calls[0][3].startswith("--say=Tal asked to turn this session into a Linear ticket."))
+        self.assertEqual(sent, [])
+        bad = type("P", (), {"returncode": 1})()
+        with patched(run=lambda a, **k: bad, rex=lambda *a, **k: sent.append(a) or {}):
+            rw.request_draft(SID, d, rw.read_state(d))
+        self.assertEqual([a[0] for a in sent], ["send", "send-key"])
+        self.assertIn("typing it into the pane instead", self.notes[-1])
 
 
 if __name__ == "__main__":

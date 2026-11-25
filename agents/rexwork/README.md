@@ -5,10 +5,10 @@ standard layout, turns a scratch session into a Linear ticket, and lands it.
 It is linked as `~/.local/bin/rexwork`.
 
 ```sh
-rexwork start --scratch NAME [--cwd DIR] [--agent claude|codex] [--no-agent] [--no-bar] [--show] [--focus]
-rexwork start --draft NAME   [--cwd DIR] [--agent claude|codex] [--no-bar] [--show] [--focus]
-rexwork start TAL-123 [--repo PATH | --cwd DIR] [--no-worktree] [--title T] [--agent ...] [--no-agent] [--no-linear] [--prompt TEXT] [--owner NAME] [--reuse-tab NAME] [--no-bar] [--show] [--focus] [-- COMMAND...]
-rexwork adopt [--name NAME] [--repo PATH] [--no-bar] [--show]
+rexwork start --scratch NAME [--cwd DIR] [--agent claude|codex] [--harness rexchat|native] [--model NAME] [--no-agent] [--no-bar] [--show] [--focus]
+rexwork start --draft NAME   [--cwd DIR] [--agent claude|codex] [--harness rexchat|native] [--model NAME] [--no-bar] [--show] [--focus]
+rexwork start TAL-123 [--repo PATH | --cwd DIR] [--no-worktree] [--title T] [--agent ...] [--harness ...] [--model NAME] [--no-agent] [--no-linear] [--prompt TEXT] [--owner NAME] [--reuse-tab NAME] [--no-bar] [--show] [--focus] [-- COMMAND...]
+rexwork adopt [--name NAME] [--repo PATH] [--agent claude|codex] [--harness rexchat|native] [--no-bar] [--show]
 rexwork promote --template
 rexwork promote [--draft FILE] [--repo PATH | --no-worktree] [--dry-run] [--no-focus]
 rexwork promote --file [--dry-run]      # the filing step; see "Filing needs Tal"
@@ -50,7 +50,8 @@ unless `--focus` is given.
 
 ## start
 
-- `--scratch NAME`: a session with an agent (default `claude`) in `--cwd`
+- `--scratch NAME`: a session with an agent (default `claude`, in rexchat;
+  see [Harness](#harness)) in `--cwd`
   (default: the caller's directory, else `$HOME`). `--no-agent` gives a shell.
 - `--ask` (the terminal fallback for the Rex picker): asks for the kind, the
   name and the agent (`claude` or `codex`, Enter for claude); `--agent`
@@ -95,6 +96,37 @@ unless `--focus` is given.
   splitting). Option values may start with `-` (`--title "- fix"`). Session
   and tab names may not.
 
+### Harness
+
+The agent pane runs the agent in one of two ways (`harness` in `session.json`,
+`status` and `ls`):
+
+- `rexchat` (the default for Tal): `rexchat --agent claude|codex --cwd DIR
+  [--model NAME] [--prompt=PROMPT]`, the full-screen ACP chat in
+  `~/src/rexchat`.
+- `native`: the agent's own CLI, `claude|codex [--model NAME] [PROMPT]`. The
+  default when `--owner` is given (any owner, such as `symphony`: unattended
+  runs keep the native CLI).
+
+`REXWORK_HARNESS=rexchat|native` overrides the default; `--harness` overrides
+both. If `rexchat` is not on `PATH`, the pane runs natively and a one-line note
+says so. Either way the pane drops to a login shell when the agent exits, and
+`--prompt` (with `@STATE_DIR@` replaced by the session's state directory, as
+`--draft` needs) is the agent's first message: with rexchat it goes through
+rexchat's queue, shows as Tal's message and is not resent on `rexchat
+--resume`. `-- COMMAND` and `--no-agent` record no agent and no harness.
+
+`--model NAME` maps to:
+
+| | native | rexchat |
+|---|---|---|
+| claude | `claude --model NAME` | `rexchat --model NAME`: claude-agent-acp's `model` option (aliases such as `opus`, or a full id) |
+| codex | `codex --model NAME` | `rexchat --model NAME`: codex-acp's `model` option |
+
+With rexchat, a model the adapter refuses leaves its default model and shows
+an error line in the pane; rexwork cannot see that. `--model` with
+`-- COMMAND` or `--no-agent` is refused. The model is recorded as `model`.
+
 Output (one JSON object):
 
 ```json
@@ -126,6 +158,10 @@ dropped; a session that still holds a worktree rexwork created is refused
 when an earlier session's `worktree_created` record still matches it,
 `treehouse` for a slot leased by `rexwork:TAL-123`, else `adopted` (never
 removed by `release`; someone else's slot is also recorded as `adopted`).
+When a rexchat runs in the pane (its status file
+`~/.local/state/rexchat/<block>.json` exists), `harness` is recorded as
+`rexchat` and `agent` as the agent it names; `--harness` and `--agent` set
+them by hand. Otherwise neither is guessed.
 
 ## promote
 
@@ -225,7 +261,8 @@ ticketed".
 
 With the `work_promote` action (or `--request-draft`) and no draft yet,
 rexwork asks the session's agent to write the draft and run
-`rexwork promote`.
+`rexwork promote` (with the rexchat harness through `rexchat --block B --say`,
+else, or if that fails, by typing into the pane).
 
 ## land
 
@@ -423,7 +460,7 @@ see, so release is the explicit `rexwork release`. `land` says so, and
 
 | File | Owner |
 |---|---|
-| `session.json` | rexwork: `label`, `kind`, `ticket`, `title`, `url`, `repo`, `worktree`, `branch`, `worktree_provider`, `lease_id`, `worktree_at`, `worktree_created`, `pending`, `worktree_error`, `released`, `worktree_moved_to`, `agent`, `cwd`, `owner`, `session_id`, `window_id`, `main_block`, `show_block`, `bar_block`, `created_at`, `landed_at`, `pr_url`, `filing`. Other keys (diffreview's `last_reviewed`) are kept. Written atomically under a lock. |
+| `session.json` | rexwork: `label`, `kind`, `ticket`, `title`, `url`, `repo`, `worktree`, `branch`, `worktree_provider`, `lease_id`, `worktree_at`, `worktree_created`, `pending`, `worktree_error`, `released`, `worktree_moved_to`, `agent`, `harness`, `model`, `cwd`, `owner`, `session_id`, `window_id`, `main_block`, `show_block`, `bar_block`, `created_at`, `landed_at`, `pr_url`, `filing`. Other keys (diffreview's `last_reviewed`) are kept. Written atomically under a lock. |
 | `objectives.md` | the agent; rexwork writes a skeleton |
 | `ticket-draft.md` | the agent and Tal; read by `promote` |
 | `ticket-filed.md` | rexwork: the exact text of the last filing (or dry run) |
@@ -455,8 +492,10 @@ GraphQL with the key in `$LINEAR_KEY_FILE` or `~/.linear_key` (as
 `python3 -m unittest discover -s ~/dotfiles/agents/rexwork/tests`
 
 `REXWORK_AGENT_STUB=/path/to/program` replaces the agent program (it gets the
-agent name and the prompt as arguments). Tests use it to start sessions
-without a real agent. `REXWORK_SHOW=/path` replaces the `show` program and
+agent name, or `rexchat` and its options, and the prompt as arguments). Tests
+use it to start sessions without a real agent. `REXWORK_REXCHAT=/path` names
+the rexchat launcher (the suite points it at a stub or a missing path, so the
+real one is never found). `REXWORK_SHOW=/path` replaces the `show` program and
 `REXWORK_BAR=/path` the `rexbar` program (tests point them at failing ones).
 `REXWORK_TREEHOUSE=/path` replaces `treehouse`: the suite uses a stub whose
 pool slots are git worktrees of a temp repo, and never runs the real one.

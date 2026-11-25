@@ -1,29 +1,39 @@
 #!/usr/bin/env python3
-"""show: draw a picture in the show pane beside the calling Rex pane.
+"""show: draw a picture in the calling agent's own Show pane, or inline under rexchat.
 
   show FILE [--title T] [--session SESSION] [--block BLOCK]
   show --enlarge [--index N] [--session SESSION] [--block BLOCK]
   show --toggle [--session SESSION] [--block BLOCK]
+  show --open-pane [--session SESSION] [--block BLOCK]
 
 FILE is a PNG, JPEG/GIF/WebP, SVG, Mermaid file (.mmd, .mermaid), or a Markdown
 file holding a mermaid block (the first one is drawn). It is converted to PNG
-and added to the session's history. The show pane is a split to the right of
-the calling pane, labelled "Show"; it is created with --focus=false if the
-caller's tab has none. Focus never moves.
+and added to the calling pane's own history. Each calling pane (one agent) has
+its own Show pane: a split to its right, labelled "Show", created with
+--focus=false. Two agents on one tab have two Show panes. Focus never moves.
 
---enlarge opens the current picture (or picture N) in a large floating pane on
-the show pane's tab. q or Esc closes it and focus returns to the pane that had it.
-A second --enlarge from the same tab replaces only the float show itself
+Under a live rexchat the picture is drawn inline in the chat instead: when
+REXCHAT_INBOX is set, or when the calling pane runs a live rexchat (its control
+socket answers). The pane subcommands then only answer that pictures are inline.
+
+--enlarge opens the caller's current picture (or picture N) in a large floating
+pane on the caller's tab. q or Esc closes it and focus returns to the pane that
+had it. A second --enlarge from the same tab replaces only the float show itself
 recorded in state.json for that tab; other tabs' enlarged pictures stay.
 
---toggle closes the Show pane on the caller's tab if there is one, else opens it
+--toggle closes the caller's Show pane if it has one, else opens it
 (--focus=false) on the latest picture.
+
+For --toggle, --enlarge and --open-pane the caller is resolved like this: a Show
+pane means its owner; a pane with its own history or Show pane means itself;
+otherwise the most recently updated history of a pane on the same tab (then the
+old shared session history, if any). The JSON says which ("owner", "resolved").
 
 --session must be a Rex session id (hex and dashes, optional "session:"); any
 other value is refused before anything is written.
 
 Output is one line of JSON. State lives in
-~/.local/state/rexwork/sessions/<UUID>/show/.
+~/.local/state/rexwork/sessions/<UUID>/show/ (per pane: panes/<BLOCK>/).
 """
 import argparse
 import fcntl
@@ -31,6 +41,8 @@ import json
 import os
 import re
 import shutil
+import socket
+import stat
 import struct
 import subprocess
 import sys
@@ -42,6 +54,8 @@ HERE = Path(__file__).resolve().parent
 VIEWER = HERE / "viewer"
 REX_VIEW = Path.home() / ".config/rex/extensions/plugins/rex-view/skills/rex-view/scripts/viewer"
 STATE = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "rexwork" / "sessions"
+REXCHAT_STATE = Path(os.environ.get("REXCHAT_STATE_DIR") or Path.home() / ".local/state/rexchat")
+REXCHAT_TMP = Path(tempfile.gettempdir()) / "rexchat"  # rexchat's picture inboxes (as its TMP_INBOXES)
 SHELL_FLAVOR = "com.superlogical.terminal.shell"
 LABEL = "Show"
 ENLARGED_LABEL = "Show: enlarged"
@@ -328,6 +342,191 @@ class Lock:
         self.f.close()
 
 
+BLOCK_NAME = re.compile(r"^[A-Za-z0-9_-][A-Za-z0-9._-]{0,127}$")
+LEGACY = "legacy"  # the old shared session history (show/history.json), read-only
+
+
+def block_name(block):
+    """The block id without "block:", or None if it is not safe as a file name."""
+    name = block[len("block:"):] if block.startswith("block:") else block
+    return name if BLOCK_NAME.match(name) else None
+
+
+def owner_dir(directory, owner):
+    """The history dir of OWNER (a block id): show/panes/<id>/; the legacy history is show/ itself."""
+    if owner == LEGACY:
+        return directory
+    name = block_name(owner)
+    if name is None:
+        fail(f"invalid Rex block id: {owner!r}")
+    return directory / "panes" / name
+
+
+def load_state(path):
+    """state.json as a dict with a valid "owners" map; older shapes load too.
+
+    owners: {owner block: its Show pane block}. panes: the old per-tab Show pane
+    records ({window: block}), kept so old Show panes can still be closed.
+    enlarge: per-tab enlarge float records (see enlarge_records).
+    """
+    state = read_json(path, {})
+    if not isinstance(state, dict):
+        state = {}
+    owners = state.get("owners")
+    state["owners"] = {o: p for o, p in owners.items() if isinstance(o, str) and isinstance(p, str)} \
+        if isinstance(owners, dict) else {}
+    panes = state.get("panes")
+    state["panes"] = {w: p for w, p in panes.items() if isinstance(p, str)} if isinstance(panes, dict) else {}
+    return state
+
+
+def history_items(directory):
+    data = read_json(directory / "history.json", {})
+    items = data.get("items") if isinstance(data, dict) else None
+    return items if isinstance(items, list) else []
+
+
+def pane_histories(directory):
+    """{owner block: history.json mtime} for every per-pane history in this session."""
+    found = {}
+    root = directory / "panes"
+    if root.is_dir():
+        for d in root.iterdir():
+            try:
+                found["block:" + d.name] = (d / "history.json").stat().st_mtime
+            except OSError:
+                pass
+    return found
+
+
+# ---- rexchat ----------------------------------------------------------------
+
+INLINE_NOTE = "pictures are drawn inline in this chat; there is no Show pane"
+
+
+def peer_pid(sock):
+    """The pid of the process at the other end of a connected Unix socket, or None."""
+    try:
+        if sys.platform == "darwin":
+            return sock.getsockopt(0, 0x002) or None  # SOL_LOCAL, LOCAL_PEERPID
+        if hasattr(socket, "SO_PEERCRED"):
+            pid, _, _ = struct.unpack("3i", sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+            return pid or None
+    except OSError:
+        pass
+    return None
+
+
+def live_rexchat(name, timeout=1.0):
+    """The pid of the rexchat running in pane NAME, or None if none is live.
+
+    A live rexchat listens on REXCHAT_STATE/<name>.sock. A status file or
+    socket file left by a killed run does not answer, so it never counts. The
+    request sent is "{}", which rexchat refuses ("nothing to send") without
+    doing anything; reading the reply keeps rexchat's side clean.
+    """
+    path = REXCHAT_STATE / f"{name}.sock"
+    if not path.exists():
+        return None
+    try:
+        with socket.socket(socket.AF_UNIX) as s:
+            s.settimeout(timeout)
+            s.connect(str(path))
+            pid = peer_pid(s)
+            s.sendall(b"{}\n")
+            reply = json.loads(s.makefile().readline() or "null")
+    except (OSError, ValueError):
+        return None
+    return pid if isinstance(reply, dict) and pid else None
+
+
+def private_dir(path):
+    """True if PATH is a real directory (not a symlink) owned by this user that no one else can write to."""
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return False
+    return stat.S_ISDIR(st.st_mode) and st.st_uid == os.getuid() and not st.st_mode & 0o022
+
+
+def safe_inbox(inbox):
+    """True if a picture may be written into INBOX: it and its per-pane parent, and rexchat's
+    temp directory when INBOX is under it, are this user's own (see private_dir), so no other
+    user can have planted or swapped them."""
+    checks = [inbox, inbox.parent] + ([REXCHAT_TMP] if REXCHAT_TMP in inbox.parents else [])
+    return all(private_dir(p) for p in checks)
+
+
+def make_private_dirs(path):
+    """Create the missing directories of PATH, each with mode 0700."""
+    missing = []
+    p = path
+    while not os.path.lexists(p) and p != p.parent:
+        missing.append(p)
+        p = p.parent
+    for d in reversed(missing):
+        try:
+            os.mkdir(d, 0o700)
+        except FileExistsError:
+            pass
+
+
+def rexchat_inbox(block):
+    """(inbox, live): where a live rexchat whose agent is calling takes pictures.
+
+    REXCHAT_INBOX first (the rexchat launcher sets it for its agent): (that path,
+    True). Else, if the calling pane (--block or REX_BLOCK) runs a live rexchat
+    with pid P, the inbox the launcher made: <tmp>/rexchat/<name>/inbox-P, or
+    the older REXCHAT_STATE/pictures/<name>/inbox-P; only one that exists and
+    passes safe_inbox counts, else (None, True). (None, False) if no rexchat.
+    """
+    env = os.environ.get("REXCHAT_INBOX")
+    if env:
+        return Path(env), True
+    name = block_name(block) if block else None
+    pid = live_rexchat(name) if name else None
+    if not pid:
+        return None, False
+    for base in (REXCHAT_TMP, REXCHAT_STATE / "pictures"):
+        inbox = base / name / f"inbox-{pid}"
+        if safe_inbox(inbox):
+            return inbox, True
+    return None, True
+
+
+def deliver_inline(src, title, inbox):
+    """Convert SRC and leave it in rexchat's inbox, which rexchat draws in the chat."""
+    if not src.is_file():
+        fail(f"no such file: {src}")
+    try:
+        make_private_dirs(inbox)
+        if not safe_inbox(inbox):
+            fail(f"refusing rexchat's picture inbox {inbox}: it or its parent is a symlink, "
+                 "or another user's, or writable by others")
+        fd, staged = tempfile.mkstemp(prefix=".staging-", suffix=".png", dir=inbox)
+        os.close(fd)
+    except OSError as e:
+        # Codex's sandbox refuses writes outside its writable roots: say so plainly, so the
+        # agent can rerun the command with more permissions (it still draws inline then).
+        fail(f"cannot write to rexchat's picture inbox {inbox}: {e.strerror or e}")
+    try:
+        try:
+            convert(src, Path(staged))
+        except ValueError as e:
+            fail(str(e))
+        stem = f"{time.time_ns()}"
+        try:
+            (inbox / f"{stem}.json").write_text(json.dumps({"title": title or src.name, "source": str(src)}))
+            out = inbox / f"{stem}.png"
+            os.replace(staged, out)   # atomic: rexchat never sees a partial picture
+        except OSError as e:
+            fail(f"cannot write to rexchat's picture inbox {inbox}: {e.strerror or e}")
+    finally:
+        if os.path.exists(staged):
+            os.unlink(staged)
+    print(json.dumps({"image": str(out), "inline": True, "note": "drawn inline in the chat"}))
+
+
 # ---- panes ------------------------------------------------------------------
 
 def caller(args):
@@ -339,6 +538,8 @@ def caller(args):
         session = "session:" + session
     if not block.startswith("block:"):
         block = "block:" + block
+    if block_name(block) is None:
+        fail(f"invalid Rex block id: {block!r}")
     return session, block
 
 
@@ -394,18 +595,23 @@ def runs_viewer(session, block, directory, retry_delay=0.3):
     return answer
 
 
-def find_pane(view, window, state, session, directory):
-    """The Show pane this tab owns, or None.
+def all_blocks(view):
+    return {b.get("block_id") for w in view.get("windows", []) for layer in w.get("layers", [])
+            for b in layer.get("blocks", [])}
 
-    Only the block recorded in state.json for this tab counts, and only while
-    it is a tiled block on the tab still running show's viewer on this
-    session's show dir. A pane merely labelled "Show" is never adopted.
-    Raises Unverified if the recorded block is on the tab but its program
-    could not be queried (twice), so nothing is created, closed or forgotten.
+
+def window_blocks(window):
+    return {b.get("block_id") for layer in window.get("layers", []) for b in layer.get("blocks", [])}
+
+
+def verified(session, recorded, window, directory):
+    """recorded if it is a tiled block on window running show's viewer on directory, else None.
+
+    A pane merely labelled "Show" is never adopted. Raises Unverified if the
+    recorded block is on the tab but its program could not be queried (twice),
+    so nothing is created, closed or forgotten.
     """
-    ids = {b["block_id"] for b in tiled_blocks(window)}
-    recorded = state.get("panes", {}).get(window["window_id"])
-    if not isinstance(recorded, str) or recorded not in ids:
+    if not isinstance(recorded, str) or recorded not in {b["block_id"] for b in tiled_blocks(window)}:
         return None
     answer = runs_viewer(session, recorded, directory)
     if answer is None:
@@ -413,26 +619,96 @@ def find_pane(view, window, state, session, directory):
     return recorded if answer else None
 
 
+def find_pane(view, owner, state, session, directory):
+    """OWNER's Show pane, or None: only the block recorded in state.json for OWNER,
+    on OWNER's tab, running show's viewer on OWNER's history dir."""
+    window = window_of(view, owner)
+    if not window:
+        return None
+    return verified(session, state["owners"].get(owner), window, owner_dir(directory, owner))
+
+
+def find_legacy_pane(view, window, state, session, directory):
+    """The old shared-history Show pane recorded for this tab (before per-pane Show panes)."""
+    return verified(session, state["panes"].get(window["window_id"]), window, directory)
+
+
+def close_orphans(view, state, session, directory):
+    """Close Show panes whose owner pane is gone, and forget them. Returns the closed blocks.
+
+    Only panes recorded in state["owners"] and still running show's viewer on
+    that owner's history are closed. A pane whose program cannot be queried
+    is left alone and stays recorded.
+    """
+    present = all_blocks(view)
+    closed = []
+    for owner, pane in list(state["owners"].items()):
+        if owner in present:
+            continue
+        window = window_of(view, pane)
+        if window and block_name(owner):
+            try:
+                mine = verified(session, pane, window, owner_dir(directory, owner))
+            except Unverified:
+                continue
+            if mine:
+                run(["rex", "block", "close", "-s", session, mine], timeout=10)
+                closed.append(mine)
+        del state["owners"][owner]
+    return closed
+
+
 def ensure_pane(session, block, directory):
-    """Find or create the caller's Show pane. Call with the session Lock held."""
+    """Find or create BLOCK's own Show pane, first closing orphaned Show panes.
+    Call with the session Lock held. Returns (pane, window id, created, closed orphans)."""
     view = rex("session", "inspect", session, "--json")
     window = window_of(view, block)
     if not window:
         fail(f"{block} is not in a tab of {session}")
     state_path = directory / "state.json"
-    state = read_json(state_path, {})
-    pane = find_pane(view, window, state, session, directory)
+    state = load_state(state_path)
+    closed = close_orphans(view, state, session, directory)
+    if closed:
+        write_json(state_path, state)
+    pane = find_pane(view, block, state, session, directory)
     created = False
     if not pane:
+        home = owner_dir(directory, block)
+        (home / "images").mkdir(parents=True, exist_ok=True, mode=0o700)
         result = rex("split", "-s", session, "-b", block, "--split=right", "--ratio", RATIO,
-                     "--label", LABEL, "--focus=false", "-c", str(directory), "--json",
-                     "--", sys.executable, str(VIEWER), str(directory))
+                     "--label", LABEL, "--focus=false", "-c", str(home), "--json",
+                     "--", sys.executable, str(VIEWER), str(home))
         pane = result["block_ids"][0]
         created = True
-    state.setdefault("panes", {})[window["window_id"]] = pane
+    state["owners"][block] = pane
     state["session"] = session
     write_json(state_path, state)
-    return pane, window["window_id"], created
+    return pane, window["window_id"], created, closed
+
+
+def resolve_owner(view, state, directory, block):
+    """Whose Show pane and history a pane-level command (toggle, enlarge) acts on.
+
+    Returns (owner, how): a Show pane resolves to its owner ("show pane"); an
+    old shared-history Show pane to LEGACY ("legacy show pane"); a pane with
+    its own Show pane or history to itself ("caller"); otherwise the pane on
+    the same tab whose history changed last ("latest on tab"). (None, None) if
+    none of these apply.
+    """
+    for owner, pane in state["owners"].items():
+        if pane == block:
+            return owner, "show pane"
+    if block in state["panes"].values():
+        return LEGACY, "legacy show pane"
+    histories = pane_histories(directory)
+    if block in state["owners"] or block in histories:
+        return block, "caller"
+    window = window_of(view, block)
+    tab = window_blocks(window) if window else set()
+    on_tab = [(mtime, owner) for owner, mtime in histories.items() if owner in tab]
+    if on_tab:
+        return max(on_tab)[1], "latest on tab"
+    return None, None
 
 
 # ---- commands ---------------------------------------------------------------
@@ -443,7 +719,8 @@ def cmd_show(args):
         fail(f"no such file: {src}")
     session, block = caller(args)
     directory = show_dir(session)
-    images = directory / "images"
+    home = owner_dir(directory, block)
+    images = home / "images"
     images.mkdir(parents=True, exist_ok=True, mode=0o700)
 
     # Convert outside the lock (it can take seconds), into a unique staging file.
@@ -455,19 +732,21 @@ def cmd_show(args):
             width, height = convert(src, staged)
         except ValueError as e:
             fail(str(e))
-        # One lock covers numbering, history, pane discovery, the split and
+        # One session lock covers numbering, history, pane discovery, the split and
         # state.json, so concurrent calls cannot both create a Show pane.
         with Lock(directory):
-            history = read_json(directory / "history.json", {"items": []})
+            history = read_json(home / "history.json", {})
+            if not isinstance(history, dict) or not isinstance(history.get("items"), list):
+                history = {"items": []}
             n = len(history["items"]) + 1
             stem = re.sub(r"[^A-Za-z0-9._-]+", "-", src.stem)[:40] or "image"
             out = images / f"{n:04d}-{stem}.png"
             os.replace(staged, out)
             history["items"].append({"png": str(out), "title": args.title or src.name, "source": str(src),
                                      "width": width, "height": height, "time": int(time.time())})
-            write_json(directory / "history.json", history)
+            write_json(home / "history.json", history)
             try:
-                pane, window, created = ensure_pane(session, block, directory)
+                pane, window, created, closed = ensure_pane(session, block, directory)
             except Unverified as e:
                 print(json.dumps({"image": str(out), "pane": None, "index": n, "count": n,
                                   "created_pane": False, "error": str(e)}))
@@ -475,62 +754,102 @@ def cmd_show(args):
     finally:
         if staged.exists():
             staged.unlink()
-    print(json.dumps({"image": str(out), "pane": pane, "window": window, "index": n,
-                      "count": n, "created_pane": created}))
+    result = {"image": str(out), "pane": pane, "window": window, "index": n, "count": n, "created_pane": created}
+    if closed:
+        result["closed_orphans"] = closed
+    print(json.dumps(result))
+
+
+def ensure_history(home):
+    (home / "images").mkdir(parents=True, exist_ok=True, mode=0o700)
+    if not (home / "history.json").exists():
+        write_json(home / "history.json", {"items": []})
 
 
 def cmd_open_pane(args):
-    """Create (or find) the caller's Show pane without drawing anything."""
+    """Create (or find) the caller's own Show pane without drawing anything."""
     session, block = caller(args)
     directory = show_dir(session)
-    (directory / "images").mkdir(parents=True, exist_ok=True, mode=0o700)
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
     with Lock(directory):
-        if not (directory / "history.json").exists():
-            write_json(directory / "history.json", {"items": []})
+        ensure_history(owner_dir(directory, block))
         try:
-            pane, window, created = ensure_pane(session, block, directory)
+            pane, window, created, _ = ensure_pane(session, block, directory)
         except Unverified as e:
             fail(str(e), RETRYABLE)
     print(json.dumps({"pane": pane, "window": window, "created_pane": created}))
 
 
+def focus_back(session, window, pane, target, result):
+    """After closing PANE from inside it, focus TARGET if it is another pane on the same tab."""
+    if isinstance(target, str) and target != pane and target in window_blocks(window):
+        run(["rex", "focus", "-s", session, target], timeout=10)
+        result["focused"] = target
+
+
 def cmd_toggle(args):
-    """Close the caller's Show pane if this tab has one; else open it on the latest picture."""
+    """Close the resolved owner's Show pane if it has one; else open it on the latest picture."""
     session, block = caller(args)
     directory = show_dir(session)
-    (directory / "images").mkdir(parents=True, exist_ok=True, mode=0o700)
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
     with Lock(directory):
-        if not (directory / "history.json").exists():
-            write_json(directory / "history.json", {"items": []})
         view = rex("session", "inspect", session, "--json")
         window = window_of(view, block)
         if not window:
             fail(f"{block} is not in a tab of {session}")
         state_path = directory / "state.json"
-        state = read_json(state_path, {})
+        state = load_state(state_path)
+        if close_orphans(view, state, session, directory):
+            write_json(state_path, state)
+        owner, how = resolve_owner(view, state, directory, block)
+        if owner is None and history_items(directory):
+            owner, how = LEGACY, "legacy history"  # nothing per pane on this tab yet: the old shared one
+        if owner is None:
+            owner, how = block, "caller"
         try:
-            pane = find_pane(view, window, state, session, directory)
+            if owner == LEGACY:
+                pane = find_legacy_pane(view, window, state, session, directory)
+            else:
+                pane = find_pane(view, owner, state, session, directory)
         except Unverified as e:
             fail(str(e), RETRYABLE)
         if pane:
             rex("block", "close", "-s", session, pane)
-            state.setdefault("panes", {}).pop(window["window_id"], None)
+            if owner == LEGACY:
+                state["panes"].pop(window["window_id"], None)
+            else:
+                state["owners"].pop(owner, None)
             write_json(state_path, state)
-            result = {"action": "closed", "pane": pane, "window": window["window_id"]}
+            result = {"action": "closed", "pane": pane, "window": window_of(view, pane)["window_id"],
+                      "owner": owner, "resolved": how}
             if pane == block:
-                # Toggled from the Show pane itself: hand focus to the agent pane.
-                main = read_json(directory.parent / "session.json", {}).get("main_block")
-                tab = {b.get("block_id") for layer in window.get("layers", []) for b in layer.get("blocks", [])}
-                if isinstance(main, str) and main != pane and main in tab:
-                    run(["rex", "focus", "-s", session, main], timeout=10)
-                    result["focused"] = main
+                # Toggled from the Show pane itself: hand focus to its agent pane.
+                target = read_json(directory.parent / "session.json", {}).get("main_block") \
+                    if owner == LEGACY else owner
+                focus_back(session, window, pane, target, result)
+        elif owner == LEGACY:
+            result = dict(open_legacy_pane(session, block, window, state, directory),
+                          owner=owner, resolved=how)
         else:
             try:
-                pane, window_id, _ = ensure_pane(session, block, directory)
+                ensure_history(owner_dir(directory, owner))
+                pane, window_id, _, _ = ensure_pane(session, owner, directory)
             except Unverified as e:
                 fail(str(e), RETRYABLE)
-            result = {"action": "opened", "pane": pane, "window": window_id}
+            result = {"action": "opened", "pane": pane, "window": window_id, "owner": owner, "resolved": how}
     print(json.dumps(result))
+
+
+def open_legacy_pane(session, block, window, state, directory):
+    """Open a viewer on the old shared history beside BLOCK, recorded per tab as before."""
+    result = rex("split", "-s", session, "-b", block, "--split=right", "--ratio", RATIO,
+                 "--label", LABEL, "--focus=false", "-c", str(directory), "--json",
+                 "--", sys.executable, str(VIEWER), str(directory))
+    pane = result["block_ids"][0]
+    state["panes"][window["window_id"]] = pane
+    state["session"] = session
+    write_json(directory / "state.json", state)
+    return {"action": "opened", "pane": pane, "window": window["window_id"]}
 
 
 def own_float(view, record, window_id):
@@ -581,24 +900,27 @@ def cmd_enlarge(args):
 
 
 def enlarge(args, session, block, directory):
-    items = read_json(directory / "history.json", {"items": []})["items"]
+    view = rex("session", "inspect", session, "--json")
+    window = window_of(view, block)
+    if not window:
+        fail(f"{block} is not in a tab of {session}")
+    owner, how = resolve_owner(view, load_state(directory / "state.json"), directory, block)
+    if owner is None:
+        owner, how = LEGACY, "legacy history"
+    items = history_items(owner_dir(directory, owner))
     if not items:
-        fail("nothing shown yet in this session")
+        fail("nothing shown yet by this pane" if owner != LEGACY else "nothing shown yet in this session")
     index = args.index or len(items)
     if not 1 <= index <= len(items):
         fail(f"index {index} is out of range 1..{len(items)}")
     png = items[index - 1]["png"]
 
-    view = rex("session", "inspect", session, "--json")
-    window = window_of(view, block)
-    if not window:
-        fail(f"{block} is not in a tab of {session}")
     # The float takes focus only on the tab being looked at, so a call from a
     # background tab never switches tabs. Focus returns to the pane that had it.
     focus = view.get("active_window_id") == window["window_id"]
     back = (window.get("focused_block_id") or block) if focus else ""
     state_path = directory / "state.json"
-    state = read_json(state_path, {})
+    state = load_state(state_path)
     record = enlarge_records(state).get(window["window_id"])
     old = own_float(view, record, window["window_id"])
     if old and back == record["block"]:
@@ -622,13 +944,14 @@ def enlarge(args, session, block, directory):
             "command": command, "cwd": str(directory), "exit": {"on_completion": True}}}},
     }
     layer = rex("api", "call", "session.new_layer", json.dumps(request))
-    state = read_json(state_path, {})
+    state = load_state(state_path)
     state["enlarge"] = enlarge_records(state)
     state["enlarge"][window["window_id"]] = {"layer": layer["layer_id"],
                                              "block": layer["block_ids"][0], "returns_to": back}
     write_json(state_path, state)
     print(json.dumps({"image": png, "index": index, "pane": layer["block_ids"][0],
-                      "layer": layer["layer_id"], "focused": focus, "returns_to": back or None}))
+                      "layer": layer["layer_id"], "focused": focus, "returns_to": back or None,
+                      "owner": owner, "resolved": how}))
 
 
 def main():
@@ -646,6 +969,17 @@ def main():
     parser.add_argument("--toggle", action="store_true",
                         help="close the caller's Show pane, or reopen it on the latest picture")
     args = parser.parse_args()
+    pane_command = args.toggle or args.open_pane or args.enlarge
+    if pane_command or args.file:
+        inbox, live = rexchat_inbox(args.block or os.environ.get("REX_BLOCK"))
+        if live and pane_command:
+            print(json.dumps({"inline": True, "note": INLINE_NOTE}))
+            return
+        if live and not inbox:
+            fail("rexchat runs in this pane, but its picture inbox is missing or not safe to write to")
+        if inbox:
+            deliver_inline(Path(args.file).expanduser().resolve(), args.title, inbox)
+            return
     if args.toggle:
         cmd_toggle(args)
     elif args.open_pane:

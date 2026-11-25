@@ -15,7 +15,7 @@ Help Tal understand with big pictures and few words, without withholding key det
    d="$HOME/.local/state/rexwork/sessions/${REX_SESSION#session:}/pictures"; mkdir -p "$d"; echo "$d"
    ```
    Write files to that literal path with your file-writing tool; shell guards may block redirects to computed paths. Outside Rex, use a temp dir. Name files `NN-topic.mmd` or `NN-topic.svg`.
-3. **Send each one** in reading order: `show DIR/01-topic.mmd --title "Takeaway in a few words"`. `show` prints JSON whose `image` is the PNG it drew.
+3. **Send each one** in reading order: `show DIR/01-topic.mmd --title "Takeaway in a few words"`. `show` prints JSON whose `image` is the PNG it drew. Pictures go to your own Show pane (each agent pane has one); under rexchat they are drawn inline in the chat.
 4. **Check the PNG.** Open `image` with your image viewer (Claude: the Read tool) when you can. Done when every label is readable at pane size and nothing overlaps or is clipped; otherwise fix and re-send.
 5. **Reply** with one line per picture saying what it shows, plus any detail the pictures could not carry.
 

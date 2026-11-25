@@ -43,6 +43,9 @@ TEAM = "TAL"
 BRANCH_PREFIX = "u/tfriedman/"
 LINEAR_API = "https://api.linear.app/graphql"
 AGENTS = ("claude", "codex")
+# How the agent pane runs the agent: in rexchat (over ACP) or as its own CLI.
+HARNESSES = ("rexchat", "native")
+REXCHAT_STATE = Path(os.environ.get("REXCHAT_STATE_DIR") or Path.home() / ".local/state/rexchat")
 TICKET_RE = re.compile(r"^([A-Za-z]+)-(\d+)$")
 # A Rex session id without its `session:` prefix, such as 01a1fabd-f4aa-...
 SESSION_UUID_RE = re.compile(r"^[0-9a-fA-F-]{8,64}$")
@@ -928,16 +931,50 @@ STATE_MARK = "@STATE_DIR@"
 AGENT_WRAPPER = (
     'if [ -n "$REXWORK_PROMPT" ]; then '
     'dir="$HOME/.local/state/rexwork/sessions/${REX_SESSION#session:}"; '
-    'set -- "$@" "$(printf %s "$REXWORK_PROMPT" | sed "s|@STATE_DIR@|$dir|g")"; fi; '
+    'set -- "$@" "${REXWORK_PROMPT_OPT}$(printf %s "$REXWORK_PROMPT" | sed "s|@STATE_DIR@|$dir|g")"; fi; '
     '"$@"; exec "${SHELL:-/bin/zsh}" -l'
 )
 
 
-def agent_command(agent, prompt=None):
+def rexchat_program():
+    """The rexchat launcher, or None when it is not installed. REXWORK_REXCHAT names it (tests)."""
+    path = os.environ.get("REXWORK_REXCHAT") or shutil.which("rexchat")
+    return path if path and os.path.isfile(path) and os.access(path, os.X_OK) else None
+
+
+def pick_harness(args):
+    """--harness, else $REXWORK_HARNESS, else native for an unattended owner (any --owner) and
+    rexchat for Tal. rexchat falls back to native, with a note, when it is not installed."""
+    harness = (getattr(args, "harness", None) or os.environ.get("REXWORK_HARNESS")
+               or ("native" if getattr(args, "owner", None) else "rexchat"))
+    if harness not in HARNESSES:
+        fail(f"REXWORK_HARNESS={harness!r}: use one of {', '.join(HARNESSES)}")
+    if harness == "rexchat" and not rexchat_program():
+        note("rexchat is not installed; running the agent natively")
+        return "native"
+    return harness
+
+
+def agent_command(agent, prompt=None, harness="native", model=None, cwd=None):
+    """The agent pane's command. native: `claude|codex [--model M] [PROMPT]`; rexchat:
+    `rexchat --agent A [--cwd DIR] [--model M] [--prompt=PROMPT]`. The wrapper adds the prompt."""
+    if harness == "rexchat":
+        argv = ["rexchat" if os.environ.get("REXWORK_AGENT_STUB") else rexchat_program(), "--agent", agent]
+        argv += ["--cwd", str(cwd)] if cwd else []
+        opt = "--prompt="
+    else:
+        argv, opt = [agent], ""
+    argv += ["--model", model] if model else []
     stub = os.environ.get("REXWORK_AGENT_STUB")
-    argv = [stub, agent] if stub else [agent]
-    env = [f"REXWORK_PROMPT={prompt}"] if prompt else ["-u", "REXWORK_PROMPT"]
+    argv = [stub, *argv] if stub else argv
+    env = [f"REXWORK_PROMPT={prompt}", f"REXWORK_PROMPT_OPT={opt}"] if prompt else ["-u", "REXWORK_PROMPT"]
     return ["/usr/bin/env", *env, "/bin/sh", "-c", AGENT_WRAPPER, "sh", *argv]
+
+
+def pane_command(args, agent, prompt, cwd):
+    """(command, harness) for an agent pane running AGENT."""
+    harness = pick_harness(args)
+    return agent_command(agent, prompt, harness, args.model, cwd), harness
 
 
 def app_client():
@@ -1329,13 +1366,14 @@ def launch_new(args, ticket, title, url, issue, label, base, repo, tree, handed)
             fail(no_worktree_message(ticket, str(e), base))
     else:
         cwd = launch_dir(cwd, ticket, tree)
+    harness = None
     if args.command:
         command, agent = args.command, None
     elif args.no_agent:
         command, agent = None, None
     else:
         agent = args.agent or "claude"
-        command = agent_command(agent, args.prompt)
+        command, harness = pane_command(args, agent, args.prompt, cwd)
 
     linear_note = "skipped (--no-linear)"
     if not args.no_linear:
@@ -1357,7 +1395,8 @@ def launch_new(args, ticket, title, url, issue, label, base, repo, tree, handed)
         directory = state_dir(session)
         fields = dict(session_id=session, window_id=window, main_block=main, show_block=show,
                       label=label, kind="ticketed", ticket=ticket, title=title, url=url,
-                      **tree_fields(tree), agent=agent, cwd=str(cwd), owner=args.owner,
+                      **tree_fields(tree), agent=agent, harness=harness, model=args.model if agent else None,
+                      cwd=str(cwd), owner=args.owner,
                       created_at=int(time.time()))
         state = soft(warnings, "session.json not written", lambda: update_state(directory, **fields)) or fields
     bar = bar_pane(warnings, args, session, window)
@@ -1466,12 +1505,13 @@ def start_named(args, kind):
     cwd = launch_dir(cwd, None)
     base = STATE_MARK  # filled in by the pane's wrapper
     agent = None if args.no_agent else (args.agent or "claude")
+    harness = None
     if args.command:
         command, agent = args.command, None
     elif agent:
         prompt = DRAFT_PROMPT.format(objectives=f"{base}/objectives.md",
                                      draft=f"{base}/ticket-draft.md") if args.draft else args.prompt
-        command = agent_command(agent, prompt)
+        command, harness = pane_command(args, agent, prompt, cwd)
     else:
         if args.draft:
             fail("--draft needs an agent")
@@ -1482,7 +1522,8 @@ def start_named(args, kind):
     bar = bar_pane(warnings, args, session, window)
     directory = state_dir(session)
     fields = dict(session_id=session, window_id=window, main_block=main, show_block=show, bar_block=bar,
-                  label=name, kind="scratch", ticket=None, agent=agent, cwd=str(cwd),
+                  label=name, kind="scratch", ticket=None, agent=agent, harness=harness,
+                  model=args.model if agent else None, cwd=str(cwd),
                   drafting=True if args.draft else None, created_at=int(time.time()))
     state = soft(warnings, "session.json not written", lambda: update_state(directory, **fields)) or fields
     soft(warnings, "objectives.md not written", write_objectives, directory, name)
@@ -1522,11 +1563,13 @@ def result_of(session, state, directory):
             "show_block": state.get("show_block"), "bar_block": state.get("bar_block"), "state_dir": str(directory),
             "repo": state.get("repo"), "worktree": state.get("worktree"), "branch": state.get("branch"),
             "worktree_provider": state.get("worktree_provider"), "lease_id": state.get("lease_id"),
-            "agent": state.get("agent")}
+            "agent": state.get("agent"), "harness": state.get("harness")}
 
 
 def cmd_start(args):
     picked = [x for x in (args.scratch, args.draft, args.ticket) if x]
+    if args.model and (args.command or args.no_agent):
+        fail("--model needs an agent; it does not apply to -- COMMAND or --no-agent")
     if args.ask:
         return start_ask(args)
     if len(picked) != 1:
@@ -1562,6 +1605,17 @@ def git_branch_info(path):
     branch = git("symbolic-ref", "-q", "--short", "HEAD", cwd=top, check=False)
     _, main = repo_root(top)
     return {"repo": str(main), "worktree": top, "branch": branch}
+
+
+def rexchat_agent(block):
+    """None unless a rexchat runs in BLOCK (its status file in rexchat's state directory);
+    then the agent it runs, claude or codex, or "" if its name says neither."""
+    try:
+        data = json.loads((REXCHAT_STATE / f"{block.removeprefix('block:')}.json").read_text())
+    except (OSError, ValueError):
+        return None
+    name = str(data.get("agent") or "").lower() if isinstance(data, dict) else ""
+    return next((a for a in AGENTS if a in name), "")
 
 
 def cmd_adopt(args):
@@ -1615,8 +1669,12 @@ def cmd_adopt(args):
                  f"({BRANCH_PREFIX}{ticket.lower()} or {BRANCH_PREFIX}{ticket.lower()}-...)")
     if not state.get("created_at"):
         updates["created_at"] = int(time.time())
-    if args.agent:
-        updates["agent"] = args.agent
+    found = rexchat_agent(block)  # a rexchat runs in the pane: the agent's process is rexchat, not claude/codex
+    harness = args.harness or ("rexchat" if found is not None else None)
+    if harness:
+        updates["harness"] = harness
+    if args.agent or found:
+        updates["agent"] = args.agent or found
     if label != current:  # rename only after every check passed
         rex("session", "rename", session, label)
     show = open_show(session, block) if args.show else {}
@@ -1872,8 +1930,17 @@ def request_draft(session, directory, state):
     if not main:
         fail("no main pane recorded; run `rexwork adopt` from the agent pane")
     text = REQUEST_DRAFT.format(objectives=directory / "objectives.md", draft=directory / "ticket-draft.md")
-    rex("send", "-s", session, "-b", main, text)
-    rex("send-key", "-s", session, "-b", main, "enter")
+    program = rexchat_program() if state.get("harness") == "rexchat" else None
+    # rexchat takes a prompt over its socket (queued while a turn runs), whatever has focus in it.
+    try:
+        said = bool(program) and run([program, "--block", main, f"--say={text}"], timeout=30).returncode == 0
+    except Failure:
+        said = False
+    if not said:
+        if program:
+            note("rexchat did not take the request; typing it into the pane instead")
+        rex("send", "-s", session, "-b", main, text)
+        rex("send-key", "-s", session, "-b", main, "enter")
     emit({"requested": True, "agent_block": main,
           "message": "No draft yet; asked the agent to write one and run `rexwork promote`."})
 
@@ -2655,7 +2722,8 @@ def cmd_status(args):
         print(f"No rexwork state for {session}. Run `rexwork adopt` to add it.")
         return
     print(f"{state.get('label')}  ({state.get('kind')})")
-    for key in ("ticket", "title", "url", "branch", "worktree", "worktree_provider", "lease_id", "agent", "pr_url",
+    for key in ("ticket", "title", "url", "branch", "worktree", "worktree_provider", "lease_id", "agent", "harness",
+                "model", "pr_url",
                 "pending", "worktree_error"):
         if state.get(key):
             print(f"  {key}: {state[key]}")
@@ -2679,14 +2747,14 @@ def cmd_ls(args):
         if held:
             held = {**held, "age": describe_age(held["since"])}
         rows.append({"session_id": sid, "label": state.get("label") or (live.get(sid) or {}).get("label"),
-                     "kind": state.get("kind"), "ticket": state.get("ticket"), "alive": sid in live,
-                     "state_dir": str(directory), "holds_worktree": held})
+                     "kind": state.get("kind"), "ticket": state.get("ticket"), "harness": state.get("harness"),
+                     "alive": sid in live, "state_dir": str(directory), "holds_worktree": held})
     if args.json:
         emit(rows)
         return
     for r in rows:
         print(f"{'live' if r['alive'] else 'gone':4}  {r['kind'] or '-':8}  {r['ticket'] or '-':8}  "
-              f"{r['label'] or '-':40}  {r['session_id']}")
+              f"{r['harness'] or '-':7}  {r['label'] or '-':40}  {r['session_id']}")
         held = r["holds_worktree"]
         if held:
             what = f"treehouse lease {held['lease_id']}" if held["provider"] == "treehouse" else "git worktree"
@@ -2698,6 +2766,7 @@ def cmd_ls(args):
 
 # Options that take a value, so `--title --` is a title, not the start of COMMAND.
 VALUE_OPTIONS = {"--scratch", "--draft", "--cwd", "--repo", "--title", "--agent", "--prompt", "--owner",
+                 "--harness", "--model",
                  "--reuse-tab", "--name", "--session", "--block"}
 
 
@@ -2736,6 +2805,10 @@ def main(argv=None):
     p.add_argument("--title", help="ticket title (skips the Linear lookup)")
     p.add_argument("--agent", choices=AGENTS, help="default claude; with --ask it preselects (else asked)")
     p.add_argument("--no-agent", action="store_true")
+    p.add_argument("--harness", choices=HARNESSES,
+                   help="how the agent pane runs the agent (default: rexchat; native with --owner; "
+                        "$REXWORK_HARNESS overrides the default)")
+    p.add_argument("--model", help="the agent's model (native: --model; rexchat: --model, its model option)")
     p.add_argument("--prompt", help="first prompt for the agent")
     p.add_argument("--no-linear", action="store_true", help="do not change the ticket in Linear")
     p.add_argument("--focus", action="store_true", help="show the new session in the Rex app")
@@ -2749,6 +2822,7 @@ def main(argv=None):
     p.add_argument("--title")
     p.add_argument("--repo")
     p.add_argument("--agent", choices=AGENTS)
+    p.add_argument("--harness", choices=HARNESSES, help="default: rexchat if one runs in the pane, else unchanged")
     p.add_argument("--no-bar", action="store_true", help="do not open the status bar")
     p.add_argument("--show", action="store_true",
                    help="open the Show pane now (default: it opens with the first picture)")
